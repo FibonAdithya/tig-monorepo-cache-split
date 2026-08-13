@@ -13,7 +13,27 @@ target/
 
 __pycache__/
 
-# Ignore these. 
+# Ignore these.
 db_data/
 
 .DS_Store
+
+# Prebuilt algorithm binaries fetched by download_algorithm, plus the PTX and
+# .so artifacts build_algorithm emits. Large, regenerable, and per-machine.
+tig-algorithms/lib/
+
+# Linker map files emitted at the repo root while building algorithm shared
+# objects. Root-anchored: dist/ has tracked swagger-ui source maps.
+/*.map
+
+# Agent session state and worktrees
+.claude/
+
+# Model checkpoints and dataset dumps. The generator weights this challenge
+# ships are committed deliberately via an explicit negation when added, since
+# every verifier needs byte-identical weights.
+*.pt
+*.pth
+*.safetensors
+*.npy
+*.hdf5
