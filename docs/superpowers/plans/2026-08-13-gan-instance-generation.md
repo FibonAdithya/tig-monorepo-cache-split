@@ -140,9 +140,9 @@ ssh tig-gpu 'source /venv/main/bin/activate && cd /workspace/tig-bench && \
     tig-challenges/src/vector_search/weights/v1_sift.bin'
 ```
 
-Expected: `layers : [(128, 512), (512, 1024), (1024, 1024), (1024, 128)]` and `bytes : 7088652`.
+Expected: `layers : [(128, 512), (512, 1024), (1024, 1024), (1024, 128)]` and `bytes : 7088684`.
 
-That byte count is `8 + 4 + 4*8 + 4*1772160` — header, layer count, four `(in,out)` pairs, and 1,772,160 f32 parameters.
+That byte count is `8 + 4 + 4*8 + 4*1772160` = `12 + 32 + 7088640` — magic, layer count, four `(in_dim, out_dim)` pairs, and 1,772,160 f32 parameters (1,769,472 weights + 2,688 biases).
 
 - [ ] **Step 3: Copy the blob back and record its hash**
 
