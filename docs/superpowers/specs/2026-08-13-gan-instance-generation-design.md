@@ -235,17 +235,23 @@ a published 128-dim spec.
 - Golden vectors: a few hundred outputs pinned against the PyTorch reference.
 - Calibration: optimal and random quality stay within the expected band on every
   active track.
-- Migration: the two production algorithms (`autovector_g`, `there_v10`, 92.7%
-  combined adoption) must score above `min_active_quality` on the new instances.
+- Migration: dimension-parameterised builds of `autovector_g` and `there_v10`
+  must score above `min_active_quality` (68,500) on the new instances. Their
+  current builds cannot run at 128 dims at all, so patched versions are a
+  precondition for this test rather than an outcome of it.
 
 ## Risks and open items
 
-- **Migration cliff.** If existing algorithms score below 68,500 on GAN
-  instances, benchmarkers cannot complete bundles the moment the change ships.
-  This must be measured before rollout, and may require a phased introduction.
-- **Instance generation cost.** Four GEMMs per vector is materially more work
-  than the current elementwise generator; the time must fit the runtime budget
-  alongside solving.
+- **Instance generation cost — measured, unresolved.** GAN generation costs
+  462 ms (n_queries=7000) to 1045 ms (15000) against the current generator's
+  ~120–250 ms, roughly 4x, in both the runtime and the verifier. That figure is
+  a cuBLAS floor and the deterministic kernel will be slower. Whether this is
+  acceptable, or whether the generator should be distilled to something
+  narrower than 1,769,472 MACs per vector, is still open.
+- **Migration is a coordination problem, not a technical one.** The per-algorithm
+  fix is ~30 lines, but only 2 of ~92 vector_search algorithms were tested, and
+  redeploying player-submitted code is a governance question. Rollout needs
+  notice and sign-off, not just a merge.
 - **Fidelity scope.** 128 dims is fixed by the trained weights, and the training
   corpus is SIFT specifically. "Realism" here means SIFT-like, which is narrower
   than embeddings in general.
