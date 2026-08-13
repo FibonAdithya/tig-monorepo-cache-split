@@ -29,6 +29,10 @@ tig-algorithms/lib/
 # Agent session state and worktrees
 .claude/
 
+# Subagent-driven-development scratch: ledgers, briefs, review packages.
+# Regenerable coordination state; the git history is the real record.
+.superpowers/
+
 # Model checkpoints and dataset dumps. The generator weights this challenge
 # ships are committed deliberately via an explicit negation when added, since
 # every verifier needs byte-identical weights.
