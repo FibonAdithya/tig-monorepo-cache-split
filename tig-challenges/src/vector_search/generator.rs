@@ -104,6 +104,28 @@ pub fn v1_weights() -> Result<GeneratorWeights> {
     parse_weights(V1_BLOB)
 }
 
+/// Reference forward pass, matching `gan_linear`'s accumulation order exactly.
+///
+/// Exists to pin the port against PyTorch in tests. `generate_instance` never
+/// calls it — instances are always produced on the GPU.
+pub fn forward_cpu(weights: &GeneratorWeights, latent: &[f32]) -> Vec<f32> {
+    let mut current = latent.to_vec();
+    for (i, layer) in weights.layers.iter().enumerate() {
+        let apply_activation = i + 1 < weights.layers.len();
+        let mut next = Vec::with_capacity(layer.out_dim);
+        for col in 0..layer.out_dim {
+            let w = &layer.weights[col * layer.in_dim..(col + 1) * layer.in_dim];
+            let mut acc = layer.bias[col];
+            for k in 0..layer.in_dim {
+                acc = current[k].mul_add(w[k], acc);
+            }
+            next.push(if apply_activation && acc < 0.0 { acc * 0.2 } else { acc });
+        }
+        current = next;
+    }
+    current
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,5 +207,34 @@ mod tests {
             g.layers.iter().map(|l| (l.in_dim, l.out_dim)).collect();
         assert_eq!(dims, vec![(128, 512), (512, 1024), (1024, 1024), (1024, 128)]);
         assert_eq!(g.layers[0].in_dim, LATENT_DIM);
+    }
+
+    #[test]
+    fn cpu_forward_matches_pytorch_golden_vectors() {
+        #[derive(serde::Deserialize)]
+        struct Golden {
+            latents: Vec<Vec<f32>>,
+            outputs: Vec<Vec<f32>>,
+        }
+        let golden: Golden = serde_json::from_str(include_str!(
+            "weights/golden_vectors.json"
+        ))
+        .unwrap();
+
+        let weights = v1_weights().unwrap();
+        for (latent, expected) in golden.latents.iter().zip(&golden.outputs) {
+            let got = forward_cpu(&weights, latent);
+            assert_eq!(got.len(), expected.len());
+            for (i, (g, e)) in got.iter().zip(expected).enumerate() {
+                // PyTorch sums a dot product in a different order than our
+                // fixed sequential loop, so exact equality is not expected;
+                // this bound catches a wrong transpose, a missing bias or a
+                // misapplied activation, which is what the test is for.
+                assert!(
+                    (g - e).abs() < 1e-4,
+                    "coordinate {i}: got {g}, expected {e}"
+                );
+            }
+        }
     }
 }
