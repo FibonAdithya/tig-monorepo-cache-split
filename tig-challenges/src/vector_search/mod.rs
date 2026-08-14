@@ -41,6 +41,24 @@ pub struct Challenge {
 pub const MAX_THREADS_PER_BLOCK: u32 = 1024;
 const FORWARD_CHUNK: usize = 65_536;
 
+/// Calibrated so GAN instances reproduce the quality band the Gaussian
+/// generator produced on mainnet: ~71,862 at n_queries=7000 rising to ~77,696
+/// at 15000, against a min_active_quality of 68,500 on every track.
+///
+/// The previous form, `(11.0 - avg_dist) / 11.0`, assumed 250-dim hypercube
+/// distances. GAN output has an optimal avg_dist of ~1.12-1.16 rather than
+/// ~10.18, so under it an exact solver scored 894,982 against a target of
+/// 71,862 -- twelve times too high, with every solution including a
+/// deliberately terrible one landing far above min_active_quality.
+///
+/// Two constants rather than one because matching the spread alone leaves the
+/// absolute level wrong, and the level is what the qualifier machinery keys on.
+/// Fitted by scripts/calibrate_vector_search.py across all five active tracks
+/// from 24 nonces each, measured on real generated instances. Worst residual
+/// 282 quality units, at n_queries=11000; every other track within 138.
+const QUALITY_OFFSET: f64 = 1.616563;
+const QUALITY_SCALE: f64 = 6.399004;
+
 impl Challenge {
     pub fn generate_instance(
         seed: &[u8; 32],
@@ -278,7 +296,7 @@ impl Challenge {
             prop: &cudaDeviceProp,
         ) -> Result<i32> {
             let avg_dist = self.evaluate_average_distance(solution, module, stream, prop)?;
-            let quality = (11.0 - avg_dist as f64) / 11.0;
+            let quality = (QUALITY_OFFSET - avg_dist as f64) / QUALITY_SCALE;
             let quality = quality.clamp(-10.0, 10.0) * QUALITY_PRECISION as f64;
             let quality = quality.round() as i32;
             Ok(quality)
