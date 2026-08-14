@@ -46,7 +46,10 @@ fn read_u32(blob: &[u8], at: &mut usize) -> Result<u32> {
 }
 
 fn read_f32s(blob: &[u8], at: &mut usize, count: usize) -> Result<Vec<f32>> {
-    let b = take(blob, at, count * 4)?;
+    let byte_len = count
+        .checked_mul(4)
+        .ok_or_else(|| anyhow!("weight blob element count overflow: {} floats", count))?;
+    let b = take(blob, at, byte_len)?;
     Ok(b.chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect())
@@ -62,14 +65,26 @@ pub fn parse_weights(blob: &[u8]) -> Result<GeneratorWeights> {
         return Err(anyhow!("weight blob declares zero layers"));
     }
 
-    let mut layers = Vec::with_capacity(num_layers);
+    // Not pre-reserving `num_layers` capacity: it comes straight from the
+    // blob and hasn't been checked against the remaining byte count yet, so
+    // a hostile value (e.g. near `u32::MAX`) must not trigger a huge
+    // allocation before the per-layer reads below have a chance to fail.
+    let mut layers = Vec::new();
     for i in 0..num_layers {
         let in_dim = read_u32(blob, &mut at)? as usize;
         let out_dim = read_u32(blob, &mut at)? as usize;
         if in_dim == 0 || out_dim == 0 {
             return Err(anyhow!("layer {} has a zero dimension", i));
         }
-        let weights = read_f32s(blob, &mut at, in_dim * out_dim)?;
+        let weight_count = in_dim.checked_mul(out_dim).ok_or_else(|| {
+            anyhow!(
+                "layer {} weight count overflow: {} * {}",
+                i,
+                in_dim,
+                out_dim
+            )
+        })?;
+        let weights = read_f32s(blob, &mut at, weight_count)?;
         let bias = read_f32s(blob, &mut at, out_dim)?;
         layers.push(Layer { in_dim, out_dim, weights, bias });
     }
@@ -134,6 +149,32 @@ mod tests {
     fn rejects_trailing_bytes() {
         let mut b = blob_with(&[(2, 3)]);
         b.push(0);
+        assert!(parse_weights(&b).is_err());
+    }
+
+    #[test]
+    fn rejects_layer_dims_that_overflow_element_count() {
+        // Built by hand rather than via `blob_with`: that helper itself
+        // computes `in_dim * out_dim` as a plain u32 multiplication to size
+        // the body, which would panic on these dimensions before
+        // `parse_weights` ever saw the blob. `in_dim * out_dim * 4` (the
+        // byte length of the weight matrix) overflows `usize` even though
+        // `in_dim * out_dim` alone does not, so this exercises the
+        // `checked_mul` in `read_f32s`.
+        let mut b = Vec::from(*b"TIGGAN01");
+        b.extend_from_slice(&1u32.to_le_bytes()); // num_layers
+        b.extend_from_slice(&u32::MAX.to_le_bytes()); // in_dim
+        b.extend_from_slice(&u32::MAX.to_le_bytes()); // out_dim
+        assert!(parse_weights(&b).is_err());
+    }
+
+    #[test]
+    fn rejects_absurd_layer_count() {
+        // Declares billions of layers with no data to back them. Must
+        // return a clean Err (via the truncation check on the very first
+        // layer) rather than pre-allocating a huge Vec for `num_layers`.
+        let mut b = Vec::from(*b"TIGGAN01");
+        b.extend_from_slice(&u32::MAX.to_le_bytes()); // num_layers
         assert!(parse_weights(&b).is_err());
     }
 
