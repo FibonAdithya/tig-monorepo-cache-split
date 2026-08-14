@@ -7,6 +7,9 @@ use cudarc::{
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::sync::Arc;
 
+mod generator;
+use generator::{v1_weights, LATENT_DIM};
+
 impl_kv_string_serde! {
     Track {
         n_queries: u32,
