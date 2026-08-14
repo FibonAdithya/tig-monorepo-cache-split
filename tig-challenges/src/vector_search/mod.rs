@@ -4,7 +4,6 @@ use cudarc::{
     driver::{safe::LaunchConfig, CudaModule, CudaSlice, CudaStream, PushKernelArg},
     runtime::sys::cudaDeviceProp,
 };
-use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::sync::Arc;
 
 mod generator;
@@ -40,6 +39,7 @@ pub struct Challenge {
 }
 
 pub const MAX_THREADS_PER_BLOCK: u32 = 1024;
+const FORWARD_CHUNK: usize = 65_536;
 
 impl Challenge {
     pub fn generate_instance(
@@ -49,96 +49,164 @@ impl Challenge {
         stream: Arc<CudaStream>,
         _prop: &cudaDeviceProp,
     ) -> Result<Self> {
-        let mut rng = StdRng::from_seed(seed.clone());
-        let vector_dims = 250;
+        let weights = v1_weights()?;
+        let layers = &weights.layers;
+        let vector_dims = layers
+            .last()
+            .ok_or_else(|| anyhow!("generator has no layers"))?
+            .out_dim;
+        let widest = layers.iter().map(|layer| layer.out_dim).max().unwrap();
         let database_size = 100 * track.n_queries;
-        let avg_cluster_size: f32 = 700.0;
-        let num_clusters: u32 = ((1.0 + rng.gen::<f32>() * 0.05)
-            + database_size as f32 / avg_cluster_size)
-            .round() as u32;
-        let var: f32 = 0.2;
-        let alpha: f32 = 0.05;
-        let avg_cluster_weight = avg_cluster_size.ln() - var / 2.0;
 
-        let generate_clusters_kernel = module.load_function("generate_clusters")?;
-        let generate_vectors_kernel = module.load_function("generate_vectors")?;
-
-        let block_size = MAX_THREADS_PER_BLOCK;
+        let sample_latents_kernel = module.load_function("gan_sample_latents")?;
+        let linear_kernel = module.load_function("gan_linear")?;
 
         let d_seed = stream.memcpy_stod(seed)?;
-        let mut d_cluster_means =
-            stream.alloc_zeros::<f32>((num_clusters * vector_dims) as usize)?;
-        let mut d_cluster_weights = stream.alloc_zeros::<f32>(num_clusters as usize)?;
-        let mut d_cluster_stds =
-            stream.alloc_zeros::<f32>((num_clusters * vector_dims) as usize)?;
-
-        unsafe {
-            stream
-                .launch_builder(&generate_clusters_kernel)
-                .arg(&d_seed)
-                .arg(&avg_cluster_weight)
-                .arg(&vector_dims)
-                .arg(&var)
-                .arg(&alpha)
-                .arg(&num_clusters)
-                .arg(&mut d_cluster_means)
-                .arg(&mut d_cluster_stds)
-                .arg(&mut d_cluster_weights)
-                .launch(LaunchConfig {
-                    grid_dim: ((num_clusters + block_size - 1) / block_size, 1, 1),
-                    block_dim: (block_size, 1, 1),
-                    shared_mem_bytes: 0,
-                })?;
+        let mut d_weights = Vec::with_capacity(layers.len());
+        for layer in layers {
+            d_weights.push((
+                stream.memcpy_stod(&layer.weights)?,
+                stream.memcpy_stod(&layer.bias)?,
+            ));
         }
-        stream.synchronize()?;
 
-        let cluster_weights = stream.memcpy_dtov(&d_cluster_weights)?;
-        let total_weight: f32 = cluster_weights.iter().sum();
-        let mut cluster_cum_prob = cluster_weights
-            .iter()
-            .scan(0.0, |state, &weight| {
-                let ret = *state;
-                *state += weight / total_weight;
-                Some(ret)
-            })
-            .collect::<Vec<_>>();
-        cluster_cum_prob.push(1.0);
-
-        let d_cluster_cum_prob = stream.memcpy_stod(&cluster_cum_prob)?;
+        let mut d_scratch_a = stream.alloc_zeros::<f32>(FORWARD_CHUNK * widest)?;
+        let mut d_scratch_b = stream.alloc_zeros::<f32>(FORWARD_CHUNK * widest)?;
+        let mut d_latents = stream.alloc_zeros::<f32>(FORWARD_CHUNK * LATENT_DIM)?;
         let mut d_database_vectors =
-            stream.alloc_zeros::<f32>((database_size * vector_dims) as usize)?;
+            stream.alloc_zeros::<f32>(database_size as usize * vector_dims)?;
         let mut d_query_vectors =
-            stream.alloc_zeros::<f32>((track.n_queries * vector_dims) as usize)?;
+            stream.alloc_zeros::<f32>(track.n_queries as usize * vector_dims)?;
 
-        unsafe {
-            stream
-                .launch_builder(&generate_vectors_kernel)
-                .arg(&d_seed)
-                .arg(&database_size)
-                .arg(&track.n_queries)
-                .arg(&vector_dims)
-                .arg(&num_clusters)
-                .arg(&d_cluster_cum_prob)
-                .arg(&d_cluster_means)
-                .arg(&d_cluster_stds)
-                .arg(&mut d_database_vectors)
-                .arg(&mut d_query_vectors)
-                .launch(LaunchConfig {
-                    grid_dim: ((database_size + block_size - 1) / block_size, 1, 1),
-                    block_dim: (block_size, 1, 1),
-                    shared_mem_bytes: 0,
-                })?;
+        for (dest_is_query, count) in [
+            (false, database_size as usize),
+            (true, track.n_queries as usize),
+        ] {
+            let index_base = if dest_is_query {
+                database_size as usize
+            } else {
+                0
+            };
+
+            for chunk_start in (0..count).step_by(FORWARD_CHUNK) {
+                let rows = FORWARD_CHUNK.min(count - chunk_start);
+
+                unsafe {
+                    stream
+                        .launch_builder(&sample_latents_kernel)
+                        .arg(&d_seed)
+                        .arg(&(rows as i32))
+                        .arg(&(LATENT_DIM as i32))
+                        .arg(&mut d_latents)
+                        .arg(&((index_base + chunk_start) as i32))
+                        .launch(LaunchConfig {
+                            grid_dim: ((rows as u32 + 255) / 256, 1, 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        })?;
+                }
+
+                for (i, layer) in layers.iter().enumerate() {
+                    let is_last = i + 1 == layers.len();
+                    let (d_weight, d_bias) = &d_weights[i];
+                    let cfg = LaunchConfig {
+                        grid_dim: (
+                            (rows as u32 + 127) / 128,
+                            (layer.out_dim as u32 + 63) / 64,
+                            1,
+                        ),
+                        block_dim: (16, 16, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let apply_activation = (!is_last) as i32;
+                    let out_row_offset = if is_last { chunk_start as i32 } else { 0 };
+
+                    if is_last {
+                        let input: &CudaSlice<f32> = if i == 0 {
+                            &d_latents
+                        } else if i % 2 == 1 {
+                            &d_scratch_a
+                        } else {
+                            &d_scratch_b
+                        };
+                        let destination = if dest_is_query {
+                            &mut d_query_vectors
+                        } else {
+                            &mut d_database_vectors
+                        };
+                        unsafe {
+                            stream
+                                .launch_builder(&linear_kernel)
+                                .arg(input)
+                                .arg(d_weight)
+                                .arg(d_bias)
+                                .arg(destination)
+                                .arg(&(rows as i32))
+                                .arg(&(layer.in_dim as i32))
+                                .arg(&(layer.out_dim as i32))
+                                .arg(&apply_activation)
+                                .arg(&out_row_offset)
+                                .launch(cfg)?;
+                        }
+                    } else if i == 0 {
+                        unsafe {
+                            stream
+                                .launch_builder(&linear_kernel)
+                                .arg(&d_latents)
+                                .arg(d_weight)
+                                .arg(d_bias)
+                                .arg(&mut d_scratch_a)
+                                .arg(&(rows as i32))
+                                .arg(&(layer.in_dim as i32))
+                                .arg(&(layer.out_dim as i32))
+                                .arg(&apply_activation)
+                                .arg(&out_row_offset)
+                                .launch(cfg)?;
+                        }
+                    } else if i % 2 == 1 {
+                        unsafe {
+                            stream
+                                .launch_builder(&linear_kernel)
+                                .arg(&d_scratch_a)
+                                .arg(d_weight)
+                                .arg(d_bias)
+                                .arg(&mut d_scratch_b)
+                                .arg(&(rows as i32))
+                                .arg(&(layer.in_dim as i32))
+                                .arg(&(layer.out_dim as i32))
+                                .arg(&apply_activation)
+                                .arg(&out_row_offset)
+                                .launch(cfg)?;
+                        }
+                    } else {
+                        unsafe {
+                            stream
+                                .launch_builder(&linear_kernel)
+                                .arg(&d_scratch_b)
+                                .arg(d_weight)
+                                .arg(d_bias)
+                                .arg(&mut d_scratch_a)
+                                .arg(&(rows as i32))
+                                .arg(&(layer.in_dim as i32))
+                                .arg(&(layer.out_dim as i32))
+                                .arg(&apply_activation)
+                                .arg(&out_row_offset)
+                                .launch(cfg)?;
+                        }
+                    }
+                }
+            }
         }
         stream.synchronize()?;
 
-        return Ok(Self {
+        Ok(Self {
             seed: seed.clone(),
             num_queries: track.n_queries.clone(),
-            vector_dims,
+            vector_dims: vector_dims as u32,
             database_size,
             d_database_vectors,
             d_query_vectors,
-        });
+        })
     }
 
     pub fn evaluate_average_distance(
