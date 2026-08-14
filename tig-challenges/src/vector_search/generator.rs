@@ -230,8 +230,13 @@ mod tests {
                 // fixed sequential loop, so exact equality is not expected;
                 // this bound catches a wrong transpose, a missing bias or a
                 // misapplied activation, which is what the test is for.
+                //
+                // 1e-5 against a largest observed deviation of 4.47e-7: over 20x
+                // headroom on reordering error, but tight enough to fail on a
+                // subtle arithmetic regression. At the original 1e-4 the margin
+                // was ~200x and the test would have passed through real damage.
                 assert!(
-                    (g - e).abs() < 1e-4,
+                    (g - e).abs() < 1e-5,
                     "coordinate {i}: got {g}, expected {e}"
                 );
             }

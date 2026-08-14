@@ -41,6 +41,15 @@ def export(checkpoint: Path, state_key: str, out: Path) -> None:
     blob = bytearray(MAGIC)
     blob += struct.pack("<I", len(indices))
     for i in indices:
+        # A layer with a weight but no bias would otherwise raise a bare
+        # KeyError. The Rust parser has no representation for a biasless layer,
+        # so say that plainly rather than leaving a traceback to interpret.
+        for suffix in ("weight", "bias"):
+            if f"net.{i}.{suffix}" not in state:
+                raise SystemExit(
+                    f"layer {i} has no '{suffix}'; the blob format requires both "
+                    f"a weight and a bias per layer"
+                )
         w = state[f"net.{i}.weight"]
         b = state[f"net.{i}.bias"]
         out_dim, in_dim = w.shape
