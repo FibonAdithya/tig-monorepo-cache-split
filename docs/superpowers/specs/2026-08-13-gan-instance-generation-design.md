@@ -1,6 +1,7 @@
 # GAN-based instance generation for vector_search
 
-Status: approved design, pending implementation plan
+Status: implemented and validated on a single GPU architecture; see "Validation".
+Migration and cross-architecture confirmation remain open.
 Branch: `vector_search/gan_instance_gen` (forked from `blank_slate`)
 
 ## Goal
@@ -151,6 +152,15 @@ to vary with `n_queries`.
 The generator sits behind a small trait — weights blob, layer dims, forward pass —
 so adding v4 later means adding its kernels and blob, not reworking the challenge.
 
+**As built, the trait was deliberately not written**, while the outcome it was
+for was delivered. The blob format carries per-layer dimensions, and
+`generate_instance` derives `vector_dims`, the layer count and the loop bounds
+from the parsed weights, so any MLP-shaped generator drops in with no code
+change. A trait with one implementor would be abstraction ahead of a second
+case, and v4 is not MLP-shaped anyway: it needs Conv3d, gate sampling and
+renormalisation, so the right boundary for it cannot be designed from v1 alone.
+Add the trait when v4 arrives and its real requirements are visible.
+
 ## Baseline measurements
 
 Measured on tig-gpu (RTX 4060) with `tig-runtime`/`tig-verifier` built from this
@@ -240,14 +250,146 @@ a published 128-dim spec.
   current builds cannot run at 128 dims at all, so patched versions are a
   precondition for this test rather than an outcome of it.
 
+## Validation
+
+End-to-end on tig-gpu (RTX 4060, sm_89, CUDA 12.6, `nightly-2025-02-10`), with
+every GPU run holding a `gpu-claim`.
+
+### Instances are solvable and land in the intended band
+
+`refsearch`, a brute-force exact 1-NN reference reading `challenge.vector_dims`
+rather than assuming a value, run through `tig-runtime` and `tig-verifier` under
+the recalibrated constants. 15/15 solutions valid, 30/30 zero exit codes, no
+invalid solutions or warnings:
+
+| track | nonce 0 | nonce 1 | nonce 2 | 3-nonce mean | mainnet median |
+|---|---|---|---|---|---|
+| 7000 | 72,099 | 71,214 | 70,431 | 71,248 | 71,862 |
+| 9000 | 73,751 | 73,254 | 73,255 | 73,420 | 73,739 |
+| 11000 | 75,361 | 74,746 | 75,383 | 75,163 | 75,234 |
+| 13000 | 76,728 | 76,698 | 76,764 | 76,730 | 76,523 |
+| 15000 | 77,056 | 77,083 | 77,142 | 77,094 | 77,696 |
+
+Every value clears `min_active_quality` (68,500), the whole set sits inside
+mainnet's observed 71,840–77,778 range, and quality rises with track size as it
+does on mainnet. The 3-nonce means deviate from the medians by -614 to +207,
+which is what a per-nonce sigma of ~400–500 predicts at n=3 (standard error
+~230–290) — nonce noise, not calibration error. The 24-nonce fit is the
+authoritative figure.
+
+Exact 1-NN is admissible: `fuel_consumed` is 3.84e11 at n_queries=7000 and
+scales to ~1.76e12 at 15000, against a `max_fuel_budget` of 5e12.
+
+### The port matches PyTorch
+
+8/8 `tig-challenges` generator tests pass, including golden vectors dumped from
+the source checkpoint. Largest observed deviation 4.47e-7 against a 1e-5 bound.
+
+### Output is invariant to launch geometry
+
+This is the property verification depends on, and the quality integer cannot
+show it — one quality unit is ~0.077 of total distance while a last-bit change
+in one coordinate moves it ~1e-7. So the raw device buffers were hashed
+(FNV-1a over the little-endian f32 bytes) across the two knobs that genuinely
+change launch geometry for the tiled kernel.
+
+n_queries=7000, 89,600,000 database floats and 896,000 query floats:
+
+| forward chunk | latent block | database digest | queries digest |
+|---|---|---|---|
+| 65,536 | 256 | `4353c1756d375efd` | `ca3bc89bed2c9253` |
+| 32,768 | 256 | `4353c1756d375efd` | `ca3bc89bed2c9253` |
+| 65,536 | 128 | `4353c1756d375efd` | `ca3bc89bed2c9253` |
+| 131,072 | 512 | `4353c1756d375efd` | `ca3bc89bed2c9253` |
+
+n_queries=15000, 192,000,000 database floats: `58e13837b2fcfdbd` /
+`b274ea82caa8c1ac` at both 65,536/256 and 131,072/512.
+
+Negative control, n_queries=9000: `4edf76f71ce42dda` / `7933addf12ee2963` —
+different, so the digest is input-sensitive and the matches above are real.
+
+Separately, the first four database floats are bit-identical across all three
+tracks (`3e727ac5 3cac0367 3c160a62 3c47de90`), independently confirming that a
+vector's value depends only on its global index and not on instance size.
+
+### Memory and cost
+
+The chunked pass holds at the largest track with no OOM. Combined
+runtime+verifier time for generation plus evaluation is ~2.3 s per nonce at
+n_queries=7000 and ~3.8 s at 15000.
+
+Cross-architecture reproducibility remains argued rather than measured: only one
+GPU model was available.
+
 ## Risks and open items
 
-- **Instance generation cost — measured, unresolved.** GAN generation costs
-  462 ms (n_queries=7000) to 1045 ms (15000) against the current generator's
-  ~120–250 ms, roughly 4x, in both the runtime and the verifier. That figure is
-  a cuBLAS floor and the deterministic kernel will be slower. Whether this is
-  acceptable, or whether the generator should be distilled to something
-  narrower than 1,769,472 MACs per vector, is still open.
+- **Instance generation cost — measured, resolved, accepted.** The first
+  deterministic kernel used one block per input row and re-read all 7.08 MB of
+  weights per vector, giving 5.00 TB of weight traffic and 22,515 ms at
+  n_queries=7000 — ~49x the cuBLAS floor, and bandwidth-bound at ~81% of the
+  4060's 272 GB/s. The shipped kernel tiles a 128x64 output block with an 8x4
+  per-thread register tile, which reuses each weight across 128 rows and lands
+  at 628 ms (707k vectors) and 1,335 ms (1,515k) — inside 1.5x of the cuBLAS
+  floor. Determinism survives because tiling changes which block owns an output
+  element, not the accumulation order within it; split-K would break that and is
+  deliberately not used.
+
+  The residual cost is inherent: ~5x the previous generator's ~120–250 ms, in
+  both the runtime and the verifier, from 1,769,472 MACs per vector. No kernel
+  removes it — only a smaller generator would. Accepted.
+
+- **Per-nonce quality variance is ~7–9x wider than today — accepted, and the
+  most consequential property of this change.** `quality = (offset - avg_dist) /
+  scale` is linear, so the single constant `scale` fixes both how far quality
+  drifts across the five tracks and how much per-nonce noise reaches quality.
+  Their ratio is a property of the data, not the constants:
+
+  | | cross-track drift | per-nonce noise | ratio |
+  |---|---|---|---|
+  | mainnet (Gaussian, 250-dim) | ~5,834 units | ~80 units | ~73 |
+  | GAN (SIFT-like, 128-dim) | ~5,834 units | ~500 units | 12.3 |
+
+  The cause is concentration of measure. At 250 uniform dimensions per-query 1-NN
+  distance has CV ~0.7%, so its average over thousands of queries barely moves
+  between nonces. Real clustered embedding data at 128 dims has per-query CV
+  ~75%, roughly 100x more relative dispersion.
+
+  Because bundle quality is the *median* of `num_nonces_per_bundle` nonces
+  (`tig-protocol/src/contracts/benchmarks.rs:218`), the fair comparison is of
+  bundle medians. Predicted spread across ~50 qualifiers, against mainnet's
+  observed spread of the same quantity:
+
+  | track | nonces/bundle | predicted | mainnet | ratio |
+  |---|---|---|---|---|
+  | 7000 | 20 | 647 | 80 | 8.1x |
+  | 9000 | 17 | 663 | 83 | 8.0x |
+  | 11000 | 15 | 728 | 81 | 9.0x |
+  | 13000 | 10 | 708 | 99 | 7.1x |
+  | 15000 | 5 | 1,073 | 114 | 9.4x |
+
+  Three mitigations were tested and rejected. Normalising by a cheap
+  per-instance reference distance the verifier could compute without solving
+  1-NN correlates only 0.32–0.76 with the 1-NN scale and cuts the noise by
+  5–35%, because the variance is mostly query-sampling noise rather than
+  instance-scale noise. Raising `num_nonces_per_bundle` helps only as
+  1/sqrt(N), so track 15000 would need ~443 nonces instead of 5. Per-track
+  constants remove the 282-unit fit residual but not the ~700-unit noise, and
+  hardcode the five track sizes into `evaluate_solution`.
+
+  Accepted deliberately: matching the per-track band is what preserves the
+  level the qualifier machinery keys on, and the variance is inherent to using
+  realistic data, which is the point of the change.
+
+- **The signal was not measured, only the noise — open.** Calibration targets
+  exact 1-NN. Mainnet's tight ~80-unit spread exists because every qualifier
+  sits within ~1% of exact 1-NN on the *old* instances, and exact 1-NN is
+  affordable: brute force consumes 3.84e11 fuel at n_queries=7000 and ~1.76e12
+  at 15000, against a `max_fuel_budget` of 5e12. If that remains true on
+  clustered data, serious algorithms will again cluster at the optimum and the
+  ~700-unit nonce noise will dominate the competitive gap. If instead clustered
+  data spreads approximate ANN algorithms over thousands of quality units, the
+  noise is proportionately fine. Deciding this needs a real approximate ANN
+  algorithm at 128 dims, which is beyond this plan's scope.
 - **Migration is a coordination problem, not a technical one.** The per-algorithm
   fix is ~30 lines, but only 2 of ~92 vector_search algorithms were tested, and
   redeploying player-submitted code is a governance question. Rollout needs
