@@ -165,3 +165,64 @@ extern "C" __global__ void evaluate_total_distance(
         *total_distance += dist;
     }
 }
+
+// Fixed-order dense layer with optional LeakyReLU(0.2).
+//
+// Determinism is the whole point. Each thread owns one complete output element
+// and accumulates over k sequentially, so the summation order does not depend
+// on grid shape, block size, or how the scheduler interleaves work. That is the
+// property cuBLAS cannot offer: it picks kernels by heuristic, and a different
+// architecture picks a different reduction order and a different last bit.
+//
+// Only fmaf/mul/add/select appear here. build_ptx compiles with --use_fast_math,
+// which makes division, sqrt and transcendentals approximate and potentially
+// architecture-dependent; these operations are all IEEE-754 exactly rounded, so
+// identical PTX yields identical results on any conforming GPU.
+//
+// The input row is staged in shared memory because every thread in the block
+// reads all of it. Weights are left in global memory: they total under 5 MB per
+// layer and stay resident in L2 across the whole launch.
+//
+// `out_row_offset` shifts writes within the destination buffer, so the caller
+// can process a chunk of rows and land the last layer's output directly in its
+// final position. `n` is the chunk's row count, not the instance's.
+extern "C" __global__ void gan_linear(
+    const float *__restrict__ input,
+    const float *__restrict__ weight,
+    const float *__restrict__ bias,
+    float *__restrict__ output,
+    const int n,
+    const int in_dim,
+    const int out_dim,
+    const int apply_activation,
+    const int out_row_offset
+)
+{
+    extern __shared__ float s_input[];
+
+    for (int row = blockIdx.x; row < n; row += gridDim.x)
+    {
+        const float *x = input + (long long)row * in_dim;
+        for (int i = threadIdx.x; i < in_dim; i += blockDim.x) {
+            s_input[i] = x[i];
+        }
+        __syncthreads();
+
+        const long long out_row = (long long)(out_row_offset + row);
+        for (int col = threadIdx.x; col < out_dim; col += blockDim.x)
+        {
+            const float *w = weight + (long long)col * in_dim;
+            float acc = bias[col];
+            for (int k = 0; k < in_dim; ++k) {
+                acc = fmaf(s_input[k], w[k], acc);
+            }
+            if (apply_activation) {
+                acc = (acc >= 0.0f) ? acc : (acc * 0.2f);
+            }
+            output[out_row * out_dim + col] = acc;
+        }
+        // Guard the next iteration's overwrite of s_input against threads still
+        // reading it in the loop above.
+        __syncthreads();
+    }
+}
