@@ -168,9 +168,9 @@ extern "C" __global__ void evaluate_total_distance(
 
 // Fixed-order dense layer with optional LeakyReLU(0.2).
 //
-// Determinism is the whole point. Each thread owns one complete output element
-// and accumulates over k sequentially, so the summation order does not depend
-// on grid shape, block size, or how the scheduler interleaves work. That is the
+// Determinism is the whole point. Each thread owns complete output elements and
+// accumulates over k sequentially, so the summation order does not depend on
+// how the scheduler interleaves work. That is the
 // property cuBLAS cannot offer: it picks kernels by heuristic, and a different
 // architecture picks a different reduction order and a different last bit.
 //
@@ -179,9 +179,11 @@ extern "C" __global__ void evaluate_total_distance(
 // architecture-dependent; these operations are all IEEE-754 exactly rounded, so
 // identical PTX yields identical results on any conforming GPU.
 //
-// The input row is staged in shared memory because every thread in the block
-// reads all of it. Weights are left in global memory: they total under 5 MB per
-// layer and stay resident in L2 across the whole launch.
+// A block produces a 128-row by 64-column output tile. Input and weight tiles are
+// staged in shared memory, while each thread accumulates an 8-by-4 register tile.
+// Each shared-memory operand is reused by four FMAs per thread, and every weight
+// is reused across 128 rows. Splitting K across blocks is deliberately avoided:
+// every output still visits k=0..in_dim in exactly that order.
 //
 // `out_row_offset` shifts writes within the destination buffer, so the caller
 // can process a chunk of rows and land the last layer's output directly in its
@@ -198,31 +200,94 @@ extern "C" __global__ void gan_linear(
     const int out_row_offset
 )
 {
-    extern __shared__ float s_input[];
+    constexpr int BM = 128;
+    constexpr int BN = 64;
+    constexpr int BK = 16;
+    constexpr int BLOCK_X = 16;
+    constexpr int BLOCK_Y = 16;
+    constexpr int TM = BM / BLOCK_Y;
+    constexpr int TN = BN / BLOCK_X;
 
-    for (int row = blockIdx.x; row < n; row += gridDim.x)
-    {
-        const float *x = input + (long long)row * in_dim;
-        for (int i = threadIdx.x; i < in_dim; i += blockDim.x) {
-            s_input[i] = x[i];
+    __shared__ float s_input[BM][BK + 1];
+    __shared__ float s_weight[BN][BK + 1];
+
+    const int tid = threadIdx.y * BLOCK_X + threadIdx.x;
+    const int row_base = blockIdx.x * BM;
+    const int col_base = blockIdx.y * BN;
+
+    float acc[TM][TN];
+#pragma unroll
+    for (int i = 0; i < TM; ++i) {
+#pragma unroll
+        for (int j = 0; j < TN; ++j) {
+            const int col = col_base + threadIdx.x + j * BLOCK_X;
+            acc[i][j] = (col < out_dim) ? bias[col] : 0.0f;
+        }
+    }
+
+    for (int k_base = 0; k_base < in_dim; k_base += BK) {
+        for (int i = tid; i < BM * BK; i += BLOCK_X * BLOCK_Y) {
+            const int tile_row = i / BK;
+            const int tile_k = i - tile_row * BK;
+            const int row = row_base + tile_row;
+            const int k = k_base + tile_k;
+            s_input[tile_row][tile_k] =
+                (row < n && k < in_dim)
+                    ? input[(long long)row * in_dim + k]
+                    : 0.0f;
+        }
+        for (int i = tid; i < BN * BK; i += BLOCK_X * BLOCK_Y) {
+            const int tile_col = i / BK;
+            const int tile_k = i - tile_col * BK;
+            const int global_col = blockIdx.y * BN + tile_col;
+            const int k = k_base + tile_k;
+            s_weight[tile_col][tile_k] =
+                (global_col < out_dim && k < in_dim)
+                    ? weight[(long long)global_col * in_dim + k]
+                    : 0.0f;
         }
         __syncthreads();
 
-        const long long out_row = (long long)(out_row_offset + row);
-        for (int col = threadIdx.x; col < out_dim; col += blockDim.x)
-        {
-            const float *w = weight + (long long)col * in_dim;
-            float acc = bias[col];
-            for (int k = 0; k < in_dim; ++k) {
-                acc = fmaf(s_input[k], w[k], acc);
+        const int tile_k_count = min(BK, in_dim - k_base);
+        for (int tile_k = 0; tile_k < tile_k_count; ++tile_k) {
+            float x[TM];
+            float w[TN];
+#pragma unroll
+            for (int i = 0; i < TM; ++i) {
+                x[i] = s_input[threadIdx.y + i * BLOCK_Y][tile_k];
             }
-            if (apply_activation) {
-                acc = (acc >= 0.0f) ? acc : (acc * 0.2f);
+#pragma unroll
+            for (int j = 0; j < TN; ++j) {
+                w[j] = s_weight[threadIdx.x + j * BLOCK_X][tile_k];
             }
-            output[out_row * out_dim + col] = acc;
+#pragma unroll
+            for (int i = 0; i < TM; ++i) {
+#pragma unroll
+                for (int j = 0; j < TN; ++j) {
+                    acc[i][j] = fmaf(x[i], w[j], acc[i][j]);
+                }
+            }
         }
-        // Guard the next iteration's overwrite of s_input against threads still
-        // reading it in the loop above.
         __syncthreads();
+    }
+
+#pragma unroll
+    for (int i = 0; i < TM; ++i) {
+        const int row = row_base + threadIdx.y + i * BLOCK_Y;
+        if (row < n) {
+#pragma unroll
+            for (int j = 0; j < TN; ++j) {
+                const int col = col_base + threadIdx.x + j * BLOCK_X;
+                if (col >= out_dim) {
+                    continue;
+                }
+                float value = acc[i][j];
+                if (apply_activation) {
+                    value = (value >= 0.0f) ? value : (value * 0.2f);
+                }
+                const long long out_row = (long long)(out_row_offset + row);
+                output[out_row * out_dim + col] = value;
+            }
+        }
     }
 }
