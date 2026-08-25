@@ -282,3 +282,83 @@ every scenario after it, additive.
 2. Confirmation that the DEEP corpus is unit-norm, before Milestone 2 training.
 3. Cross-architecture determinism remains open from the previous spec and is
    unaffected by this design either way.
+
+## Validation
+
+Measured 2026-08-25 on tig-gpu after the box was repaired: **RTX 3060, GA106,
+compute capability 8.6 (sm_86)**, CUDA 12.6, `nightly-2025-02-10`, every GPU run
+holding a `gpu-claim`. Note the architecture: all prior validation in this
+project was on an RTX 4060 (sm_89).
+
+### Calibration lands in band
+
+Instances generated for `s=sift_128` and solved by brute-force exact 1-NN over a
+fixed nonce range 0–23 (not sampled, not time-derived):
+
+| statistic | value |
+|---|---|
+| n | 24 |
+| mean quality | **71,819.8** |
+| target (mainnet median at `n_queries=7000`) | 71,862 |
+| **deviation from target** | **−42.2** |
+| standard deviation | 540.4 |
+| min | 70,870 |
+| max | 73,434 |
+
+Both assertions pass. Every nonce clears `min_active_quality` (68,500) with the
+worst at 70,870, and the mean sits 42 units from target against a ±400 band —
+0.38 standard errors, where the standard error of a 24-nonce mean is 110.
+
+**No re-fit was required.** The constants shipped in `ScenarioConfig` are still
+the joint fit across the five retired tracks, and they land well inside
+tolerance at this track, so the exact single-track fit described above remains
+available but unnecessary. The measured sd of 540 also independently reproduces
+the ~500 per-nonce sigma recorded in the previous spec, on different hardware.
+
+### Output is invariant to launch geometry
+
+FNV-1a over the raw device buffers, across the two knobs that actually change
+launch geometry. `gan_linear`'s `block_dim` is fixed at `(16,16)` by its tile
+constants and is deliberately not varied.
+
+| forward chunk | latent block | database digest | queries digest |
+|---|---|---|---|
+| 65,536 | 256 | `724bd044c64bb8f7` | `ae2662cd24a5116d` |
+| 32,768 | 256 | `724bd044c64bb8f7` | `ae2662cd24a5116d` |
+| 65,536 | 128 | `724bd044c64bb8f7` | `ae2662cd24a5116d` |
+| 131,072 | 512 | `724bd044c64bb8f7` | `ae2662cd24a5116d` |
+
+Negative control at nonce 1: `37cac7a8cceaed3f` / `4ee10d3f2de30886` — different,
+so the digest is input-sensitive and the four matches above are meaningful.
+
+### What this does NOT establish
+
+**Cross-architecture bit-exactness remains open, and this run could not close
+it.** The digests above cannot be compared against the sm_89 digests in the
+previous spec (`4353c1756d375efd` / `ca3bc89bed2c9253`), because
+`BenchmarkSettings::calc_seed` hashes the jsonified settings — including
+`track_id` — and `track_id` changed from `n_queries=7000` to `s=sift_128` in
+this very design. Different seed, different instance, different digest, for
+reasons that have nothing to do with the GPU.
+
+Settling it requires generating the *same* track on both architectures. The
+architecture change and the track-encoding change landed together, which
+confounds exactly the comparison that was wanted.
+
+What the run does add: the generator produces in-band, launch-invariant,
+solvable instances on a second architecture. Combined with the static PTX audit
+recorded in the handoff — `gan_linear` emits 96 `fma.rn` and 32 `mul` with no
+inexact operation — the remaining cross-architecture risk sits in the inherited
+`sin/cos/lg2/sqrt.approx` of `gan_sample_latents` and `evaluate_total_distance`,
+which mainnet already exercises across a heterogeneous fleet.
+
+### Reproducing
+
+Two scratch binaries were used and **deleted afterwards**, as they need the
+`vector_search`/`cuda` features and otherwise break `cargo test --workspace`:
+`measure_quality.rs` (generate, brute-force solve, print quality) and
+`dump_instance.rs` (FNV-1a over the device buffers). Both bypass `tig-runtime`
+by loading the algorithm PTX directly, which avoids needing an instrumented
+`.so` — worth knowing, because `build_so` requires TIG's custom LLVM at
+`/opt/llvm`, whose prebuilt binaries need GLIBC_2.36 and therefore do not run on
+this Ubuntu 22.04 box.
