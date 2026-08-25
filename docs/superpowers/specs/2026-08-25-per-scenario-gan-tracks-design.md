@@ -158,10 +158,13 @@ quality problem, and a median of 20 draws suppresses it far better than a median
 of 5. Track 7000 is also the cheapest to generate (628 ms against 1,335 ms at
 15,000).
 
-A secondary benefit: with one track, calibration is an exact fit to a single
-target rather than a compromise across five, so the 282-unit worst-case residual
-recorded in the previous spec disappears. The ~500-unit per-nonce noise does
-not.
+A secondary benefit is available but **not automatic**: with one track,
+calibration *can* be an exact fit to a single target rather than a compromise
+across five, retiring the 282-unit worst-case residual from the previous spec.
+Realising it requires re-fitting the constants against the single track, which
+needs a live GPU. Until then the shipped constants remain the inherited joint
+fit (residual ≤138 at `n_queries=7000`), which is within tolerance but is not
+the exact fit. The ~500-unit per-nonce noise is unaffected either way.
 
 `database_size` stays `100 * n_queries` in value but moves into `ScenarioConfig`
 as an explicit field, so a future high-dimensional scenario can override it

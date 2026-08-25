@@ -141,8 +141,6 @@ pub struct ScenarioConfig {
     pub quality_scale: f64,
 }
 
-const SIFT_BLOB: &[u8] = include_bytes!("weights/v1_sift.bin");
-
 impl From<Scenario> for ScenarioConfig {
     fn from(scenario: Scenario) -> Self {
         match scenario {
@@ -150,7 +148,12 @@ impl From<Scenario> for ScenarioConfig {
                 n_queries: 7_000,
                 database_size: 700_000,
                 vector_dims: 128,
-                weights: SIFT_BLOB,
+                // Reuses generator.rs's existing constant. Do NOT add a second
+                // include_bytes! of the same file here: Rust does not guarantee
+                // that two identical consts in different modules are merged, so
+                // it can embed the 7 MB blob twice -- in every algorithm .so,
+                // since they all link tig-challenges.
+                weights: super::generator::V1_BLOB,
                 quality_offset: 1.616563,
                 quality_scale: 6.399004,
             },
@@ -183,6 +186,12 @@ Add to `tig-challenges/src/vector_search/mod.rs` after line 9 (`mod generator;`)
 ```rust
 mod scenarios;
 pub use scenarios::{Scenario, ScenarioConfig};
+```
+
+Widen the blob constant's visibility in `generator.rs:11` so `scenarios.rs` can reference it instead of embedding a second copy:
+
+```rust
+pub(super) const V1_BLOB: &[u8] = include_bytes!("weights/v1_sift.bin");
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
@@ -468,11 +477,17 @@ Assert: every nonce clears `min_active_quality` (68,500), and the mean of the 24
 
 The ±400 band is derived: per-nonce sigma is ~500, so a 24-nonce mean has standard error ~102 and ±400 is close to 4 SE. Tighter than ~±300 fails on sampling noise alone; looser than ~±800 stops catching a mis-fitted constant.
 
+**If the mean falls outside ±400, re-fit rather than widening the band.** `QUALITY_OFFSET` and `QUALITY_SCALE` as shipped in Task 1 are inherited from the *joint* fit across the five old tracks (worst residual 282 units, ≤138 at `n_queries=7000`), not fitted to this single track. The spec notes that a single track admits an exact fit; that benefit is **not automatic** — it requires this re-fit, which needs a live GPU and so could not be done before Task 4.
+
+To re-fit: with only one track, `scale` is fixed by the spread you want and `offset` follows from `offset = target_quality * scale / QUALITY_PRECISION + mean_avg_dist`. Keep `scale` at 6.399004 unless you intend to change per-nonce noise sensitivity — it is the single constant governing both, and its ratio to the drift is a property of the data, not a free parameter. Update `scenarios.rs` and re-run this step.
+
 - [ ] **Step 3: Re-run launch-invariance digests**
 
-FNV-1a over the raw device buffers across four forward-chunk / latent-block combinations (65536/256, 32768/256, 65536/128, 131072/512), plus a negative control on a different scenario or size that must produce a *different* digest.
+FNV-1a over the raw device buffers across four forward-chunk / latent-block combinations (65536/256, 32768/256, 65536/128, 131072/512).
 
-Expected: identical digests within a configuration, different for the control. A control that matches means the digest is not input-sensitive and proves nothing.
+The negative control must be **a different nonce** — *not* a different scenario or track size. Milestone 1 ships exactly one scenario at one fixed size, so there is no second scenario or size to vary; specifying one would make the control unrunnable. A different nonce yields a different seed via `BenchmarkSettings::calc_seed`, hence different vectors and a different digest.
+
+Expected: identical digests across all four configurations at a fixed nonce, and a *different* digest at a different nonce. A control that matches means the digest is not input-sensitive and the four matches prove nothing.
 
 - [ ] **Step 4: Record results in the spec and commit**
 
