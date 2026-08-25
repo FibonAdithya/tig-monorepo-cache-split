@@ -8,12 +8,12 @@ use std::sync::Arc;
 
 mod generator;
 mod scenarios;
-use generator::{v1_weights, LATENT_DIM};
+use generator::{weights_from, LATENT_DIM};
 pub use scenarios::{Scenario, ScenarioConfig};
 
 impl_kv_string_serde! {
     Track {
-        n_queries: u32,
+        s: Scenario,
     }
 }
 
@@ -33,6 +33,7 @@ impl Solution {
 
 pub struct Challenge {
     pub seed: [u8; 32],
+    pub scenario: Scenario,
     pub num_queries: u32,
     pub vector_dims: u32,
     pub database_size: u32,
@@ -43,23 +44,6 @@ pub struct Challenge {
 pub const MAX_THREADS_PER_BLOCK: u32 = 1024;
 const FORWARD_CHUNK: usize = 65_536;
 
-/// Calibrated so GAN instances reproduce the quality band the Gaussian
-/// generator produced on mainnet: ~71,862 at n_queries=7000 rising to ~77,696
-/// at 15000, against a min_active_quality of 68,500 on every track.
-///
-/// The previous form, `(11.0 - avg_dist) / 11.0`, assumed 250-dim hypercube
-/// distances. GAN output has an optimal avg_dist of ~1.12-1.16 rather than
-/// ~10.18, so under it an exact solver scored 894,982 against a target of
-/// 71,862 -- twelve times too high, with every solution including a
-/// deliberately terrible one landing far above min_active_quality.
-///
-/// Two constants rather than one because matching the spread alone leaves the
-/// absolute level wrong, and the level is what the qualifier machinery keys on.
-/// Fitted by scripts/calibrate_vector_search.py across all five active tracks
-/// from 24 nonces each, measured on real generated instances. Worst residual
-/// 282 quality units, at n_queries=11000; every other track within 138.
-const QUALITY_OFFSET: f64 = 1.616563;
-const QUALITY_SCALE: f64 = 6.399004;
 
 impl Challenge {
     pub fn generate_instance(
@@ -69,14 +53,24 @@ impl Challenge {
         stream: Arc<CudaStream>,
         _prop: &cudaDeviceProp,
     ) -> Result<Self> {
-        let weights = v1_weights()?;
+        let config = ScenarioConfig::from(track.s);
+        let weights = weights_from(config.weights)?;
         let layers = &weights.layers;
         let vector_dims = layers
             .last()
             .ok_or_else(|| anyhow!("generator has no layers"))?
             .out_dim;
+        if vector_dims != config.vector_dims {
+            return Err(anyhow!(
+                "scenario {} declares {} dims but its blob produces {}",
+                track.s,
+                config.vector_dims,
+                vector_dims
+            ));
+        }
         let widest = layers.iter().map(|layer| layer.out_dim).max().unwrap();
-        let database_size = 100 * track.n_queries;
+        let database_size = config.database_size;
+        let n_queries = config.n_queries;
 
         let sample_latents_kernel = module.load_function("gan_sample_latents")?;
         let linear_kernel = module.load_function("gan_linear")?;
@@ -96,11 +90,11 @@ impl Challenge {
         let mut d_database_vectors =
             stream.alloc_zeros::<f32>(database_size as usize * vector_dims)?;
         let mut d_query_vectors =
-            stream.alloc_zeros::<f32>(track.n_queries as usize * vector_dims)?;
+            stream.alloc_zeros::<f32>(n_queries as usize * vector_dims)?;
 
         for (dest_is_query, count) in [
             (false, database_size as usize),
-            (true, track.n_queries as usize),
+            (true, n_queries as usize),
         ] {
             let index_base = if dest_is_query {
                 database_size as usize
@@ -221,7 +215,8 @@ impl Challenge {
 
         Ok(Self {
             seed: seed.clone(),
-            num_queries: track.n_queries.clone(),
+            scenario: track.s,
+            num_queries: n_queries,
             vector_dims: vector_dims as u32,
             database_size,
             d_database_vectors,
@@ -298,10 +293,43 @@ impl Challenge {
             prop: &cudaDeviceProp,
         ) -> Result<i32> {
             let avg_dist = self.evaluate_average_distance(solution, module, stream, prop)?;
-            let quality = (QUALITY_OFFSET - avg_dist as f64) / QUALITY_SCALE;
+            let config = ScenarioConfig::from(self.scenario);
+            let quality = (config.quality_offset - avg_dist as f64) / config.quality_scale;
             let quality = quality.clamp(-10.0, 10.0) * QUALITY_PRECISION as f64;
             let quality = quality.round() as i32;
             Ok(quality)
         }
     );
+}
+
+#[cfg(test)]
+mod track_tests {
+    use super::*;
+
+    #[test]
+    fn track_serialises_to_protocol_wire_form() {
+        let track = Track {
+            s: Scenario::SIFT_128,
+        };
+        let encoded = serde_json::to_string(&track).unwrap();
+        // serde_json wraps the kv-string in quotes, exactly as
+        // tig-runtime/src/main.rs:110-122 expects to receive it.
+        assert_eq!(encoded, r#""s=sift_128""#);
+    }
+
+    #[test]
+    fn track_deserialises_from_protocol_wire_form() {
+        let track: Track = serde_json::from_str(r#""s=sift_128""#).unwrap();
+        assert_eq!(track.s, Scenario::SIFT_128);
+    }
+
+    #[test]
+    fn track_rejects_unknown_scenario() {
+        let err = serde_json::from_str::<Track>(r#""s=glove_300""#).unwrap_err();
+        assert!(
+            err.to_string().contains("glove_300"),
+            "error should name the offending scenario, got: {}",
+            err
+        );
+    }
 }
