@@ -8,7 +8,7 @@ const MAGIC: &[u8; 8] = b"TIGGAN01";
 /// Weights are committed rather than fetched: every verifier regenerates the
 /// instance independently and compares a fixed-point quality integer exactly,
 /// so a single differing byte would fail verification network-wide.
-const V1_BLOB: &[u8] = include_bytes!("weights/v1_sift.bin");
+pub(super) const V1_BLOB: &[u8] = include_bytes!("weights/v1_sift.bin");
 
 pub struct Layer {
     pub in_dim: usize,

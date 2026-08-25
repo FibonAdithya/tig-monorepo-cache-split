@@ -7,7 +7,9 @@ use cudarc::{
 use std::sync::Arc;
 
 mod generator;
+mod scenarios;
 use generator::{v1_weights, LATENT_DIM};
+pub use scenarios::{Scenario, ScenarioConfig};
 
 impl_kv_string_serde! {
     Track {
