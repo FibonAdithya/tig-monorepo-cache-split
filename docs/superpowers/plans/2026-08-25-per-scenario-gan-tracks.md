@@ -32,8 +32,9 @@ git bundle create /tmp/wip.bundle HEAD
 scp -o BatchMode=yes /tmp/wip.bundle tig-gpu:/workspace/wip.bundle
 ssh -o BatchMode=yes tig-gpu 'cd /workspace && rm -rf tig-bench && git clone -q /workspace/wip.bundle tig-bench'
 
-# 2. build and test
+# 2. build and test -- the touch is REQUIRED, not cosmetic
 ssh -o BatchMode=yes tig-gpu '
+cd /workspace/tig-bench && touch tig-challenges/src/vector_search/*.rs
 export PATH=/usr/local/cuda-12.6/bin:$HOME/.cargo/bin:$PATH
 export CUDA_PATH=/usr/local/cuda-12.6 RUSTUP_TOOLCHAIN=nightly-2025-02-10
 export LD_LIBRARY_PATH=/usr/local/cuda-12.6/lib64:/usr/local/cuda-12.6/lib64/stubs:$(rustc +nightly-2025-02-10 --print target-libdir):$LD_LIBRARY_PATH
@@ -41,6 +42,11 @@ cd /workspace/tig-bench && cargo +nightly-2025-02-10 test -p tig-challenges --fe
 ```
 
 **Tasks 1-3 need no working GPU** — they are CPU-side tests, and compilation needs only the toolkit. Task 4 needs a live device; as of 2026-08-25 the card is hardware-faulted (`nvidia-smi`: *No devices were found*), so Task 4 is **blocked, not skipped**.
+
+**Two traps, both hit during execution:**
+
+1. **`tar x` restores the archive's original mtimes**, which can be *older* than the file you just mutated. Cargo's change detection is mtime-based, so it silently reuses the stale build and a restored file still tests as mutated. Always `touch` the sources after extracting — the recipe above does. Symptom: a mutation "fails to restore" even though the file on disk is visibly correct.
+2. **`cargo test --workspace` (no features) fails on `openssl-sys`** on this box, because `libssl-dev` is not installed after the reprovision. This is pre-existing and unrelated — verified by reproducing it at a pre-change commit. Do not chase it, and do not treat it as a regression from this work.
 
 ---
 
@@ -437,8 +443,14 @@ Expected: 16 passed, 0 failed. The 8 original tests must still be among them, un
 
 - [ ] **Step 7: Mutation-check the wire-format tests**
 
-Change the `Track` field name from `s` to `scenario` in the `impl_kv_string_serde!` block, re-run.
-Expected: `track_serialises_to_protocol_wire_form` FAILS, because the encoded string becomes `scenario=sift_128`. Restore `s`.
+Rename the `Track` field from `s` to `scenario` **and** update its references, or the mutation only produces a compile error rather than a discriminating test failure:
+
+```bash
+sed -i 's/\bs: Scenario/scenario: Scenario/g; s/track\.s\b/track.scenario/g' \
+  tig-challenges/src/vector_search/mod.rs
+```
+
+Expected: `track_serialises_to_protocol_wire_form` FAILS on the assertion, because the encoded string becomes `scenario=sift_128`. Restore, `touch`, and confirm green.
 
 Be aware of what is **not** covered here: the `vector_dims != config.vector_dims` guard added to `generate_instance` in Step 4 cannot be reached from a CPU test, because `generate_instance` requires a live `CudaModule`. Task 2's `every_scenario_blob_matches_its_declared_dims` catches the same mismatch at the config level, which is the case that actually occurs (a blob updated without its config). The runtime guard is defence-in-depth for a blob swapped at build time, and is first exercised for real in Task 4. Do not claim it is tested before then.
 
