@@ -220,7 +220,13 @@ extern "C" __global__ void recall_audit(
     if (threadIdx.x == 0) {
         const size_t idx = solution_indexes[q];
         if (idx >= database_size) {
-            *error_flag = 1;
+            // atomicExch, not a plain store: every block that finds a bad index
+            // writes the same constant, so the outcome is deterministic either
+            // way, but a concurrent non-atomic write is still a data race under
+            // the strict memory model. The host also range-checks every index
+            // before launching; this branch is defence in depth for a future
+            // caller that bypasses that path.
+            atomicExch(error_flag, 1u);
             s_returned = 3.0e38f;
         } else {
             const float *cand = database_vectors + idx * vector_dims;
@@ -245,6 +251,17 @@ extern "C" __global__ void recall_audit(
     }
 
     __shared__ float s_best[AUDIT_BLOCK];
+    // Every slot is initialised, not just the blockDim.x of them that ran the
+    // scan. The reduction below reads s_best[t + stride] for strides up to
+    // AUDIT_BLOCK/2, so a launch with fewer threads than AUDIT_BLOCK would
+    // otherwise fold uninitialised shared memory into the minimum and turn
+    // every hit into a miss -- silently, with no error anywhere. (The scan's
+    // AUDIT_BLOCK stride assumes the same equality, which is why the host ties
+    // its block_dim to a constant rather than a literal.)
+    for (int i = threadIdx.x; i < AUDIT_BLOCK; i += blockDim.x) {
+        s_best[i] = 3.0e38f;
+    }
+    __syncthreads();
     s_best[threadIdx.x] = best;
     __syncthreads();
     for (int stride = AUDIT_BLOCK / 2; stride > 0; stride >>= 1) {

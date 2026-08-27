@@ -45,6 +45,18 @@ pub struct Challenge {
 pub const MAX_THREADS_PER_BLOCK: u32 = 1024;
 const FORWARD_CHUNK: usize = 65_536;
 
+/// Must equal `AUDIT_BLOCK` in kernels.cu. `recall_audit` strides its candidate
+/// scan by that literal and reduces over that many shared-memory slots, so the
+/// launch's block_dim is not a free parameter: the two are one constant that
+/// happens to live in two languages. Task 6 tiles this kernel -- change it here
+/// and there together, or the scan silently skips candidates.
+const AUDIT_BLOCK: u32 = 256;
+
+/// Must equal `AUDIT_MAX_DIMS` in kernels.cu, which sizes the kernel's
+/// shared-memory query staging buffer. A scenario declaring more dims than this
+/// would overrun that buffer with no error, so it is checked on the host.
+const AUDIT_MAX_DIMS: u32 = 128;
+
 
 impl Challenge {
     pub fn generate_instance(
@@ -307,9 +319,41 @@ impl Challenge {
                 solution.indexes.len()
             ));
         }
+        // Unconditional, over every index rather than only the sampled ones.
+        // The kernel cannot do this: it reads solution_indexes[q] only for the
+        // queries it audits, so a bad index elsewhere would be invisible. Spec
+        // Decision 3a gives the benchmarker, the verifier and the pentest three
+        // different salts, so a salt-dependent check would let the same
+        // solution be Ok for one role and Err for another. Well-formedness is
+        // not a property of a random draw.
+        if let Some(&bad) = solution
+            .indexes
+            .iter()
+            .find(|&&i| i >= self.database_size as usize)
+        {
+            return Err(anyhow!(
+                "Invalid index in solution: {} >= {}",
+                bad,
+                self.database_size
+            ));
+        }
+        if self.vector_dims > AUDIT_MAX_DIMS {
+            return Err(anyhow!(
+                "recall_audit stages the query in {} floats of shared memory, but \
+                 this instance has {} dims",
+                AUDIT_MAX_DIMS,
+                self.vector_dims
+            ));
+        }
         let config = ScenarioConfig::from(self.scenario);
         let ids = sample_query_ids(salt, self.num_queries, config.audit_samples);
         let num_samples = ids.len() as u32;
+        // Makes the divide-by-zero below unreachable by construction rather
+        // than by argument, and avoids a zero-block launch. Only reachable when
+        // num_queries is 0, which no scenario declares.
+        if num_samples == 0 {
+            return Err(anyhow!("No queries to audit"));
+        }
 
         let kernel = module.load_function("recall_audit")?;
         let d_indexes = stream.memcpy_stod(&solution.indexes)?;
@@ -335,7 +379,7 @@ impl Challenge {
                 .arg(&mut d_err)
                 .launch(LaunchConfig {
                     grid_dim: (num_samples, 1, 1),
-                    block_dim: (256, 1, 1),
+                    block_dim: (AUDIT_BLOCK, 1, 1),
                     shared_mem_bytes: 0,
                 })?;
         }
@@ -409,6 +453,12 @@ mod recall_audit_tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::OnceLock;
+
+    /// The two .cu files `tig-binary/scripts/build_ptx` concatenates, in the
+    /// order it concatenates them. The tests compile the same source with the
+    /// same flags, so what they exercise is the PTX production actually runs.
+    const FRAMEWORK_CU: &str = include_str!("../../../tig-binary/src/framework.cu");
+    const KERNELS_CU: &str = include_str!("kernels.cu");
 
     /// Exact 1-NN by brute force: the reference answer the audit is measured
     /// against.
@@ -530,19 +580,15 @@ extern "C" __global__ void reference_nn_search(
     fn test_ptx_path() -> &'static PathBuf {
         static PTX: OnceLock<PathBuf> = OnceLock::new();
         PTX.get_or_init(|| {
-            let manifest = PathBuf::from(crate::BUILD_TIME_PATH);
-            let sources = [
-                manifest.join("../tig-binary/src/framework.cu"),
-                manifest.join("src/vector_search/kernels.cu"),
-            ];
+            // include_str!, not a runtime read off BUILD_TIME_PATH: the sources
+            // are baked into the test binary, so it does not depend on the
+            // source tree still being where it was at compile time, and cargo
+            // rebuilds the tests when either .cu file changes.
             let mut combined = String::new();
-            for src in &sources {
-                let text = std::fs::read_to_string(src).unwrap_or_else(|e| {
-                    panic!("cannot read {}: {}", src.display(), e)
-                });
-                combined.push_str(&text);
-                combined.push('\n');
-            }
+            combined.push_str(FRAMEWORK_CU);
+            combined.push('\n');
+            combined.push_str(KERNELS_CU);
+            combined.push('\n');
             combined.push_str(REFERENCE_1NN_KERNEL);
 
             let dir = std::env::temp_dir()
@@ -719,6 +765,11 @@ extern "C" __global__ void reference_nn_search(
         let before = challenge
             .measure_recall(&sol, &salt, module.clone(), stream.clone(), &prop)
             .unwrap();
+        // Pin the value, not only the relation. `assert_eq!(before, after)`
+        // alone is satisfied by any measure_recall that returns a constant --
+        // it passed under both of round 1's mutations. With this line the test
+        // stands on its own.
+        assert_eq!(before, 1.0);
         sol.indexes[victim] = (sol.indexes[victim] + 1) % challenge.database_size as usize;
         let after = challenge
             .measure_recall(&sol, &salt, module, stream, &prop)
@@ -750,6 +801,39 @@ extern "C" __global__ void reference_nn_search(
         // The message is asserted, not merely `is_err()`: a bare `is_err()`
         // passes when the kernel is missing entirely, which is exactly how this
         // test went green before `recall_audit` existed.
+        assert!(
+            err.to_string().contains("Invalid index in solution"),
+            "expected the invalid-index error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_index_on_an_unsampled_query_is_also_an_error() {
+        // Well-formedness must not be a function of a random draw. Spec
+        // Decision 3a hands three callers three different salts -- the
+        // benchmarker's self-estimate, the verifier's protocol salt, the
+        // pentest's seed-derived salt -- so a kernel-only range check makes the
+        // same solution Ok for one role and Err for another. The audit reads
+        // only the queries it samples, so this is the case the host check
+        // exists for, and the only one that fails without it.
+        let (challenge, module, stream, prop) = gpu_instance(1);
+        let salt = [9u8; 32];
+        let config = ScenarioConfig::from(challenge.scenario);
+        let ids: std::collections::HashSet<u32> =
+            sample_query_ids(&salt, challenge.num_queries, config.audit_samples)
+                .into_iter()
+                .collect();
+        let victim = (0..challenge.num_queries)
+            .find(|q| !ids.contains(q))
+            .expect("audit_samples < num_queries, so some query is unsampled")
+            as usize;
+
+        let mut sol = brute_force_1nn(&challenge, module.clone(), stream.clone());
+        sol.indexes[victim] = challenge.database_size as usize;
+        let err = challenge
+            .measure_recall(&sol, &salt, module, stream, &prop)
+            .unwrap_err();
         assert!(
             err.to_string().contains("Invalid index in solution"),
             "expected the invalid-index error, got: {}",
