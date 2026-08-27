@@ -17,7 +17,7 @@ pub fn sample_query_ids(
 ) -> Vec<u32> {
     let n = num_samples.min(num_queries) as usize;
     let mut rng = StdRng::seed_from_u64(u64::from_le_bytes(
-        salt[0..8].try_into().expect("salt is 32 bytes"),
+        salt[0..8].try_into().expect("slice is exactly 8 bytes"),
     ));
     let mut all: Vec<u32> = (0..num_queries).collect();
     // Partial Fisher-Yates, written out rather than SliceRandom::shuffle:
@@ -68,7 +68,24 @@ mod tests {
     #[test]
     fn asking_for_more_samples_than_queries_yields_every_query_once() {
         let s = sample_query_ids(&[4u8; 32], 10, 1000);
-        assert_eq!(s.len(), 10);
+        assert_eq!(s, (0..10).collect::<Vec<u32>>());
+    }
+
+    #[test]
+    fn only_the_first_eight_salt_bytes_select_the_sample() {
+        // Deliberate: the seed is drawn from salt[0..8], matching how tig-protocol
+        // draws sampled_nonces. This test exists so the truncation is a recorded
+        // decision rather than an accident -- if the derivation is ever widened to
+        // the full 32 bytes, this test must be updated on purpose.
+        let a = [9u8; 32];
+        let mut b = [9u8; 32];
+        b[8] = 1; // differs only OUTSIDE the read window
+        assert_eq!(sample_query_ids(&a, 7000, 1000), sample_query_ids(&b, 7000, 1000));
+    }
+
+    #[test]
+    fn zero_queries_yields_an_empty_sample() {
+        assert!(sample_query_ids(&[1u8; 32], 0, 100).is_empty());
     }
 
     #[test]
