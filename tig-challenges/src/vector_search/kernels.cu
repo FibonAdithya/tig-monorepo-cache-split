@@ -189,11 +189,117 @@ extern "C" __global__ void gan_linear(
 #define AUDIT_BLOCK 256
 #define AUDIT_MAX_DIMS 128
 
-// One block per audited query. Writes hits[s] = 1 when the submitted answer for
-// query sample_query_ids[s] is within tolerance of the true nearest neighbour.
+// Audited queries staged per block. The block streams the database ONCE for all
+// AUDIT_TQ of them, so database traffic falls by this factor: auditing 1,000
+// queries goes from 1,000 sweeps of the 358 MB database to ceil(1000/18) = 56.
+//
+// Must equal AUDIT_TQ in mod.rs, which derives grid_dim from it.
+//
+// Chosen by measurement on an RTX 3060 (28 SMs, sm_86, PTX JIT'd from
+// compute_70), SIFT_128 -- 1,000 samples over 700,000 x 128 database vectors --
+// best of three under a gpu-claim, with the whole of measure_recall timed (host
+// overhead is ~0.3 ms of it; the kernel alone is stable to +/-0.02 ms):
+//
+//   untiled, one block per query          2623 ms
+//   AUDIT_TQ =  8   125 blocks             119 ms
+//   AUDIT_TQ = 12    84 blocks             104 ms
+//   AUDIT_TQ = 14    72 blocks             130 ms
+//   AUDIT_TQ = 16    63 blocks         114-122 ms
+//   AUDIT_TQ = 17    59 blocks             124 ms
+//   AUDIT_TQ = 18    56 blocks              93 ms   <- chosen
+//   AUDIT_TQ = 19    53 blocks              98 ms
+//   AUDIT_TQ = 20    50 blocks             103 ms
+//   AUDIT_TQ = 22    46 blocks             107 ms
+//   AUDIT_TQ = 23    44 blocks             182 ms
+//   AUDIT_TQ = 32    32 blocks             234 ms
+//
+// The sweep above was taken back to back across many rebuilds; the committed
+// kernel measures 85-87 ms on five later runs of the full suite, against a
+// 150 ms gate. Both figures are the same PTX (56 registers, 27,720 bytes of
+// shared memory), so the spread is the card's clocks, not the code.
+//
+// The curve is not monotonic, and neither end of it is where the cost lives:
+//
+//   - Above AUDIT_TQ = 22 ptxas needs 96 registers rather than 64 for the
+//     per-thread running minima, which drops the SM from three resident blocks
+//     to two. That is the 107 -> 182 ms step between 22 and 23, and it is why
+//     the obvious "more staged queries is strictly less traffic" reasoning
+//     gives the wrong answer.
+//   - Below that, what moves the number is how evenly the blocks divide over
+//     the 28 SMs. AUDIT_TQ = 18 lands on exactly 56 = 28 x 2. This is the one
+//     tuning input here that is a property of the card rather than of the
+//     kernel, so on a machine with a different SM count the plateau will sit
+//     somewhere slightly different -- the whole 18..22 region measures 93-107
+//     ms, well inside the gate, so nothing depends on hitting 18 exactly.
+//
+// Register blocking over database rows -- each thread owning R rows so that a
+// staged query value is reused R times, which is what a GEMM would do -- was
+// also measured, and is slower at every setting tried. It needs R times the
+// shared memory for the tile, and losing the third resident block costs more
+// than the saved shared-memory loads gain. All at AUDIT_TQ = 16, against
+// 114-122 ms for one row per thread:
+//
+//   R = 2, 8-dim chunks, 512-row tile    128 ms
+//   R = 2, 16-dim chunks, 512-row tile   141 ms
+//   R = 4, 8-dim chunks, 1024-row tile   125 ms
+//
+// So: one row per thread.
+#define AUDIT_TQ 18
+
+// Dims of a database row staged per pass over a tile. A power of two so the
+// staging index arithmetic is a shift, and large enough that each row's slice
+// is a whole number of fully-used 32-byte sectors.
+#define AUDIT_KC 16
+// Padded by one so that s_db[row][k] is bank-conflict-free: the row stride is
+// odd and therefore coprime with 32, so 32 consecutive rows land on 32 distinct
+// banks.
+#define AUDIT_DB_STRIDE (AUDIT_KC + 1)
+// Rows of the tile covered per pass of the cooperative load.
+#define AUDIT_ROWS_PER_PASS (AUDIT_BLOCK / AUDIT_KC)
+
+// The four constants above are not independent, and every relationship between
+// them is one a wrong value would break silently -- by skipping candidates and
+// reporting recall HIGHER than reality, which is the direction no test here
+// catches. So they are checked at compile time rather than left to a comment.
+static_assert(AUDIT_BLOCK % AUDIT_KC == 0,
+              "AUDIT_ROWS_PER_PASS truncates unless AUDIT_KC divides "
+              "AUDIT_BLOCK, and the staging loop then never reaches the last "
+              "rows of each tile");
+static_assert((AUDIT_BLOCK & (AUDIT_BLOCK - 1)) == 0,
+              "the minimum is reduced by repeated halving from AUDIT_BLOCK/2, "
+              "which drops the odd slot unless AUDIT_BLOCK is a power of two");
+static_assert(AUDIT_TQ <= AUDIT_BLOCK,
+              "one thread per audited query computes the returned distance, so "
+              "a block must have at least AUDIT_TQ threads");
+static_assert(AUDIT_TQ >= 1, "a block must audit at least one query");
+
+// Recall@1 audit, tiled over queries.
+//
+// One block audits AUDIT_TQ consecutive samples: it stages their query vectors
+// in shared memory and then sweeps the database once for all of them, holding
+// AUDIT_TQ running minima per thread in registers. grid_dim is
+// ceil(num_samples / AUDIT_TQ).
+//
+// Database rows are read cooperatively and coalesced into shared memory --
+// AUDIT_BLOCK threads fetch AUDIT_ROWS_PER_PASS rows of AUDIT_KC contiguous
+// floats each, so every warp issues fully-used sectors -- and each thread then
+// owns one row of the tile and reads it back out of shared memory. The
+// alternative, every thread walking its own 512-byte row in global memory, is
+// the defect that makes the reference 1-NN kernel run at a small fraction of
+// achievable bandwidth.
+//
+// Writes hits[s] = 1 when the submitted answer for query sample_query_ids[s] is
+// within tolerance of the true nearest neighbour.
 //
 // tolerance_sq is (1 + tau)^2: the comparison runs in squared distance so that
 // no sqrt appears, and --use_fast_math makes sqrt approximate.
+//
+// Determinism survives the tiling. Every distance still accumulates over
+// k = 0..vector_dims-1 in that order through fmaf, exactly as the untiled
+// kernel did, so the distances are bit-identical to it. The only reduction is a
+// minimum, which is exact at any width, and it is still a fixed-order
+// shared-memory tree -- no atomics into an accumulator, and nothing that
+// depends on how the scheduler interleaves blocks.
 extern "C" __global__ void recall_audit(
     const uint32_t vector_dims,
     const uint32_t database_size,
@@ -206,73 +312,153 @@ extern "C" __global__ void recall_audit(
     uint32_t *__restrict__ hits,
     uint32_t *__restrict__ error_flag)
 {
-    const int s = blockIdx.x;
-    if (s >= num_samples) return;
-    const uint32_t q = sample_query_ids[s];
+    // blockDim.x == AUDIT_BLOCK is structural, not a preference: one thread
+    // owns one row of an AUDIT_BLOCK-row tile, the cooperative staging maps
+    // AUDIT_BLOCK threads onto AUDIT_ROWS_PER_PASS x AUDIT_KC elements of it,
+    // and the reduction folds AUDIT_BLOCK/2 strides. A launch with fewer
+    // threads would leave tile rows unexamined, so the kernel would miss the
+    // true minimum and report false HITS -- recall reading HIGHER than reality,
+    // the one failure direction a correctness test that checks only that a bad
+    // answer scores badly cannot see. Fail closed rather than trust the caller.
+    // mod.rs ties block_dim to a Rust const that must equal this #define; this
+    // is the belt to that braces.
+    if (blockDim.x != AUDIT_BLOCK) {
+        if (threadIdx.x == 0) atomicExch(error_flag, 1u);
+        return;
+    }
 
-    __shared__ float s_query[AUDIT_MAX_DIMS];
-    for (int i = threadIdx.x; i < vector_dims; i += AUDIT_BLOCK) {
-        s_query[i] = query_vectors[(long long)q * vector_dims + i];
+    const int sample_base = blockIdx.x * AUDIT_TQ;
+    if (sample_base >= (int)num_samples) return;
+    // The final block gets a short group whenever AUDIT_TQ does not divide
+    // num_samples -- 10 of 18 at the default 1,000 samples.
+    int n_tq = (int)num_samples - sample_base;
+    if (n_tq > AUDIT_TQ) n_tq = AUDIT_TQ;
+
+    __shared__ float s_query[AUDIT_TQ][AUDIT_MAX_DIMS];
+    __shared__ float s_db[AUDIT_BLOCK][AUDIT_DB_STRIDE];
+    __shared__ float s_red[AUDIT_BLOCK];
+    __shared__ float s_returned[AUDIT_TQ];
+
+    // Stage this block's queries. Slots past n_tq are zero-filled rather than
+    // left alone: the accumulator loop below runs over the compile-time
+    // AUDIT_TQ so that it unrolls, and folding uninitialised shared memory into
+    // an arithmetic result -- even one nobody reads -- is the defect class the
+    // untiled kernel's reduction had.
+    for (int t = 0; t < AUDIT_TQ; ++t) {
+        if (t < n_tq) {
+            const uint32_t q = sample_query_ids[sample_base + t];
+            for (int k = threadIdx.x; k < (int)vector_dims; k += AUDIT_BLOCK) {
+                s_query[t][k] = query_vectors[(long long)q * vector_dims + k];
+            }
+        } else {
+            for (int k = threadIdx.x; k < (int)vector_dims; k += AUDIT_BLOCK) {
+                s_query[t][k] = 0.0f;
+            }
+        }
     }
     __syncthreads();
 
-    __shared__ float s_returned;
-    if (threadIdx.x == 0) {
+    // One thread per audited query computes the distance to the answer the
+    // solution returned. These are the only global reads outside the sweep.
+    if ((int)threadIdx.x < n_tq) {
+        const int t = threadIdx.x;
+        const uint32_t q = sample_query_ids[sample_base + t];
         const size_t idx = solution_indexes[q];
         if (idx >= database_size) {
-            // atomicExch, not a plain store: every block that finds a bad index
-            // writes the same constant, so the outcome is deterministic either
-            // way, but a concurrent non-atomic write is still a data race under
-            // the strict memory model. The host also range-checks every index
-            // before launching; this branch is defence in depth for a future
-            // caller that bypasses that path.
+            // atomicExch, not a plain store: every thread that finds a bad
+            // index writes the same constant, so the outcome is deterministic
+            // either way, but a concurrent non-atomic write is still a data
+            // race under the strict memory model. The host also range-checks
+            // every index before launching; this branch is defence in depth for
+            // a future caller that bypasses that path.
             atomicExch(error_flag, 1u);
-            s_returned = 3.0e38f;
+            s_returned[t] = 3.0e38f;
         } else {
             const float *cand = database_vectors + idx * vector_dims;
             float d = 0.0f;
-            for (int k = 0; k < vector_dims; ++k) {
-                const float diff = s_query[k] - cand[k];
+            for (int k = 0; k < (int)vector_dims; ++k) {
+                const float diff = s_query[t][k] - cand[k];
                 d = fmaf(diff, diff, d);
             }
-            s_returned = d;
+            s_returned[t] = d;
         }
     }
 
-    float best = 3.0e38f;
-    for (int j = threadIdx.x; j < database_size; j += AUDIT_BLOCK) {
-        const float *cand = database_vectors + (long long)j * vector_dims;
-        float d = 0.0f;
-        for (int k = 0; k < vector_dims; ++k) {
-            const float diff = s_query[k] - cand[k];
-            d = fmaf(diff, diff, d);
+    float best[AUDIT_TQ];
+#pragma unroll
+    for (int t = 0; t < AUDIT_TQ; ++t) best[t] = 3.0e38f;
+
+    // Each thread owns one row of the tile; the cooperative load is indexed
+    // independently of that ownership, so that consecutive threads read
+    // consecutive floats of the same database row.
+    const int row = (int)threadIdx.x;
+    const int load_row = (int)threadIdx.x / AUDIT_KC;
+    const int load_k = (int)threadIdx.x % AUDIT_KC;
+
+    for (int base = 0; base < (int)database_size; base += AUDIT_BLOCK) {
+        int rows_in_tile = (int)database_size - base;
+        if (rows_in_tile > AUDIT_BLOCK) rows_in_tile = AUDIT_BLOCK;
+        const bool active = row < rows_in_tile;
+
+        float acc[AUDIT_TQ];
+#pragma unroll
+        for (int t = 0; t < AUDIT_TQ; ++t) acc[t] = 0.0f;
+
+        for (int k0 = 0; k0 < (int)vector_dims; k0 += AUDIT_KC) {
+            int kc = (int)vector_dims - k0;
+            if (kc > AUDIT_KC) kc = AUDIT_KC;
+
+            // Before the store: the previous pass's reads of s_db must have
+            // finished. After it: the stores must be visible to every thread.
+            __syncthreads();
+            if (load_k < kc) {
+                for (int r = load_row; r < rows_in_tile; r += AUDIT_ROWS_PER_PASS) {
+                    s_db[r][load_k] =
+                        database_vectors[(long long)(base + r) * vector_dims + k0 + load_k];
+                }
+            }
+            __syncthreads();
+
+            if (active) {
+                for (int k = 0; k < kc; ++k) {
+                    const float c = s_db[row][k];
+#pragma unroll
+                    for (int t = 0; t < AUDIT_TQ; ++t) {
+                        const float diff = s_query[t][k0 + k] - c;
+                        acc[t] = fmaf(diff, diff, acc[t]);
+                    }
+                }
+            }
         }
-        if (d < best) best = d;
+
+        if (active) {
+#pragma unroll
+            for (int t = 0; t < AUDIT_TQ; ++t) {
+                if (acc[t] < best[t]) best[t] = acc[t];
+            }
+        }
     }
 
-    __shared__ float s_best[AUDIT_BLOCK];
-    // Every slot is initialised, not just the blockDim.x of them that ran the
-    // scan. The reduction below reads s_best[t + stride] for strides up to
-    // AUDIT_BLOCK/2, so a launch with fewer threads than AUDIT_BLOCK would
-    // otherwise fold uninitialised shared memory into the minimum and turn
-    // every hit into a miss -- silently, with no error anywhere. (The scan's
-    // AUDIT_BLOCK stride assumes the same equality, which is why the host ties
-    // its block_dim to a constant rather than a literal.)
-    for (int i = threadIdx.x; i < AUDIT_BLOCK; i += blockDim.x) {
-        s_best[i] = 3.0e38f;
-    }
-    __syncthreads();
-    s_best[threadIdx.x] = best;
-    __syncthreads();
-    for (int stride = AUDIT_BLOCK / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            const float other = s_best[threadIdx.x + stride];
-            if (other < s_best[threadIdx.x]) s_best[threadIdx.x] = other;
-        }
+    // Fixed-order tree reduction, one audited query at a time so the scratch
+    // buffer stays AUDIT_BLOCK floats rather than AUDIT_TQ times that.
+    // AUDIT_TQ * 8 barrier rounds, once, at the end of a sweep over 358 MB, is
+    // not measurable.
+    for (int t = 0; t < AUDIT_TQ; ++t) {
         __syncthreads();
-    }
-
-    if (threadIdx.x == 0) {
-        hits[s] = (s_returned <= s_best[0] * tolerance_sq) ? 1u : 0u;
+        s_red[threadIdx.x] = best[t];
+        __syncthreads();
+        for (int stride = AUDIT_BLOCK / 2; stride > 0; stride >>= 1) {
+            if ((int)threadIdx.x < stride) {
+                const float other = s_red[threadIdx.x + stride];
+                if (other < s_red[threadIdx.x]) s_red[threadIdx.x] = other;
+            }
+            __syncthreads();
+        }
+        // hits[s] is written by exactly one thread: thread 0 of the single
+        // block that owns sample s.
+        if (threadIdx.x == 0 && t < n_tq) {
+            hits[sample_base + t] =
+                (s_returned[t] <= s_red[0] * tolerance_sq) ? 1u : 0u;
+        }
     }
 }

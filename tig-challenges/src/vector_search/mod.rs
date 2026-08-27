@@ -45,12 +45,29 @@ pub struct Challenge {
 pub const MAX_THREADS_PER_BLOCK: u32 = 1024;
 const FORWARD_CHUNK: usize = 65_536;
 
-/// Must equal `AUDIT_BLOCK` in kernels.cu. `recall_audit` strides its candidate
-/// scan by that literal and reduces over that many shared-memory slots, so the
-/// launch's block_dim is not a free parameter: the two are one constant that
-/// happens to live in two languages. Task 6 tiles this kernel -- change it here
-/// and there together, or the scan silently skips candidates.
+/// Must equal `AUDIT_BLOCK` in kernels.cu. In the tiled kernel one thread owns
+/// one row of an `AUDIT_BLOCK`-row database tile, the cooperative staging maps
+/// `AUDIT_BLOCK` threads onto the tile, and the minimum is reduced over that
+/// many shared-memory slots. So the launch's block_dim is not a free parameter:
+/// the two are one constant that happens to live in two languages. A smaller
+/// launch would leave tile rows unexamined and report recall *higher* than
+/// reality; the kernel refuses to run rather than rely on this alone.
 const AUDIT_BLOCK: u32 = 256;
+
+/// Must equal `AUDIT_TQ` in kernels.cu. One block audits this many consecutive
+/// samples, staging their query vectors in shared memory and sweeping the
+/// database once for all of them, so `grid_dim` is `ceil(num_samples /
+/// AUDIT_TQ)` rather than `num_samples`.
+///
+/// The kernel derives each block's first sample from *its* `AUDIT_TQ`, so a
+/// mismatch is a coverage bug, not a crash. Too large a value here launches too
+/// few blocks and leaves the tail of the sample list unaudited -- those samples
+/// keep the zero `hits` they were allocated with and count as misses, so recall
+/// reads *lower* than reality. Too small a value launches surplus blocks whose
+/// `sample_base` is past the end, and they return immediately. Both directions
+/// fail conservatively, but only equality is correct. The value itself is a
+/// tuning result; kernels.cu carries the measurements behind it.
+const AUDIT_TQ: u32 = 18;
 
 /// Must equal `AUDIT_MAX_DIMS` in kernels.cu, which sizes the kernel's
 /// shared-memory query staging buffer. A scenario declaring more dims than this
@@ -382,7 +399,9 @@ impl Challenge {
                 .arg(&mut d_hits)
                 .arg(&mut d_err)
                 .launch(LaunchConfig {
-                    grid_dim: (num_samples, 1, 1),
+                    // One block per AUDIT_TQ samples, not one per sample:
+                    // ceil, so the final partial group still gets a block.
+                    grid_dim: (num_samples.div_ceil(AUDIT_TQ), 1, 1),
                     block_dim: (AUDIT_BLOCK, 1, 1),
                     shared_mem_bytes: 0,
                 })?;
@@ -936,6 +955,44 @@ extern "C" __global__ void reference_nn_search(
             "salt A audits the corrupted query, so {} must be < {}",
             q_a,
             q_b
+        );
+    }
+
+    #[test]
+    fn audit_is_much_cheaper_than_a_naive_solve() {
+        // The design property: verification must be far cheaper than solving.
+        // The naive full-database scan for 7,000 queries measured 27,000 ms
+        // (docs/measurements/2026-08-26-c004-lane-probe.md). 150 ms is a
+        // deliberately loose ceiling that a tiled kernel clears comfortably and
+        // an untiled one cannot: measured on an RTX 3060, the untiled
+        // one-block-per-query kernel this replaced took 2,623 ms and the tiled
+        // one takes 85-87 ms. So the gate has room on both sides -- it is not
+        // near enough to either number to be decided by a bad run.
+        let (challenge, module, stream, prop) = gpu_instance(1);
+        let sol = Solution {
+            indexes: vec![0; challenge.num_queries as usize],
+        };
+        // Warm the context so JIT and allocation are not in the measurement.
+        let _ = challenge
+            .measure_recall(&sol, &[1u8; 32], module.clone(), stream.clone(), &prop)
+            .unwrap();
+
+        // Best of three: the gate separates 2,623 ms from 86 ms, so one
+        // scheduling hiccup must not fail it, and taking the minimum cannot
+        // turn a genuinely slow kernel into a passing one.
+        let mut ms = u128::MAX;
+        for i in 0..3u8 {
+            let t = std::time::Instant::now();
+            let _ = challenge
+                .measure_recall(&sol, &[i; 32], module.clone(), stream.clone(), &prop)
+                .unwrap();
+            ms = ms.min(t.elapsed().as_millis());
+        }
+        println!("recall_audit best-of-three: {} ms", ms);
+        assert!(
+            ms < 150,
+            "audit took {} ms; the untiled kernel is still in place",
+            ms
         );
     }
 }
