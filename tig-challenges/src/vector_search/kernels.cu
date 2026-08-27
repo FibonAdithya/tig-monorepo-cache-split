@@ -322,8 +322,12 @@ extern "C" __global__ void recall_audit(
     // answer scores badly cannot see. Fail closed rather than trust the caller.
     // mod.rs ties block_dim to a Rust const that must equal this #define; this
     // is the belt to that braces.
+    //
+    // Code 2, not 1: 1 means a solution index out of range, and a future
+    // debugger reading "Invalid index in solution" after a block-size mismatch
+    // would hunt entirely the wrong bug.
     if (blockDim.x != AUDIT_BLOCK) {
-        if (threadIdx.x == 0) atomicExch(error_flag, 1u);
+        if (threadIdx.x == 0) atomicExch(error_flag, 2u);
         return;
     }
 

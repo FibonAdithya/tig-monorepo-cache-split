@@ -408,8 +408,18 @@ impl Challenge {
         }
         stream.synchronize()?;
 
-        if stream.memcpy_dtov(&d_err)?[0] != 0 {
-            return Err(anyhow!("Invalid index in solution"));
+        match stream.memcpy_dtov(&d_err)?[0] {
+            0 => {}
+            // Unreachable in tree -- AUDIT_BLOCK is the launch's block_dim --
+            // but if it ever fires it must not masquerade as a bad solution.
+            2 => {
+                return Err(anyhow!(
+                    "recall_audit was launched with a block size other than {}; \
+                     its tiling is only correct at that width",
+                    AUDIT_BLOCK
+                ))
+            }
+            _ => return Err(anyhow!("Invalid index in solution")),
         }
         let hits = stream.memcpy_dtov(&d_hits)?;
         // u32 accumulator: 1,000 samples cannot overflow, but summing into u32
@@ -500,9 +510,25 @@ mod recall_audit_tests {
     /// reduction runs in a fixed order, so the answer cannot depend on
     /// scheduler interleaving. No sqrt: argmin of squared distance is argmin of
     /// distance, and `--use_fast_math` makes sqrt approximate.
+    ///
+    /// It emits the second-nearest index alongside the nearest.
+    /// `second_nearest_answers_score_a_miss` needs it: a solution built from
+    /// the runner-up is the only probe here that lands in the narrow band where
+    /// an audit that over-estimates the minimum flips a miss into a hit, and
+    /// that band is where a tiling bug lives.
     const REFERENCE_1NN_KERNEL: &str = r#"
 #define REF_BLOCK 256
 #define REF_MAX_DIMS 128
+
+// Total order over candidates: nearer first, and among exact ties the lower
+// database index. Every comparison in this kernel goes through it, so the
+// answer cannot depend on scheduler interleaving.
+__device__ __forceinline__ bool ref_before(
+    const float da, const unsigned long long ia,
+    const float db, const unsigned long long ib)
+{
+    return da < db || (da == db && ia < ib);
+}
 
 extern "C" __global__ void reference_nn_search(
     const float *__restrict__ queries,
@@ -510,7 +536,8 @@ extern "C" __global__ void reference_nn_search(
     const int num_queries,
     const int database_size,
     const int dims,
-    unsigned long long *__restrict__ out_indexes)
+    unsigned long long *__restrict__ out_indexes,
+    unsigned long long *__restrict__ out_second_indexes)
 {
     const int q = blockIdx.x;
     if (q >= num_queries) {
@@ -527,6 +554,8 @@ extern "C" __global__ void reference_nn_search(
     // specials, and a finite sentinel needs none of them.
     float best = 3.0e38f;
     unsigned long long best_idx = 0ULL;
+    float second = 3.0e38f;
+    unsigned long long second_idx = 0ULL;
 
     for (int j = threadIdx.x; j < database_size; j += REF_BLOCK) {
         const float *cand = database + (long long)j * dims;
@@ -536,27 +565,63 @@ extern "C" __global__ void reference_nn_search(
             d = fmaf(diff, diff, d);
         }
         const unsigned long long jj = (unsigned long long)j;
-        if (d < best || (d == best && jj < best_idx)) {
+        // The `best` branch is character-for-character the decision the
+        // one-output version made, so the 1-NN answer is unchanged; `second`
+        // only catches what `best` displaces or what falls just short of it.
+        if (ref_before(d, jj, best, best_idx)) {
+            second = best;
+            second_idx = best_idx;
             best = d;
             best_idx = jj;
+        } else if (ref_before(d, jj, second, second_idx)) {
+            second = d;
+            second_idx = jj;
         }
     }
 
     __shared__ float s_best[REF_BLOCK];
     __shared__ unsigned long long s_idx[REF_BLOCK];
+    __shared__ float s_second[REF_BLOCK];
+    __shared__ unsigned long long s_sidx[REF_BLOCK];
     s_best[threadIdx.x] = best;
     s_idx[threadIdx.x] = best_idx;
+    s_second[threadIdx.x] = second;
+    s_sidx[threadIdx.x] = second_idx;
     __syncthreads();
 
+    // Merging two ordered pairs, rather than picking one winner. Each database
+    // index lives in exactly one thread's stride subset, so the four candidates
+    // entering a merge are four distinct rows: the combined runner-up is the
+    // loser of the final between the two leaders, whichever side it came from.
     for (int stride = REF_BLOCK / 2; stride > 0; stride >>= 1) {
         if (threadIdx.x < stride) {
-            const float other = s_best[threadIdx.x + stride];
-            const unsigned long long other_idx = s_idx[threadIdx.x + stride];
-            const float mine = s_best[threadIdx.x];
-            const unsigned long long mine_idx = s_idx[threadIdx.x];
-            if (other < mine || (other == mine && other_idx < mine_idx)) {
-                s_best[threadIdx.x] = other;
-                s_idx[threadIdx.x] = other_idx;
+            const int o = threadIdx.x + stride;
+            const float mb = s_best[threadIdx.x];
+            const unsigned long long mbi = s_idx[threadIdx.x];
+            const float ms = s_second[threadIdx.x];
+            const unsigned long long msi = s_sidx[threadIdx.x];
+            const float ob = s_best[o];
+            const unsigned long long obi = s_idx[o];
+            const float os = s_second[o];
+            const unsigned long long osi = s_sidx[o];
+
+            if (ref_before(mb, mbi, ob, obi)) {
+                // Mine leads; the runner-up is my own runner-up or their leader.
+                if (!ref_before(ms, msi, ob, obi)) {
+                    s_second[threadIdx.x] = ob;
+                    s_sidx[threadIdx.x] = obi;
+                }
+            } else {
+                // Theirs leads; the runner-up is their runner-up or my leader.
+                s_best[threadIdx.x] = ob;
+                s_idx[threadIdx.x] = obi;
+                if (ref_before(os, osi, mb, mbi)) {
+                    s_second[threadIdx.x] = os;
+                    s_sidx[threadIdx.x] = osi;
+                } else {
+                    s_second[threadIdx.x] = mb;
+                    s_sidx[threadIdx.x] = mbi;
+                }
             }
         }
         __syncthreads();
@@ -564,6 +629,7 @@ extern "C" __global__ void reference_nn_search(
 
     if (threadIdx.x == 0) {
         out_indexes[q] = s_idx[0];
+        out_second_indexes[q] = s_sidx[0];
     }
 }
 "#;
@@ -681,14 +747,21 @@ extern "C" __global__ void reference_nn_search(
         (challenge, module, stream, prop)
     }
 
-    /// The exact answer, computed independently of `recall_audit`.
-    fn brute_force_1nn(
+    /// The exact answers, computed independently of `recall_audit`: the true
+    /// nearest neighbour of every query, and the true *second* nearest.
+    ///
+    /// One launch produces both, because the second-nearest is only meaningful
+    /// against the same scan that produced the first.
+    fn brute_force_1nn_and_2nn(
         challenge: &Challenge,
         module: Arc<CudaModule>,
         stream: Arc<CudaStream>,
-    ) -> Solution {
+    ) -> (Solution, Solution) {
         let kernel = module.load_function("reference_nn_search").unwrap();
         let mut d_out = stream
+            .alloc_zeros::<u64>(challenge.num_queries as usize)
+            .unwrap();
+        let mut d_out_second = stream
             .alloc_zeros::<u64>(challenge.num_queries as usize)
             .unwrap();
         unsafe {
@@ -700,6 +773,7 @@ extern "C" __global__ void reference_nn_search(
                 .arg(&(challenge.database_size as i32))
                 .arg(&(challenge.vector_dims as i32))
                 .arg(&mut d_out)
+                .arg(&mut d_out_second)
                 .launch(LaunchConfig {
                     grid_dim: (challenge.num_queries, 1, 1),
                     block_dim: (256, 1, 1),
@@ -708,10 +782,22 @@ extern "C" __global__ void reference_nn_search(
                 .unwrap();
         }
         stream.synchronize().unwrap();
-        let indexes = stream.memcpy_dtov(&d_out).unwrap();
-        Solution {
-            indexes: indexes.into_iter().map(|i| i as usize).collect(),
-        }
+        let to_solution = |v: Vec<u64>| Solution {
+            indexes: v.into_iter().map(|i| i as usize).collect(),
+        };
+        (
+            to_solution(stream.memcpy_dtov(&d_out).unwrap()),
+            to_solution(stream.memcpy_dtov(&d_out_second).unwrap()),
+        )
+    }
+
+    /// The exact answer, computed independently of `recall_audit`.
+    fn brute_force_1nn(
+        challenge: &Challenge,
+        module: Arc<CudaModule>,
+        stream: Arc<CudaStream>,
+    ) -> Solution {
+        brute_force_1nn_and_2nn(challenge, module, stream).0
     }
 
     #[test]
@@ -955,6 +1041,80 @@ extern "C" __global__ void reference_nn_search(
             "salt A audits the corrupted query, so {} must be < {}",
             q_a,
             q_b
+        );
+    }
+
+    #[test]
+    fn second_nearest_answers_score_a_miss() {
+        // The guard the rest of this module does not provide: that the audit
+        // actually finds the MINIMUM, not merely some small distance.
+        //
+        // Every other test here submits an answer that is either the exact
+        // argmin or a uniformly random row. The first is a hit under any kernel
+        // that over-estimates the minimum -- `exact_1nn_measures_recall_1` is
+        // structurally incapable of failing that way, since the true 1-NN's
+        // distance is by definition <= any minimum computed over a subset. The
+        // second is a miss under any kernel at all. So a `recall_audit` that
+        // scanned only part of the database passed all nine of the tests that
+        // existed before this one; that was measured, not supposed.
+        //
+        // The second-nearest neighbour is the probe that lands in the band
+        // between those two. Its distance is above the true minimum, so a
+        // correct audit calls it a miss -- but it is the smallest distance
+        // above it, so the moment the audit fails to visit the true 1-NN of a
+        // query, the runner-up BECOMES that query's minimum and scores a hit.
+        // That makes recall on a 2nd-NN solution a direct read-out of the
+        // fraction of the database the audit skipped: recall ~= f_skipped.
+        //
+        // SENSITIVITY FLOOR -- do not over-trust this test. The threshold below
+        // is 0.01 against a 1,000-sample audit whose resolution is 1/1000, so
+        // it catches skipped fractions of roughly 1% and up. Structural bugs
+        // clear that comfortably: a half-scan is 50%, and truncating
+        // `rows_in_tile` by one row of a 16-row staging pass is 6.25%. A
+        // single-row off-by-one over 700,000 rows is 0.39% and would NOT be
+        // caught here. This test is a guard against the tiling being wrong in
+        // shape, not a proof that it is right in every index.
+        let (challenge, module, stream, prop) = gpu_instance(1);
+        // Fixed seed and fixed salt: the value below is then deterministic, and
+        // a regression moves it for a reason rather than by luck of the draw.
+        let salt = [9u8; 32];
+        let (first, second) =
+            brute_force_1nn_and_2nn(&challenge, module.clone(), stream.clone());
+
+        // The runner-up must actually be a different row, or this asserts
+        // nothing at all -- it would just be exact_1nn_measures_recall_1 again.
+        assert_eq!(first.indexes.len(), second.indexes.len());
+        assert!(
+            first
+                .indexes
+                .iter()
+                .zip(second.indexes.iter())
+                .all(|(a, b)| a != b),
+            "the reference kernel returned the same row as both nearest and \
+             second nearest for some query"
+        );
+
+        let r = challenge
+            .measure_recall(&second, &salt, module, stream, &prop)
+            .unwrap();
+        // Printed because the value is informative when it moves: under a
+        // broken audit it is approximately the fraction of database skipped.
+        println!("second-nearest solution scored recall {}", r);
+
+        // `< 0.01`, deliberately not `== 0.0`. The hit test admits anything
+        // within (1 + tau) of the minimum with tau = 1e-6, and Task 1 measured
+        // min sqrt(d2/d1) = 1.0000004598 over 42,000 queries -- BELOW that
+        // threshold. So the tightest near-tie query in the instance is a
+        // legitimate hit even when answered with its second-nearest neighbour,
+        // and this reads 0.000 usually and 0.001 when such a query lands in the
+        // sampled subset. An equality assertion would be intermittently flaky,
+        // and a flaky guard is a guard someone deletes at 2am.
+        assert!(
+            r < 0.01,
+            "second-nearest answers scored recall {}, so the audit is not \
+             finding the true minimum -- recall on a 2nd-NN solution is roughly \
+             the fraction of the database the audit skipped",
+            r
         );
     }
 
