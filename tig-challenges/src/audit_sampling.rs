@@ -89,6 +89,72 @@ mod tests {
     }
 
     #[test]
+    fn no_query_is_audited_under_every_salt() {
+        // The audit set must MOVE with the salt, in full. A sampler that pins
+        // even one query -- a partial Fisher-Yates that skips `i == 0`, say,
+        // leaving query 0 in slot 0 under every seed -- hands an algorithm a
+        // query it can brute-force once and answer for free ever after. None of
+        // the tests above can see that: two salts still give different samples,
+        // and the sample is still deduplicated, in range and sorted.
+        //
+        // 64 fixed salts, so this is deterministic. Under the honest sampler a
+        // given query survives all 64 intersections with probability (1/7)^64,
+        // so the expected size of `common` is 7000 * (1/7)^64 -- zero for any
+        // purpose. Under a sampler that pins a query it is exactly 1.
+        let mut common: Option<std::collections::HashSet<u32>> = None;
+        for salt_byte in 0..64u8 {
+            let s: std::collections::HashSet<u32> =
+                sample_query_ids(&[salt_byte; 32], 7000, 1000)
+                    .into_iter()
+                    .collect();
+            common = Some(match common {
+                None => s,
+                Some(prev) => prev.intersection(&s).copied().collect(),
+            });
+        }
+        let mut common: Vec<u32> = common.expect("64 salts were drawn").into_iter().collect();
+        common.sort_unstable();
+        assert!(
+            common.is_empty(),
+            "queries {:?} are audited under all 64 salts, so the audit set is \
+             partly fixed and an algorithm can brute-force just those",
+            common
+        );
+    }
+
+    #[test]
+    fn the_sample_spans_the_whole_query_range() {
+        // A sampler that draws only from a PREFIX of the range --
+        // `(0..num_queries.min(2000))` instead of `(0..num_queries)`, say --
+        // passes every other test in this module: the sample is still
+        // salt-dependent, deduplicated, in range, sorted, and 1,000 long. Only
+        // its spread gives it away, and only the top of the range does: a
+        // prefix-restricted sampler still starts near 0.
+        //
+        // Fixed salt, so this either always passes or always fails; it cannot
+        // flake. The bounds are not tuned to this salt -- drawing 1,000 of
+        // 7,000 without replacement, P(nothing below 70) = (6/7)^70 ~= 2e-5,
+        // and the same at the top -- so almost every salt satisfies them.
+        // If this ever has to change, change the SALT, not the thresholds:
+        // widening them is exactly what would blind it to a restricted range.
+        let s = sample_query_ids(&[11u8; 32], 7000, 1000);
+        assert_eq!(s.len(), 1000);
+        assert!(
+            s[0] < 70,
+            "lowest audited query is {}; the sample does not reach the bottom \
+             of the query range",
+            s[0]
+        );
+        let last = *s.last().unwrap();
+        assert!(
+            last > 6930,
+            "highest audited query is {}; the sample does not reach the top of \
+             the query range, so most queries are never audited",
+            last
+        );
+    }
+
+    #[test]
     fn sample_is_sorted_ascending() {
         // The kernel reads sample_query_ids in order; sorted order makes the
         // query-vector reads sequential rather than scattered.

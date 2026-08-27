@@ -88,6 +88,41 @@ fn parse_audit_salt(audit_salt_hex: Option<String>) -> Result<[u8; 32]> {
     })
 }
 
+/// The warning text for a predictable audit salt, or `None` when the salt is
+/// one an algorithm could not have known in advance.
+///
+/// The all-zeros salt is what `parse_audit_salt` returns when `--audit-salt` is
+/// omitted, and it is not a secret: `tig_challenges::audit_sampling::
+/// sample_query_ids` is `pub` and is NOT hidden by the `hide_verification`
+/// feature that tig-algorithms builds tig-challenges with. An algorithm can
+/// therefore evaluate `sample_query_ids(&[0u8; 32], 7_000, 1_000)` at build
+/// time and bake the answer in. Against a verification run that omitted the
+/// flag, it needs to solve only the 1,000 audited queries -- 14% of the honest
+/// work -- and can return anything at all for the other 6,000 while still
+/// scoring recall 1.0.
+///
+/// The default stays (it is plan-mandated, contract C7, and the five CPU lanes
+/// depend on it); only its silence goes. Returned as a value rather than
+/// printed here so the wording is testable without a GPU.
+///
+/// `#[allow(dead_code)]`: a CPU-only build such as `--features c001` compiles
+/// no GPU arm, so nothing calls this outside the tests.
+#[allow(dead_code)]
+fn predictable_salt_warning(salt: &[u8; 32]) -> Option<String> {
+    if salt.iter().any(|&b| b != 0) {
+        return None;
+    }
+    Some(
+        "WARNING: no --audit-salt was given, so this run audits with the \
+         all-zeros salt. That salt is predictable: the audited query set is \
+         publicly computable before the solve, so a solution can be built to \
+         answer only those queries and still score full recall. Safe for local \
+         debugging ONLY -- never for verification whose result is trusted. Pass \
+         --audit-salt <64 hex chars> drawn after the solution was submitted."
+            .to_string(),
+    )
+}
+
 pub fn verify_solution(
     settings: String,
     rand_hash: String,
@@ -164,6 +199,15 @@ pub fn verify_solution(
                     stringify!($c)
                 )
             })?;
+
+            // Not gated behind --verbose: an operator who did not ask for
+            // verbose output is exactly the operator who needs to be told that
+            // this run's audit set was knowable before the solve. stderr, so it
+            // does not contaminate the `quality: N` line on stdout that callers
+            // parse.
+            if let Some(w) = predictable_salt_warning(&audit_salt) {
+                eprintln!("{}", w);
+            }
 
             if ptx_path.is_none() {
                 panic!("PTX file is required for GPU challenges.");
@@ -444,6 +488,49 @@ mod tests {
             "a well-formed but short salt is a length problem, not a hex problem: {}",
             err
         );
+    }
+
+    // --- the predictable-salt warning.
+
+    #[test]
+    fn the_all_zeros_salt_is_warned_about() {
+        // `sample_query_ids` is pub and ungated, and tig-algorithms links
+        // tig-challenges with `hide_verification`, which does not hide it. So an
+        // algorithm can compute sample_query_ids(&[0u8; 32], 7000, 1000) at
+        // BUILD time and hardcode the result. A GPU lane verified without
+        // --audit-salt hands over exactly that audit set, and the algorithm
+        // needs to solve only 1,000 of 7,000 queries -- 14% of the honest work
+        // -- to score whatever recall it likes.
+        //
+        // The all-zeros default itself is plan-mandated (contract C7) and stays.
+        // What must not stay is its silence.
+        let w = predictable_salt_warning(&[0u8; 32])
+            .expect("the all-zeros salt must produce a warning");
+        assert!(
+            w.contains("--audit-salt"),
+            "the warning must name the flag that fixes it, got: {}",
+            w
+        );
+        assert!(
+            w.to_lowercase().contains("predictable")
+                || w.to_lowercase().contains("publicly computable"),
+            "the warning must say WHY the zero salt is unsafe, got: {}",
+            w
+        );
+    }
+
+    #[test]
+    fn a_real_salt_is_not_warned_about() {
+        // The other half: a warning that fires on every salt is noise an
+        // operator learns to ignore, which is the same as no warning at all.
+        assert!(predictable_salt_warning(&[0xabu8; 32]).is_none());
+        // One non-zero byte is enough -- the seed is drawn from salt[0..8], but
+        // "not the all-zeros default" is the property being reported, and a
+        // salt that is zero in its first eight bytes but not elsewhere is not
+        // the default and did not come from omitting the flag.
+        let mut nearly_zero = [0u8; 32];
+        nearly_zero[31] = 1;
+        assert!(predictable_salt_warning(&nearly_zero).is_none());
     }
 
     #[test]

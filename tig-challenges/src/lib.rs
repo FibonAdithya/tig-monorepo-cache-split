@@ -7,7 +7,14 @@ macro_rules! conditional_pub {
         #[cfg(not(feature = "hide_verification"))]
         pub fn $name $($rest)*
 
+        // `dead_code` allowed on this arm only. Under `hide_verification` these
+        // functions are private with no in-crate caller BY CONSTRUCTION -- that
+        // is what the feature is for -- so the lint fires on every one of them
+        // in every algorithm build that links this crate, along with everything
+        // reachable only through them. Real dead code still warns in the
+        // ungated and per-challenge builds, where the arm above applies.
         #[cfg(feature = "hide_verification")]
+        #[allow(dead_code)]
         fn $name $($rest)*
     };
 }
@@ -211,3 +218,93 @@ pub use job_scheduling as c007;
 pub mod energy_arbitrage;
 #[cfg(feature = "c008")]
 pub use energy_arbitrage as c008;
+
+/// The one seam in c004 that no compiler checks: `AUDIT_BLOCK`, `AUDIT_TQ` and
+/// `AUDIT_MAX_DIMS` each exist twice, once as a `#define` in
+/// `vector_search/kernels.cu` and once as a Rust `const` in
+/// `vector_search/mod.rs`, and the two copies must agree. A mismatch is silent:
+/// too small an `AUDIT_BLOCK` leaves tile rows unexamined and reports recall
+/// *higher* than reality, and a mismatched `AUDIT_TQ` leaves the tail of the
+/// sample list unaudited. Each doc comment on the Rust side says "must equal
+/// X in kernels.cu"; this is the check behind that sentence.
+///
+/// Deliberately ungated, and deliberately reading both files as text. The Rust
+/// consts live behind `#[cfg(feature = "c004")]`, and that build pulls in
+/// cudarc, whose build script requires nvcc -- so a c004-gated test cannot even
+/// compile on a machine without CUDA, which is precisely where an unchecked
+/// seam would go unnoticed. Parsing the sources costs the ability to name the
+/// consts directly and buys a test that runs everywhere.
+///
+/// Inside `#[cfg(test)]` so the two sources are not embedded in the shipped
+/// library -- `include_str!` in a non-test item would put them in every
+/// algorithm `.so` that links this crate.
+#[cfg(test)]
+mod audit_constant_agreement_tests {
+    const KERNELS_CU: &str = include_str!("vector_search/kernels.cu");
+    const VECTOR_SEARCH_RS: &str = include_str!("vector_search/mod.rs");
+
+    /// The value of `#define <name> <integer>` in kernels.cu.
+    ///
+    /// Panics rather than returning an Option: a lookup that quietly found
+    /// nothing would turn the assertion below into a comparison of two
+    /// absences, which is the shape of a test that passes after the thing it
+    /// guards has been deleted.
+    fn cu_define(name: &str) -> u32 {
+        let prefix = format!("#define {} ", name);
+        let matches: Vec<&str> = KERNELS_CU
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with(&prefix))
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected exactly one `#define {}` in kernels.cu, found {}: {:?}",
+            name,
+            matches.len(),
+            matches
+        );
+        matches[0][prefix.len()..]
+            .trim()
+            .parse::<u32>()
+            .unwrap_or_else(|e| panic!("`{}` is not an integer #define: {}", matches[0], e))
+    }
+
+    /// The value of `const <name>: u32 = <integer>;` in vector_search/mod.rs.
+    fn rs_const(name: &str) -> u32 {
+        let prefix = format!("const {}: u32 = ", name);
+        let matches: Vec<&str> = VECTOR_SEARCH_RS
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with(&prefix) && l.ends_with(';'))
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected exactly one `const {}: u32` in vector_search/mod.rs, found {}: {:?}",
+            name,
+            matches.len(),
+            matches
+        );
+        let body = &matches[0][prefix.len()..matches[0].len() - 1];
+        body.trim()
+            .replace('_', "")
+            .parse::<u32>()
+            .unwrap_or_else(|e| panic!("`{}` is not an integer const: {}", matches[0], e))
+    }
+
+    #[test]
+    fn audit_constants_agree_between_kernels_cu_and_mod_rs() {
+        for name in ["AUDIT_BLOCK", "AUDIT_TQ", "AUDIT_MAX_DIMS"] {
+            let cu = cu_define(name);
+            let rs = rs_const(name);
+            assert_eq!(
+                cu, rs,
+                "{} is {} in kernels.cu but {} in vector_search/mod.rs; the two \
+                 are one constant that happens to live in two languages, and a \
+                 mismatch changes what the audit examines without any error",
+                name, cu, rs
+            );
+        }
+    }
+}

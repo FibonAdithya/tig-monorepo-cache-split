@@ -318,115 +318,168 @@ impl Challenge {
         Ok(avg_dist)
     }
 
-    /// Recall@1 measured on the salt-selected subsample.
-    ///
-    /// This function MEASURES; it never compares against `min_recall` and never
-    /// sees a declaration. The protocol does the comparing. Three callers share
-    /// it: a benchmarker estimating its own recall before declaring, a verifier
-    /// auditing with the protocol's salt, and the pentest reading the result
-    /// straight through as quality.
-    pub fn measure_recall(
-        &self,
-        solution: &Solution,
-        salt: &[u8; 32],
-        module: Arc<CudaModule>,
-        stream: Arc<CudaStream>,
-        _prop: &cudaDeviceProp,
-    ) -> Result<f32> {
-        if solution.indexes.len() != self.num_queries as usize {
-            return Err(anyhow!(
-                "Invalid number of indexes. Expected: {}, Actual: {}",
-                self.num_queries,
-                solution.indexes.len()
-            ));
+    // Recall@1 measured on the salt-selected subsample of `audit_samples`
+    // queries -- the audit as the protocol runs it.
+    //
+    // This function MEASURES; it never compares against `min_recall` and never
+    // sees a declaration. The protocol does the comparing. Three callers share
+    // it: a benchmarker estimating its own recall before declaring, a verifier
+    // auditing with the protocol's salt, and the pentest reading the result
+    // straight through as quality. Contract C3 is this signature, and the
+    // harness build does not set `hide_verification`, so wrapping it here does
+    // not narrow what the harness can call -- it only stops an algorithm, which
+    // DOES build with `hide_verification`, from reaching its own scorer.
+    //
+    // (Plain comments, not doc comments: conditional_pub! matches on a leading
+    // `fn`, so an attribute -- which is what /// desugars to -- would not match
+    // the macro arm.)
+    conditional_pub!(
+        fn measure_recall(
+            &self,
+            solution: &Solution,
+            salt: &[u8; 32],
+            module: Arc<CudaModule>,
+            stream: Arc<CudaStream>,
+            prop: &cudaDeviceProp,
+        ) -> Result<f32> {
+            let config = ScenarioConfig::from(self.scenario);
+            self.measure_recall_with_samples(
+                solution,
+                salt,
+                config.audit_samples,
+                module,
+                stream,
+                prop,
+            )
         }
-        // Unconditional, over every index rather than only the sampled ones.
-        // The kernel cannot do this: it reads solution_indexes[q] only for the
-        // queries it audits, so a bad index elsewhere would be invisible. Spec
-        // Decision 3a gives the benchmarker, the verifier and the pentest three
-        // different salts, so a salt-dependent check would let the same
-        // solution be Ok for one role and Err for another. Well-formedness is
-        // not a property of a random draw.
-        if let Some(&bad) = solution
-            .indexes
-            .iter()
-            .find(|&&i| i >= self.database_size as usize)
-        {
-            return Err(anyhow!(
-                "Invalid index in solution: {} >= {}",
-                bad,
-                self.database_size
-            ));
-        }
-        if self.vector_dims > AUDIT_MAX_DIMS {
-            return Err(anyhow!(
-                "recall_audit stages the query in {} floats of shared memory, but \
-                 this instance has {} dims",
-                AUDIT_MAX_DIMS,
-                self.vector_dims
-            ));
-        }
-        let config = ScenarioConfig::from(self.scenario);
-        let ids = sample_query_ids(salt, self.num_queries, config.audit_samples);
-        let num_samples = ids.len() as u32;
-        // Makes the divide-by-zero below unreachable by construction rather
-        // than by argument, and avoids a zero-block launch. Only reachable when
-        // num_queries is 0, which no scenario declares.
-        if num_samples == 0 {
-            return Err(anyhow!("No queries to audit"));
-        }
+    );
 
-        let kernel = module.load_function("recall_audit")?;
-        let d_indexes = stream.memcpy_stod(&solution.indexes)?;
-        let d_ids = stream.memcpy_stod(&ids)?;
-        let mut d_hits = stream.alloc_zeros::<u32>(ids.len())?;
-        let mut d_err = stream.alloc_zeros::<u32>(1)?;
-
-        let tol = 1.0f32 + config.recall_tolerance;
-        let tolerance_sq = tol * tol;
-
-        unsafe {
-            stream
-                .launch_builder(&kernel)
-                .arg(&self.vector_dims)
-                .arg(&self.database_size)
-                .arg(&num_samples)
-                .arg(&self.d_query_vectors)
-                .arg(&self.d_database_vectors)
-                .arg(&d_indexes)
-                .arg(&d_ids)
-                .arg(&tolerance_sq)
-                .arg(&mut d_hits)
-                .arg(&mut d_err)
-                .launch(LaunchConfig {
-                    // One block per AUDIT_TQ samples, not one per sample:
-                    // ceil, so the final partial group still gets a block.
-                    grid_dim: (num_samples.div_ceil(AUDIT_TQ), 1, 1),
-                    block_dim: (AUDIT_BLOCK, 1, 1),
-                    shared_mem_bytes: 0,
-                })?;
-        }
-        stream.synchronize()?;
-
-        match stream.memcpy_dtov(&d_err)?[0] {
-            0 => {}
-            // Unreachable in tree -- AUDIT_BLOCK is the launch's block_dim --
-            // but if it ever fires it must not masquerade as a bad solution.
-            2 => {
+    // The same measurement with the sample size chosen by the caller, which is
+    // what spec Decision 7 / contract C6 needs: `vs-evaluate` reports recall
+    // EXACT over all queries, and passing `num_queries` here is how it says so.
+    //
+    // Split out rather than given a defaulted parameter because the difference
+    // is not cosmetic. Asking `measure_recall` for an exact figure used to hand
+    // back a 1,000-of-7,000 estimate with no error and no type change -- the
+    // failure mode being a number that is merely wrong, which nothing downstream
+    // could detect. `num_samples` above `num_queries` is not an error: the
+    // sampler clamps with `min`, so `u32::MAX` and `num_queries` mean the same
+    // thing, "every query".
+    //
+    // Wrapped in conditional_pub! for the same reason `measure_recall` is: an
+    // algorithm that could call this could score itself, and it would not even
+    // need the salt to matter, since over all queries the salt selects nothing.
+    conditional_pub!(
+        fn measure_recall_with_samples(
+            &self,
+            solution: &Solution,
+            salt: &[u8; 32],
+            num_samples: u32,
+            module: Arc<CudaModule>,
+            stream: Arc<CudaStream>,
+            _prop: &cudaDeviceProp,
+        ) -> Result<f32> {
+            if solution.indexes.len() != self.num_queries as usize {
                 return Err(anyhow!(
-                    "recall_audit was launched with a block size other than {}; \
-                     its tiling is only correct at that width",
-                    AUDIT_BLOCK
-                ))
+                    "Invalid number of indexes. Expected: {}, Actual: {}",
+                    self.num_queries,
+                    solution.indexes.len()
+                ));
             }
-            _ => return Err(anyhow!("Invalid index in solution")),
+            // Unconditional, over every index rather than only the sampled ones.
+            // The kernel cannot do this: it reads solution_indexes[q] only for the
+            // queries it audits, so a bad index elsewhere would be invisible. Spec
+            // Decision 3a gives the benchmarker, the verifier and the pentest three
+            // different salts, so a salt-dependent check would let the same
+            // solution be Ok for one role and Err for another. Well-formedness is
+            // not a property of a random draw.
+            if let Some(&bad) = solution
+                .indexes
+                .iter()
+                .find(|&&i| i >= self.database_size as usize)
+            {
+                return Err(anyhow!(
+                    "Invalid index in solution: {} >= {}",
+                    bad,
+                    self.database_size
+                ));
+            }
+            if self.vector_dims > AUDIT_MAX_DIMS {
+                return Err(anyhow!(
+                    "recall_audit stages the query in {} floats of shared memory, but \
+                     this instance has {} dims",
+                    AUDIT_MAX_DIMS,
+                    self.vector_dims
+                ));
+            }
+            let config = ScenarioConfig::from(self.scenario);
+            let ids = sample_query_ids(salt, self.num_queries, num_samples);
+            // `ids.len()`, not `num_samples`: the sampler clamps with
+            // `min(num_samples, num_queries)`, so a caller asking for every
+            // query -- or for more than there are, which C6's exact path may
+            // well do -- still divides by what was actually audited.
+            let num_audited = ids.len() as u32;
+            // Makes the divide-by-zero below unreachable by construction rather
+            // than by argument, and avoids a zero-block launch. Reachable when
+            // num_queries is 0, which no scenario declares, or when a caller
+            // asks for 0 samples, which is a caller bug worth naming.
+            if num_audited == 0 {
+                return Err(anyhow!("No queries to audit"));
+            }
+
+            let kernel = module.load_function("recall_audit")?;
+            let d_indexes = stream.memcpy_stod(&solution.indexes)?;
+            let d_ids = stream.memcpy_stod(&ids)?;
+            let mut d_hits = stream.alloc_zeros::<u32>(ids.len())?;
+            let mut d_err = stream.alloc_zeros::<u32>(1)?;
+
+            let tol = 1.0f32 + config.recall_tolerance;
+            let tolerance_sq = tol * tol;
+
+            unsafe {
+                stream
+                    .launch_builder(&kernel)
+                    .arg(&self.vector_dims)
+                    .arg(&self.database_size)
+                    .arg(&num_audited)
+                    .arg(&self.d_query_vectors)
+                    .arg(&self.d_database_vectors)
+                    .arg(&d_indexes)
+                    .arg(&d_ids)
+                    .arg(&tolerance_sq)
+                    .arg(&mut d_hits)
+                    .arg(&mut d_err)
+                    .launch(LaunchConfig {
+                        // One block per AUDIT_TQ samples, not one per sample:
+                        // ceil, so the final partial group still gets a block.
+                        grid_dim: (num_audited.div_ceil(AUDIT_TQ), 1, 1),
+                        block_dim: (AUDIT_BLOCK, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+            }
+            stream.synchronize()?;
+
+            match stream.memcpy_dtov(&d_err)?[0] {
+                0 => {}
+                // Unreachable in tree -- AUDIT_BLOCK is the launch's block_dim --
+                // but if it ever fires it must not masquerade as a bad solution.
+                2 => {
+                    return Err(anyhow!(
+                        "recall_audit was launched with a block size other than {}; \
+                         its tiling is only correct at that width",
+                        AUDIT_BLOCK
+                    ))
+                }
+                _ => return Err(anyhow!("Invalid index in solution")),
+            }
+            let hits = stream.memcpy_dtov(&d_hits)?;
+            // u32 accumulator: neither 1,000 samples nor all 7,000 queries can
+            // overflow it, but summing into u32 rather than the element type
+            // keeps it correct if either grows.
+            let total: u32 = hits.iter().sum();
+            Ok(total as f32 / num_audited as f32)
         }
-        let hits = stream.memcpy_dtov(&d_hits)?;
-        // u32 accumulator: 1,000 samples cannot overflow, but summing into u32
-        // rather than the element type keeps it correct if audit_samples grows.
-        let total: u32 = hits.iter().sum();
-        Ok(total as f32 / num_samples as f32)
-    }
+    );
 
     // Quality is the audited recall@1, scaled to QUALITY_PRECISION.
     //
@@ -744,6 +797,83 @@ extern "C" __global__ void reference_nn_search(
             &prop,
         )
         .unwrap();
+        (challenge, module, stream, prop)
+    }
+
+    // The three floats that make the hit tolerance's two edges reachable, and
+    // the hand-built instance that carries them. (Plain comments: a `///` block
+    // here would attach to `TOL_DB_NEAR` alone, and this describes the group.)
+    //
+    // A generated SIFT instance cannot exercise `tolerance_sq`. Every probe
+    // available on one is either the exact argmin (a hit at any tolerance,
+    // including zero) or a uniformly random row (a miss at any tolerance short
+    // of absurd), so both directions of the band are invisible: setting
+    // `tolerance_sq` to 1.0 or to 1e9 leaves every other test in this module
+    // green. The band is only observable against a database whose second row
+    // is placed *inside* it on purpose.
+    //
+    // Every query is the origin, so a row's squared distance is its own
+    // squared norm and the arithmetic is checkable by hand:
+    //
+    // | row | first coord | d^2                    | role                    |
+    // |-----|-------------|------------------------|-------------------------|
+    // | 0   | 1.0         | 1.0                    | the true argmin         |
+    // | 1   | 1.0 + 5e-7  | 1 + 8 ulp ~= 1.0000010 | inside the band: a HIT  |
+    // | 2   | 2.0         | 4.0                    | outside it: a MISS      |
+    //
+    // `1.0 + 5e-7` is not a no-op: an f32 ulp at 1.0 is 1.19e-7, so it rounds
+    // to exactly 4 ulps above 1.0 and its square to exactly 8 ulps above 1.0.
+    // The tolerance is `(1 + 1e-6)^2`, which is 16 ulps above 1.0, so row 1
+    // clears the bar with 8 ulps to spare while a `tolerance_sq` of 1.0 rejects
+    // it. This is the deliberate difference from the "make rows 0 and 1
+    // identical" construction: identical rows give `s_returned == s_red[0]`
+    // exactly, and the kernel's test is `<=`, so they would be a hit even at
+    // `tolerance_sq = 1.0` and would discriminate nothing.
+    //
+    // `scenario` is SIFT_128 because `measure_recall` reads only
+    // `audit_samples` and `recall_tolerance` off the config -- the shape comes
+    // from the `Challenge` fields, which are this instance's own. With 4
+    // queries and `audit_samples` 1,000, `min(1000, 4) = 4`: every query is
+    // audited, so recall here is exact and not a subsample estimate.
+    const TOL_DB_NEAR: f32 = 1.0f32 + 5e-7;
+    const TOL_DIMS: usize = 8;
+    const TOL_NUM_QUERIES: usize = 4;
+    const TOL_DB_ROWS: usize = 3;
+
+    /// The synthetic instance described above.
+    fn tolerance_probe_instance() -> (Challenge, Arc<CudaModule>, Arc<CudaStream>, cudaDeviceProp) {
+        let ptx = Ptx::from_file(test_ptx_path().clone());
+        let ctx = CudaContext::new(0).unwrap_or_else(|e| {
+            panic!(
+                "cannot open CUDA device 0: {}. These tests need a GPU and do \
+                 not skip without one.",
+                e
+            )
+        });
+        ctx.set_blocking_synchronize().unwrap();
+        let module = ctx.load_module(ptx).unwrap();
+        let stream = ctx.default_stream();
+        let prop = get_device_prop(0).unwrap();
+
+        let queries = vec![0.0f32; TOL_NUM_QUERIES * TOL_DIMS];
+        let mut database = vec![0.0f32; TOL_DB_ROWS * TOL_DIMS];
+        database[0 * TOL_DIMS] = 1.0;
+        database[1 * TOL_DIMS] = TOL_DB_NEAR;
+        database[2 * TOL_DIMS] = 2.0;
+
+        let d_query_vectors = stream.memcpy_stod(&queries).unwrap();
+        let d_database_vectors = stream.memcpy_stod(&database).unwrap();
+        stream.synchronize().unwrap();
+
+        let challenge = Challenge {
+            seed: [0u8; 32],
+            scenario: Scenario::SIFT_128,
+            num_queries: TOL_NUM_QUERIES as u32,
+            vector_dims: TOL_DIMS as u32,
+            database_size: TOL_DB_ROWS as u32,
+            d_database_vectors,
+            d_query_vectors,
+        };
         (challenge, module, stream, prop)
     }
 
@@ -1119,6 +1249,214 @@ extern "C" __global__ void reference_nn_search(
     }
 
     #[test]
+    fn recall_over_all_queries_is_exact_not_a_sample_estimate() {
+        // Spec Decision 7 / contract C6: `vs-evaluate` reports recall EXACT over
+        // all 7,000 queries, not the 1,000-sample estimate the audit runs on.
+        // `measure_recall` reads `config.audit_samples` with no override, so a
+        // caller asking for the exact figure silently received an estimate --
+        // no error, no type change, just a different number. C6 was
+        // unreachable, and failed quietly.
+        let (challenge, module, stream, prop) = gpu_instance(1);
+        let config = ScenarioConfig::from(challenge.scenario);
+        let salt = [9u8; 32];
+        let n = challenge.num_queries;
+        assert!(
+            config.audit_samples < n,
+            "this test needs unaudited queries to exist; audit_samples is {} of {}",
+            config.audit_samples,
+            n
+        );
+
+        // An exact 1-NN is right on every query, so the exact path must return
+        // exactly 1.0.
+        let exact_answer = brute_force_1nn(&challenge, module.clone(), stream.clone());
+        let r = challenge
+            .measure_recall_with_samples(
+                &exact_answer,
+                &salt,
+                n,
+                module.clone(),
+                stream.clone(),
+                &prop,
+            )
+            .unwrap();
+        assert_eq!(r, 1.0, "an exact 1-NN must score 1.0 over all queries");
+
+        // The discriminating half: corrupt exactly one query that this salt does
+        // NOT audit. `corrupting_an_unsampled_query_does_not_move_recall`
+        // already pins that the sampled path cannot see such a corruption, so if
+        // the two paths agree here, the "exact" path is still sampling.
+        let sampled: std::collections::HashSet<u32> =
+            sample_query_ids(&salt, n, config.audit_samples)
+                .into_iter()
+                .collect();
+        let victim = (0..n)
+            .find(|q| !sampled.contains(q))
+            .expect("audit_samples < num_queries, so some query is unsampled")
+            as usize;
+        let mut corrupted = exact_answer.clone();
+        corrupted.indexes[victim] =
+            (corrupted.indexes[victim] + 1) % challenge.database_size as usize;
+
+        let sampled_recall = challenge
+            .measure_recall(&corrupted, &salt, module.clone(), stream.clone(), &prop)
+            .unwrap();
+        assert_eq!(
+            sampled_recall, 1.0,
+            "the corrupted query is unsampled, so the sampled path must still \
+             read 1.0 -- if it does not, the victim was chosen wrongly and the \
+             comparison below proves nothing"
+        );
+
+        let exact_recall = challenge
+            .measure_recall_with_samples(&corrupted, &salt, n, module.clone(), stream.clone(), &prop)
+            .unwrap();
+        // The exact VALUE, not merely "different": this pins the denominator to
+        // all 7,000 queries. A body that ignored `num_samples` returns 1.0; one
+        // that used it for the numerator but kept `audit_samples` as the
+        // denominator lands somewhere else again.
+        assert_eq!(
+            exact_recall,
+            (n - 1) as f32 / n as f32,
+            "one wrong answer out of {} queries must read as exactly {} over the \
+             exact path; got {}, while the sampled path read {}",
+            n,
+            (n - 1) as f32 / n as f32,
+            exact_recall,
+            sampled_recall
+        );
+
+        // And the delegation: `measure_recall` must be exactly
+        // `measure_recall_with_samples` at `config.audit_samples`, not at some
+        // other constant.
+        //
+        // The probe has to be a solution whose recall MOVES with the sample
+        // size, and `corrupted` is not one: `sample_query_ids` builds its
+        // n-sample draw as the first n swaps of the same Fisher-Yates walk, so
+        // a k-sample set is a subset of the 1,000-sample set for any k < 1,000,
+        // and a query unsampled at 1,000 is unsampled at every smaller k too.
+        // Comparing on `corrupted` therefore compares 1.0 against 1.0 and
+        // passes for any constant at all -- measured, not supposed: with
+        // `measure_recall` mutated to pass 500 it stayed green.
+        //
+        // Every even-indexed query answered wrongly gives roughly half recall,
+        // and the even fraction of a 500-sample prefix is not the even fraction
+        // of the 1,000-sample draw.
+        let mut half_wrong = exact_answer.clone();
+        for q in (0..half_wrong.indexes.len()).step_by(2) {
+            half_wrong.indexes[q] = (half_wrong.indexes[q] + 1) % challenge.database_size as usize;
+        }
+        let via_measure_recall = challenge
+            .measure_recall(&half_wrong, &salt, module.clone(), stream.clone(), &prop)
+            .unwrap();
+        let via_explicit_samples = challenge
+            .measure_recall_with_samples(
+                &half_wrong,
+                &salt,
+                config.audit_samples,
+                module,
+                stream,
+                &prop,
+            )
+            .unwrap();
+        assert!(
+            via_measure_recall > 0.2 && via_measure_recall < 0.8,
+            "half the queries are answered wrongly, so recall should be near \
+             0.5; {} means the probe is not discriminating and the equality \
+             below proves nothing",
+            via_measure_recall
+        );
+        assert_eq!(
+            via_measure_recall, via_explicit_samples,
+            "measure_recall must be measure_recall_with_samples at \
+             config.audit_samples ({}), and nothing else",
+            config.audit_samples
+        );
+    }
+
+    #[test]
+    fn a_near_tie_inside_the_tolerance_counts_as_a_hit() {
+        // The spec row that says a solution equal to exact-1NN with a near-tie
+        // swapped still counts as a hit. Nothing in this module tested it, and
+        // nothing tested `tolerance_sq` at all: with `tolerance_sq` hardcoded to
+        // 1.0 -- no tolerance whatsoever -- every other test here stays green.
+        //
+        // Row 1 is NOT the argmin (row 0 is, at exactly 1.0), so a kernel that
+        // simply compared the returned index against the true one would fail
+        // this; the hit comes from the distance being inside the band.
+
+        // The CPU reference for the same arithmetic, asserted first so that a
+        // future f32 surprise shows up here as a clear failure rather than as a
+        // mysterious recall of 0. This is the "audit kernel vs a CPU reference
+        // on a small synthetic instance" check.
+        let config = ScenarioConfig::from(Scenario::SIFT_128);
+        let d0_sq = 1.0f32;
+        let d1_sq = TOL_DB_NEAR * TOL_DB_NEAR;
+        let tol = 1.0f32 + config.recall_tolerance;
+        let tolerance_sq = tol * tol;
+        assert!(
+            TOL_DB_NEAR > 1.0f32,
+            "1.0 + 5e-7 rounded back to 1.0 in f32, so rows 0 and 1 are \
+             identical and this test degenerates: identical rows are a hit even \
+             at tolerance_sq = 1.0, because the kernel's test is `<=`"
+        );
+        assert!(
+            d1_sq > d0_sq,
+            "row 1 must be strictly farther than row 0 ({} vs {}), or the \
+             tolerance is not what is being measured",
+            d1_sq,
+            d0_sq
+        );
+        assert!(
+            d1_sq <= d0_sq * tolerance_sq,
+            "row 1 at {} is outside the tolerance band {} and could never be a \
+             hit; the construction is wrong, not the kernel",
+            d1_sq,
+            d0_sq * tolerance_sq
+        );
+
+        let (challenge, module, stream, prop) = tolerance_probe_instance();
+        let near_tie = Solution {
+            indexes: vec![1; TOL_NUM_QUERIES],
+        };
+        let r = challenge
+            .measure_recall(&near_tie, &[3u8; 32], module, stream, &prop)
+            .unwrap();
+        assert_eq!(
+            r, 1.0,
+            "an answer {} times the true minimum, inside the (1 + {})^2 \
+             tolerance, must count as a hit",
+            d1_sq / d0_sq,
+            config.recall_tolerance
+        );
+    }
+
+    #[test]
+    fn an_answer_outside_the_tolerance_is_a_miss() {
+        // The other edge. Without this, `tolerance_sq` could be raised to any
+        // value at all -- 4.0, 1e9 -- and every test in this module would stay
+        // green, because a tolerance that admits everything turns the audit into
+        // "did you return a valid index", which every solution passes.
+        //
+        // Row 2 is at d^2 = 4.0 against a minimum of 1.0: four times the
+        // minimum, so this fails the moment the tolerance grows past a factor
+        // of 4 in squared distance (a factor of 2 in distance).
+        let (challenge, module, stream, prop) = tolerance_probe_instance();
+        let far = Solution {
+            indexes: vec![2; TOL_NUM_QUERIES],
+        };
+        let r = challenge
+            .measure_recall(&far, &[3u8; 32], module, stream, &prop)
+            .unwrap();
+        assert_eq!(
+            r, 0.0,
+            "an answer at 4x the true minimum squared distance must be a miss; \
+             the tolerance is meant to absorb float noise, not to excuse a \
+             wrong neighbour"
+        );
+    }
+
+    #[test]
     fn audit_is_much_cheaper_than_a_naive_solve() {
         // The design property: verification must be far cheaper than solving.
         // The naive full-database scan for 7,000 queries measured 27,000 ms
@@ -1151,7 +1489,13 @@ extern "C" __global__ void reference_nn_search(
         println!("recall_audit best-of-three: {} ms", ms);
         assert!(
             ms < 150,
-            "audit took {} ms; the untiled kernel is still in place",
+            "audit took {} ms. The ceiling implies a floor of roughly 134 GB/s \
+             of database reads (56 sweeps of the 358 MB database is about 20 GB, \
+             and 20 GB in 150 ms is 134 GB/s), which an RTX 3060 clears at 85-87 \
+             ms and the untiled one-block-per-query kernel misses at 2,623 ms. \
+             So this is either the untiled kernel back in place, or a card whose \
+             achievable bandwidth is below that floor -- check which before \
+             assuming a regression",
             ms
         );
     }
