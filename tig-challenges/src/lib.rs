@@ -190,6 +190,7 @@ pub use vehicle_routing as c002;
 pub mod knapsack;
 #[cfg(feature = "c003")]
 pub use knapsack as c003;
+pub mod audit_sampling;
 #[cfg(feature = "c004")]
 pub mod vector_search;
 #[cfg(feature = "c004")]
