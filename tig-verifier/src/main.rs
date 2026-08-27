@@ -88,8 +88,19 @@ fn parse_audit_salt(audit_salt_hex: Option<String>) -> Result<[u8; 32]> {
     })
 }
 
-/// The warning text for a predictable audit salt, or `None` when the salt is
-/// one an algorithm could not have known in advance.
+/// The warning text for a predictable audit salt on an audited lane, or `None`
+/// when there is nothing to say -- either because the salt is one an algorithm
+/// could not have known in advance, or because this challenge does not audit on
+/// a salt-selected subsample at all.
+///
+/// `challenge_id` is not decoration. The `gpu` arm of `dispatch_challenge!` is
+/// shared by c004, c005 and c006, and only c004's quality is audited on a
+/// subsample; the other two take `_audit_salt` and ignore it (see
+/// `hypergraph/mod.rs`), and no c005 or c006 run ever passes `--audit-salt`,
+/// because for them it means nothing. Warning on all three would put a false
+/// security notice on two of the three GPU lanes, and a warning that fires
+/// where it does not apply is one operators learn to scroll past -- which costs
+/// it precisely the attention the c004 case needs.
 ///
 /// The all-zeros salt is what `parse_audit_salt` returns when `--audit-salt` is
 /// omitted, and it is not a secret: `tig_challenges::audit_sampling::
@@ -108,7 +119,10 @@ fn parse_audit_salt(audit_salt_hex: Option<String>) -> Result<[u8; 32]> {
 /// `#[allow(dead_code)]`: a CPU-only build such as `--features c001` compiles
 /// no GPU arm, so nothing calls this outside the tests.
 #[allow(dead_code)]
-fn predictable_salt_warning(salt: &[u8; 32]) -> Option<String> {
+fn predictable_salt_warning(challenge_id: &str, salt: &[u8; 32]) -> Option<String> {
+    if challenge_id != "c004" {
+        return None;
+    }
     if salt.iter().any(|&b| b != 0) {
         return None;
     }
@@ -204,8 +218,10 @@ pub fn verify_solution(
             // verbose output is exactly the operator who needs to be told that
             // this run's audit set was knowable before the solve. stderr, so it
             // does not contaminate the `quality: N` line on stdout that callers
-            // parse.
-            if let Some(w) = predictable_salt_warning(&audit_salt) {
+            // parse. And scoped by challenge, because this arm is shared with
+            // c005 and c006, for which the salt is inert -- the helper does the
+            // scoping so that "which lanes warn" is testable without a GPU.
+            if let Some(w) = predictable_salt_warning(stringify!($c), &audit_salt) {
                 eprintln!("{}", w);
             }
 
@@ -504,8 +520,8 @@ mod tests {
         //
         // The all-zeros default itself is plan-mandated (contract C7) and stays.
         // What must not stay is its silence.
-        let w = predictable_salt_warning(&[0u8; 32])
-            .expect("the all-zeros salt must produce a warning");
+        let w = predictable_salt_warning("c004", &[0u8; 32])
+            .expect("the all-zeros salt must produce a warning on the c004 lane");
         assert!(
             w.contains("--audit-salt"),
             "the warning must name the flag that fixes it, got: {}",
@@ -523,14 +539,41 @@ mod tests {
     fn a_real_salt_is_not_warned_about() {
         // The other half: a warning that fires on every salt is noise an
         // operator learns to ignore, which is the same as no warning at all.
-        assert!(predictable_salt_warning(&[0xabu8; 32]).is_none());
+        assert!(predictable_salt_warning("c004", &[0xabu8; 32]).is_none());
         // One non-zero byte is enough -- the seed is drawn from salt[0..8], but
         // "not the all-zeros default" is the property being reported, and a
         // salt that is zero in its first eight bytes but not elsewhere is not
         // the default and did not come from omitting the flag.
         let mut nearly_zero = [0u8; 32];
         nearly_zero[31] = 1;
-        assert!(predictable_salt_warning(&nearly_zero).is_none());
+        assert!(predictable_salt_warning("c004", &nearly_zero).is_none());
+    }
+
+    #[test]
+    fn only_the_audited_lane_warns_about_the_zero_salt() {
+        // The gpu arm of dispatch_challenge! is shared by c004, c005 and c006,
+        // and only c004's quality is audited on a salt-selected subsample:
+        // hypergraph/mod.rs takes `_audit_salt` and ignores it, and the
+        // parameter exists only so the three challenges share one signature.
+        // So a bare `if salt is zero` in that arm fires on every c005 and c006
+        // verification ever run -- none of which pass --audit-salt, because for
+        // them it means nothing -- and says something false about each.
+        //
+        // That is the same habituation failure `a_real_salt_is_not_warned_about`
+        // guards, on the other axis. A warning that cries wolf on two of the
+        // three GPU lanes is a warning operators learn to scroll past, which
+        // costs it exactly the attention the c004 case needs.
+        for lane in ["c005", "c006"] {
+            assert!(
+                predictable_salt_warning(lane, &[0u8; 32]).is_none(),
+                "{} does not audit on a subsample, so the zero salt is not a \
+                 security property of that lane and must not be reported as one",
+                lane
+            );
+        }
+        // And the same call that stays silent for those must still speak for
+        // c004, or this test is satisfied by a function that never warns.
+        assert!(predictable_salt_warning("c004", &[0u8; 32]).is_some());
     }
 
     #[test]
