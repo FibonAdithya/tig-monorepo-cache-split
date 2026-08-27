@@ -395,20 +395,24 @@ impl Challenge {
         Ok(total as f32 / num_samples as f32)
     }
 
+    // Quality is the audited recall@1, scaled to QUALITY_PRECISION.
+    //
+    // No clamp: measure_recall returns hits/samples, which is already in
+    // [0, 1], so the result lands in [0, QUALITY_PRECISION] by construction.
+    // (A plain comment, not a doc comment: conditional_pub! matches on a
+    // leading `fn`, so an attribute -- which is what /// desugars to -- would
+    // not match the macro arm.)
     conditional_pub!(
         fn evaluate_solution(
             &self,
             solution: &Solution,
+            audit_salt: &[u8; 32],
             module: Arc<CudaModule>,
             stream: Arc<CudaStream>,
             prop: &cudaDeviceProp,
         ) -> Result<i32> {
-            let avg_dist = self.evaluate_average_distance(solution, module, stream, prop)?;
-            let config = ScenarioConfig::from(self.scenario);
-            let quality = (config.quality_offset - avg_dist as f64) / config.quality_scale;
-            let quality = quality.clamp(-10.0, 10.0) * QUALITY_PRECISION as f64;
-            let quality = quality.round() as i32;
-            Ok(quality)
+            let recall = self.measure_recall(solution, audit_salt, module, stream, prop)?;
+            Ok((recall * QUALITY_PRECISION as f32).round() as i32)
         }
     );
 }
@@ -839,5 +843,31 @@ extern "C" __global__ void reference_nn_search(
             "expected the invalid-index error, got: {}",
             err
         );
+    }
+
+    #[test]
+    fn quality_is_recall_scaled_to_quality_precision() {
+        // Quality IS the audited recall, scaled. Asserting the exact
+        // QUALITY_PRECISION value (not "> 0") is what pins the scale: an
+        // implementation returning the raw 0..1 recall, or the old
+        // mean-distance quality, misses it.
+        let (challenge, module, stream, prop) = gpu_instance(1);
+        let exact = brute_force_1nn(&challenge, module.clone(), stream.clone());
+        let q = challenge
+            .evaluate_solution(&exact, &[9u8; 32], module.clone(), stream.clone(), &prop)
+            .unwrap();
+        assert_eq!(q, QUALITY_PRECISION, "exact 1-NN must score full quality");
+
+        // The lower end: a solution that answers nothing must land below the
+        // bar the protocol will compare against, or the bar gates nothing.
+        let zeros = Solution {
+            indexes: vec![0; challenge.num_queries as usize],
+        };
+        let qz = challenge
+            .evaluate_solution(&zeros, &[9u8; 32], module, stream, &prop)
+            .unwrap();
+        let config = ScenarioConfig::from(challenge.scenario);
+        let bar = (config.min_recall * QUALITY_PRECISION as f32).round() as i32;
+        assert!(qz < bar, "all-zeros scored {} against a bar of {}", qz, bar);
     }
 }

@@ -20,11 +20,6 @@ pub struct ScenarioConfig {
     /// blob fails in tests rather than network-wide.
     pub vector_dims: usize,
     pub weights: &'static [u8],
-    /// quality = (offset - avg_dist) / scale. Per-scenario because mean
-    /// distance scales with dims and clustering; one shared pair cannot span
-    /// two corpora.
-    pub quality_offset: f64,
-    pub quality_scale: f64,
     /// Recall@1 a solution must declare to qualify. Per scenario because the
     /// achievable recall/speed frontier depends on the corpus.
     /// 0.95, chosen in `docs/measurements/2026-08-27-c004-d2-over-d1.md`
@@ -57,8 +52,6 @@ impl From<Scenario> for ScenarioConfig {
                 // it can embed the 7 MB blob twice -- in every algorithm .so,
                 // since they all link tig-challenges.
                 weights: super::generator::V1_BLOB,
-                quality_offset: 1.616563,
-                quality_scale: 6.399004,
                 min_recall: 0.95,
                 recall_tolerance: 1e-6,
                 audit_samples: 1_000,
@@ -121,8 +114,6 @@ mod tests {
         assert_eq!(c.n_queries, 7_000);
         assert_eq!(c.database_size, 700_000);
         assert_eq!(c.vector_dims, 128);
-        assert_eq!(c.quality_offset, 1.616563);
-        assert_eq!(c.quality_scale, 6.399004);
         assert!(!c.weights.is_empty());
     }
 

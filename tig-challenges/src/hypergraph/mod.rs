@@ -478,6 +478,10 @@ impl Challenge {
         fn evaluate_solution(
             &self,
             solution: &Solution,
+            // Unused: c005/c006 quality is not audited on a subsample. The
+            // parameter exists so all three GPU challenges share one
+            // signature, which is what dispatch_challenge!'s gpu arm calls.
+            _audit_salt: &[u8; 32],
             module: Arc<CudaModule>,
             stream: Arc<CudaStream>,
             _prop: &cudaDeviceProp,

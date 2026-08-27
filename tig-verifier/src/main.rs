@@ -28,6 +28,10 @@ fn cli() -> Command {
         )
         .arg(arg!(--ptx [PTX] "Path to a CUDA ptx file").value_parser(clap::value_parser!(PathBuf)))
         .arg(arg!(--gpu [GPU] "Which GPU device to use").value_parser(clap::value_parser!(usize)))
+        .arg(
+            arg!(--"audit-salt" [AUDIT_SALT] "32-byte audit salt as 64 hex chars")
+                .value_parser(clap::value_parser!(String)),
+        )
         .arg(arg!(--verbose "Enable verbose output").action(clap::ArgAction::SetTrue))
 }
 
@@ -41,6 +45,7 @@ fn main() {
         matches.get_one::<String>("SOLUTION").unwrap().clone(),
         matches.get_one::<PathBuf>("ptx").cloned(),
         matches.get_one::<usize>("gpu").cloned(),
+        matches.get_one::<String>("audit-salt").cloned(),
         matches.get_one::<bool>("verbose").cloned().unwrap_or(false),
     ) {
         eprintln!("Error: {}", e);
@@ -55,10 +60,31 @@ pub fn verify_solution(
     solution_path: String,
     ptx_path: Option<PathBuf>,
     gpu_device: Option<usize>,
+    audit_salt_hex: Option<String>,
     verbose: bool,
 ) -> Result<()> {
     let settings = load_settings(&settings);
     let seed = settings.calc_seed(&rand_hash, nonce);
+
+    // Decoded once, up front, so a malformed salt is a clear error before any
+    // GPU work rather than a surprise mid-verification. Defaults to all-zeros
+    // when absent: the five CPU lanes never pass one, and local debugging of a
+    // GPU lane should not have to invent 64 hex characters.
+    // Only the GPU arm reads it; a CPU-only build (e.g. --features c001)
+    // still decodes and validates, so a bad salt is rejected on every lane.
+    #[allow(unused_variables)]
+    let audit_salt: [u8; 32] = match audit_salt_hex {
+        Some(h) => hex::decode(&h)
+            .map_err(|e| anyhow::anyhow!("--audit-salt is not hex: {}", e))?
+            .try_into()
+            .map_err(|v: Vec<u8>| {
+                anyhow::anyhow!(
+                    "--audit-salt must decode to exactly 32 bytes, got {}",
+                    v.len()
+                )
+            })?,
+        None => [0u8; 32],
+    };
 
     let mut err_msg = Option::<String>::None;
 
@@ -150,6 +176,7 @@ pub fn verify_solution(
                     }
                     match challenge.evaluate_solution(
                         &solution,
+                        &audit_salt,
                         module.clone(),
                         stream.clone(),
                         &prop,
