@@ -25,6 +25,23 @@ pub struct ScenarioConfig {
     /// two corpora.
     pub quality_offset: f64,
     pub quality_scale: f64,
+    /// Recall@1 a solution must declare to qualify. Per scenario because the
+    /// achievable recall/speed frontier depends on the corpus.
+    /// 0.95, chosen in `docs/measurements/2026-08-27-c004-d2-over-d1.md`
+    /// (tig-pentesting repo): measured floors for a viable `r` are far below
+    /// it (0.281 measured on an oracle worst-case seed; 0.79 under an
+    /// unmeasured near-tie hypothesis), so 0.95 clears both with margin. The
+    /// upper end is not measured — no ANN method was run — so "0.95 is not
+    /// trivially cleared by an approximate method" is judgement, not
+    /// measurement; a cheap ANN clearing it later is grounds to raise `r`,
+    /// not to reconsider the design.
+    pub min_recall: f32,
+    /// A returned vector counts as a hit when its distance is within this
+    /// relative tolerance of the true minimum. Absorbs cross-architecture float
+    /// noise and makes an equidistant alternative a hit by construction.
+    pub recall_tolerance: f32,
+    /// Queries the audit checks. Verification cost is linear in this.
+    pub audit_samples: u32,
 }
 
 impl From<Scenario> for ScenarioConfig {
@@ -42,6 +59,9 @@ impl From<Scenario> for ScenarioConfig {
                 weights: super::generator::V1_BLOB,
                 quality_offset: 1.616563,
                 quality_scale: 6.399004,
+                min_recall: 0.95,
+                recall_tolerance: 1e-6,
+                audit_samples: 1_000,
             },
         }
     }
@@ -104,5 +124,15 @@ mod tests {
         assert_eq!(c.quality_offset, 1.616563);
         assert_eq!(c.quality_scale, 6.399004);
         assert!(!c.weights.is_empty());
+    }
+
+    #[test]
+    fn sift_128_declares_its_recall_bar() {
+        let c = ScenarioConfig::from(Scenario::SIFT_128);
+        // Asserted against the value, not `is_finite()` — a bar that silently
+        // defaulted to 0.0 would qualify every solution including all-zeros.
+        assert_eq!(c.min_recall, 0.95);
+        assert_eq!(c.audit_samples, 1_000);
+        assert_eq!(c.recall_tolerance, 1e-6);
     }
 }
