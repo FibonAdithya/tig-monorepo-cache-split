@@ -109,7 +109,13 @@ mod tests {
     }
 
     #[test]
-    fn sift_config_matches_calibrated_constants() {
+    fn sift_config_matches_its_declared_shape() {
+        // Renamed from `..._matches_calibrated_constants`: nothing here is
+        // calibrated any more. The quality map these numbers were once fitted
+        // against (mean distance, via QUALITY_OFFSET/QUALITY_SCALE) is retired,
+        // and what this pins now is the instance SHAPE -- how many queries, how
+        // many database rows, how many dims -- which is what the audit kernel's
+        // launch geometry and the recall bar are reasoned about against.
         let c = ScenarioConfig::from(Scenario::SIFT_128);
         assert_eq!(c.n_queries, 7_000);
         assert_eq!(c.database_size, 700_000);
