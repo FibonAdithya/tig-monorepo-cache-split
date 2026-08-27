@@ -237,6 +237,10 @@ impl Challenge {
         })
     }
 
+    /// Diagnostic only -- NOT the quality path. Since quality became audited
+    /// recall this has zero callers in this repo, and rustc will never warn
+    /// about that (pub fn, pub type, pub mod), so: its sole consumer is
+    /// `vs-evaluate`, which reports `avg_distance`. Do not delete as dead code.
     pub fn evaluate_average_distance(
         &self,
         solution: &Solution,
@@ -869,5 +873,69 @@ extern "C" __global__ void reference_nn_search(
         let config = ScenarioConfig::from(challenge.scenario);
         let bar = (config.min_recall * QUALITY_PRECISION as f32).round() as i32;
         assert!(qz < bar, "all-zeros scored {} against a bar of {}", qz, bar);
+    }
+
+    #[test]
+    fn evaluate_solution_audits_the_salt_it_is_given() {
+        // The one behavioural link this task introduces: evaluate_solution must
+        // forward ITS caller's salt to measure_recall. Neither assertion in
+        // quality_is_recall_scaled_to_quality_precision can see that -- an exact
+        // 1-NN scores 1.0 and an all-zeros solution scores ~0 under *every*
+        // salt -- and Task 4's salt-sensitivity tests all call measure_recall
+        // directly, so they cannot see it either. Without this test, hardcoding
+        // `&[0u8; 32]` in the body passes all 31 tests, which is the same
+        // fully-predictable-audit-set failure --audit-salt's required value
+        // exists to prevent, reached from the other end.
+        let (challenge, module, stream, prop) = gpu_instance(1);
+        let config = ScenarioConfig::from(challenge.scenario);
+        let salt_a = [9u8; 32];
+        let salt_b = [7u8; 32];
+
+        // A query audited under A but not under B, taken straight from the set
+        // difference so the choice is deterministic rather than hopeful.
+        let ids_b: std::collections::HashSet<u32> =
+            sample_query_ids(&salt_b, challenge.num_queries, config.audit_samples)
+                .into_iter()
+                .collect();
+        let victim = sample_query_ids(&salt_a, challenge.num_queries, config.audit_samples)
+            .into_iter()
+            .find(|q| !ids_b.contains(q))
+            .expect("two different salts over 1,000-of-7,000 must differ somewhere")
+            as usize;
+
+        let mut sol = brute_force_1nn(&challenge, module.clone(), stream.clone());
+        // Same corruption Task 4's tests use: a different index in 128 dims over
+        // 700k vectors is not within 1e-6 of the true minimum except by
+        // astronomical coincidence.
+        sol.indexes[victim] = (sol.indexes[victim] + 1) % challenge.database_size as usize;
+
+        let q_a = challenge
+            .evaluate_solution(&sol, &salt_a, module.clone(), stream.clone(), &prop)
+            .unwrap();
+        let q_b = challenge
+            .evaluate_solution(&sol, &salt_b, module, stream, &prop)
+            .unwrap();
+
+        // The guard: one solution, two salts, two different qualities. A body
+        // that ignores its salt argument returns the same number twice.
+        assert_ne!(
+            q_a, q_b,
+            "the same solution scored {} under both salts -- evaluate_solution \
+             is not forwarding the salt it was given",
+            q_a
+        );
+        // Pin both ends too, so this cannot be satisfied by a body that merely
+        // varies: B does not audit the corrupted query, so it is still perfect;
+        // A does, so it must be strictly worse.
+        assert_eq!(
+            q_b, QUALITY_PRECISION,
+            "salt B does not audit the corrupted query"
+        );
+        assert!(
+            q_a < q_b,
+            "salt A audits the corrupted query, so {} must be < {}",
+            q_a,
+            q_b
+        );
     }
 }

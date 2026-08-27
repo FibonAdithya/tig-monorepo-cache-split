@@ -53,6 +53,41 @@ fn main() {
     }
 }
 
+/// Decode the `--audit-salt` value, defaulting to all-zeros when the flag is
+/// absent.
+///
+/// The all-zeros default is deliberate and load-bearing in both directions: the
+/// five CPU lanes never pass a salt, and local debugging of a GPU lane should
+/// not have to invent 64 hex characters. It is safe only because a *valueless*
+/// `--audit-salt` is rejected by the parser (the value is `<AUDIT_SALT>`, not
+/// `[AUDIT_SALT]`), so an operator cannot reach the predictable zero salt by
+/// accident -- only by omitting the flag entirely.
+fn parse_audit_salt(audit_salt_hex: Option<String>) -> Result<[u8; 32]> {
+    let Some(h) = audit_salt_hex else {
+        return Ok([0u8; 32]);
+    };
+    let bytes = match hex::decode(&h) {
+        Ok(bytes) => bytes,
+        // An odd-length run of valid hex digits is a LENGTH problem, not a
+        // character problem. hex reports it as `OddLength`, and forwarding that
+        // verbatim tells an operator who dropped one character off a 64-char
+        // salt to go hunting for a bad character that is not there.
+        Err(hex::FromHexError::OddLength) => {
+            return Err(anyhow::anyhow!(
+                "--audit-salt must be 64 hex chars (32 bytes), got {}",
+                h.len()
+            ))
+        }
+        Err(e) => return Err(anyhow::anyhow!("--audit-salt is not hex: {}", e)),
+    };
+    bytes.try_into().map_err(|v: Vec<u8>| {
+        anyhow::anyhow!(
+            "--audit-salt must decode to exactly 32 bytes, got {}",
+            v.len()
+        )
+    })
+}
+
 pub fn verify_solution(
     settings: String,
     rand_hash: String,
@@ -67,24 +102,11 @@ pub fn verify_solution(
     let seed = settings.calc_seed(&rand_hash, nonce);
 
     // Decoded once, up front, so a malformed salt is a clear error before any
-    // GPU work rather than a surprise mid-verification. Defaults to all-zeros
-    // when absent: the five CPU lanes never pass one, and local debugging of a
-    // GPU lane should not have to invent 64 hex characters.
-    // Only the GPU arm reads it; a CPU-only build (e.g. --features c001)
-    // still decodes and validates, so a bad salt is rejected on every lane.
+    // GPU work rather than a surprise mid-verification. Only the GPU arm reads
+    // it; a CPU-only build (e.g. --features c001) still decodes and validates,
+    // so a bad salt is rejected on every lane.
     #[allow(unused_variables)]
-    let audit_salt: [u8; 32] = match audit_salt_hex {
-        Some(h) => hex::decode(&h)
-            .map_err(|e| anyhow::anyhow!("--audit-salt is not hex: {}", e))?
-            .try_into()
-            .map_err(|v: Vec<u8>| {
-                anyhow::anyhow!(
-                    "--audit-salt must decode to exactly 32 bytes, got {}",
-                    v.len()
-                )
-            })?,
-        None => [0u8; 32],
-    };
+    let audit_salt = parse_audit_salt(audit_salt_hex)?;
 
     let mut err_msg = Option::<String>::None;
 
@@ -318,7 +340,13 @@ mod tests {
 
     /// argv[0] plus the four required positionals every invocation needs, so
     /// the tests below isolate the behaviour of `--audit-salt` and nothing else.
-    const POSITIONALS: [&str; 5] = ["tig-verifier", "settings.json", "rand_hash", "0", "sol.json"];
+    const POSITIONALS: [&str; 5] = [
+        "tig-verifier",
+        "settings.json",
+        "rand_hash",
+        "0",
+        "sol.json",
+    ];
 
     fn parse(extra: &[&str]) -> Result<clap::ArgMatches, clap::Error> {
         let mut argv: Vec<&str> = POSITIONALS.to_vec();
@@ -363,5 +391,79 @@ mod tests {
         // valueless flag is rejected.
         let m = parse(&[]).unwrap();
         assert!(m.get_one::<String>("audit-salt").is_none());
+    }
+
+    // --- parse_audit_salt: the decode path, including the security-relevant
+    // all-zeros default. Previously exercised only by hand against the built
+    // binary; those runs do not repeat, these do.
+
+    #[test]
+    fn absent_salt_decodes_to_all_zeros() {
+        // Pinning the VALUE, not just Ok-ness: this default is what the five
+        // CPU lanes and local debugging rely on, and it is also the predictable
+        // salt, so a silent change here is a security change.
+        assert_eq!(parse_audit_salt(None).unwrap(), [0u8; 32]);
+    }
+
+    #[test]
+    fn a_real_salt_round_trips_to_its_bytes() {
+        assert_eq!(
+            parse_audit_salt(Some("ab".repeat(32))).unwrap(),
+            [0xabu8; 32]
+        );
+    }
+
+    #[test]
+    fn a_non_hex_salt_reports_a_hex_error() {
+        let err = parse_audit_salt(Some("zz".repeat(32)))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("is not hex"),
+            "expected the not-hex message, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn a_short_salt_reports_a_length_error_naming_the_length() {
+        // "aabb" is perfectly good hex -- 2 bytes of it. The operator needs to
+        // be told it is the wrong SIZE, and told what size it was.
+        let err = parse_audit_salt(Some("aabb".to_string()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            // `contains('2')` would NOT do here: the "32" in "32 bytes"
+            // satisfies it whatever the reported length is.
+            err.contains("32 bytes") && err.contains("got 2"),
+            "expected a length message naming the observed length, got: {}",
+            err
+        );
+        assert!(
+            !err.contains("is not hex"),
+            "a well-formed but short salt is a length problem, not a hex problem: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn an_odd_length_salt_is_a_length_error_not_a_hex_error() {
+        // 63 chars: one character lost to a shell slip. Every character is a
+        // valid hex digit, but hex::decode returns OddLength, and forwarding
+        // that verbatim ("is not hex: Odd number of digits") sends the operator
+        // hunting for a bad character that does not exist.
+        let salt = "a".repeat(63);
+        let err = parse_audit_salt(Some(salt)).unwrap_err().to_string();
+        assert!(
+            !err.contains("is not hex"),
+            "an odd-length run of valid hex digits must not be reported as a hex \
+             problem, got: {}",
+            err
+        );
+        assert!(
+            err.contains("64 hex chars") && err.contains("63"),
+            "expected a length message naming the observed 63, got: {}",
+            err
+        );
     }
 }
