@@ -2153,6 +2153,7 @@ dependencies = [
  "anyhow",
  "clap",
  "cudarc",
+ "hex",
  "serde",
  "serde_json",
  "tig-challenges",

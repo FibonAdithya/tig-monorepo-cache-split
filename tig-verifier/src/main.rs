@@ -29,7 +29,7 @@ fn cli() -> Command {
         .arg(arg!(--ptx [PTX] "Path to a CUDA ptx file").value_parser(clap::value_parser!(PathBuf)))
         .arg(arg!(--gpu [GPU] "Which GPU device to use").value_parser(clap::value_parser!(usize)))
         .arg(
-            arg!(--"audit-salt" [AUDIT_SALT] "32-byte audit salt as 64 hex chars")
+            arg!(--"audit-salt" <AUDIT_SALT> "32-byte audit salt as 64 hex chars")
                 .value_parser(clap::value_parser!(String)),
         )
         .arg(arg!(--verbose "Enable verbose output").action(clap::ArgAction::SetTrue))
@@ -309,5 +309,59 @@ fn load_solution(solution: &str) -> String {
         }
     } else {
         solution.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// argv[0] plus the four required positionals every invocation needs, so
+    /// the tests below isolate the behaviour of `--audit-salt` and nothing else.
+    const POSITIONALS: [&str; 5] = ["tig-verifier", "settings.json", "rand_hash", "0", "sol.json"];
+
+    fn parse(extra: &[&str]) -> Result<clap::ArgMatches, clap::Error> {
+        let mut argv: Vec<&str> = POSITIONALS.to_vec();
+        argv.extend_from_slice(extra);
+        cli().try_get_matches_from(argv)
+    }
+
+    #[test]
+    fn audit_salt_flag_without_a_value_is_rejected() {
+        // The load-bearing assertion. With clap's optional-value form
+        // (`[AUDIT_SALT]`) this parses fine and yields None, which the decode
+        // then turns into the all-zeros salt -- so a shell-quoting slip or an
+        // empty variable would silently audit a fully predictable sample, which
+        // is the exact attack the salt exists to prevent. A security parameter
+        // must fail closed on operator error, so the value is required
+        // (`<AUDIT_SALT>`) and this must be an Err.
+        let err = parse(&["--audit-salt"]).expect_err(
+            "a valueless --audit-salt must be rejected, not silently defaulted to zeros",
+        );
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::InvalidValue,
+            "expected a missing-value parse error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn audit_salt_with_a_value_parses() {
+        // Pins that requiring the value did not break the supported form.
+        let m = parse(&["--audit-salt", &"ab".repeat(32)]).unwrap();
+        assert_eq!(
+            m.get_one::<String>("audit-salt").map(|s| s.as_str()),
+            Some("ab".repeat(32).as_str())
+        );
+    }
+
+    #[test]
+    fn absent_audit_salt_is_still_allowed() {
+        // The flag itself stays optional: the five CPU lanes never pass one and
+        // local debugging should not have to invent 64 hex characters. Only a
+        // valueless flag is rejected.
+        let m = parse(&[]).unwrap();
+        assert!(m.get_one::<String>("audit-salt").is_none());
     }
 }
