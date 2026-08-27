@@ -185,3 +185,77 @@ extern "C" __global__ void gan_linear(
         }
     }
 }
+
+#define AUDIT_BLOCK 256
+#define AUDIT_MAX_DIMS 128
+
+// One block per audited query. Writes hits[s] = 1 when the submitted answer for
+// query sample_query_ids[s] is within tolerance of the true nearest neighbour.
+//
+// tolerance_sq is (1 + tau)^2: the comparison runs in squared distance so that
+// no sqrt appears, and --use_fast_math makes sqrt approximate.
+extern "C" __global__ void recall_audit(
+    const uint32_t vector_dims,
+    const uint32_t database_size,
+    const uint32_t num_samples,
+    const float *__restrict__ query_vectors,
+    const float *__restrict__ database_vectors,
+    const size_t *__restrict__ solution_indexes,
+    const uint32_t *__restrict__ sample_query_ids,
+    const float tolerance_sq,
+    uint32_t *__restrict__ hits,
+    uint32_t *__restrict__ error_flag)
+{
+    const int s = blockIdx.x;
+    if (s >= num_samples) return;
+    const uint32_t q = sample_query_ids[s];
+
+    __shared__ float s_query[AUDIT_MAX_DIMS];
+    for (int i = threadIdx.x; i < vector_dims; i += AUDIT_BLOCK) {
+        s_query[i] = query_vectors[(long long)q * vector_dims + i];
+    }
+    __syncthreads();
+
+    __shared__ float s_returned;
+    if (threadIdx.x == 0) {
+        const size_t idx = solution_indexes[q];
+        if (idx >= database_size) {
+            *error_flag = 1;
+            s_returned = 3.0e38f;
+        } else {
+            const float *cand = database_vectors + idx * vector_dims;
+            float d = 0.0f;
+            for (int k = 0; k < vector_dims; ++k) {
+                const float diff = s_query[k] - cand[k];
+                d = fmaf(diff, diff, d);
+            }
+            s_returned = d;
+        }
+    }
+
+    float best = 3.0e38f;
+    for (int j = threadIdx.x; j < database_size; j += AUDIT_BLOCK) {
+        const float *cand = database_vectors + (long long)j * vector_dims;
+        float d = 0.0f;
+        for (int k = 0; k < vector_dims; ++k) {
+            const float diff = s_query[k] - cand[k];
+            d = fmaf(diff, diff, d);
+        }
+        if (d < best) best = d;
+    }
+
+    __shared__ float s_best[AUDIT_BLOCK];
+    s_best[threadIdx.x] = best;
+    __syncthreads();
+    for (int stride = AUDIT_BLOCK / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            const float other = s_best[threadIdx.x + stride];
+            if (other < s_best[threadIdx.x]) s_best[threadIdx.x] = other;
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        hits[s] = (s_returned <= s_best[0] * tolerance_sq) ? 1u : 0u;
+    }
+}
