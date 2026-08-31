@@ -92,6 +92,8 @@ serializable_struct_with_getters! {
         max_qualifiers_per_track: u64,
         legacy_multiplier_span: f32,
         min_num_bundles: u64,
+        build_fuel_alpha: Option<f64>,
+        max_build_fuel_budget: Option<u64>,
     }
 }
 serializable_struct_with_getters! {
