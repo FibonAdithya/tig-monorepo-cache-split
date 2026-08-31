@@ -105,6 +105,11 @@ serializable_struct_with_getters! {
         max_qualifiers_per_track: u64,
         legacy_multiplier_span: f32,
         min_num_bundles: u64,
+        // Gated: only set once the slave is wired to `tig-runtime batch` AND
+        // live algorithms implement `build_index`/`load_index`. Otherwise every
+        // c004 batch carries `build_fuel_budget`, `run_build_index` runs for
+        // every algorithm, and each batch fails ("does not export build_index").
+        // See docs/superpowers/specs/2026-08-31-c004-index-build-split-design.md.
         build_fuel_alpha: Option<f64>,
         max_build_fuel_budget: Option<u64>,
     }

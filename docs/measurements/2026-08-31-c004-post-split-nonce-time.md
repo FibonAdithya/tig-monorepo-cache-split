@@ -792,20 +792,51 @@ Against the 8 GiB value this section was written to assess:
 
 ### 6.4 The T4 question — arithmetic, not measurement
 
-Enforceability of the cap requires `free_after_database >= 8 GiB + 64 MiB`. On
-this 3060, `free_after_database` = 11,999,707,136 B = 11.18 GiB, so the cap is
-enforceable with 3.11 GiB of balloon — measured. On a 16 GB T4, total usable is
-~14.6–15.6 GiB depending on ECC; subtracting the same 466 MiB of context plus
-database leaves ~14.2–15.2 GiB, comfortably above the 8.06 GiB required.
-**That last step is arithmetic on published T4 capacities, not a measurement:
-no T4 was available.** Two things consequently remain open:
+> **Revised 2026-08-31 for the 2 GiB cap.** This section was written against
+> the old 8 GiB default and was not updated when §6.3/§10 moved the cap to
+> 2 GiB. The box above §6.3 says "the measurements below are unchanged," which
+> is true of the raw byte counts but not of this section's arithmetic or its
+> conclusion. Re-derived below. Lowering the cap 4x does **not** make the open
+> question moot — it makes the substantive half of it strictly tighter, because
+> it is the algorithm's own index that now has to fit inside a quarter of the
+> previous budget.
 
-1. whether an 8 GiB cap leaves enough for a real index on a T4 (the index's
-   build-time footprint is unmeasured); and
+Enforceability of the cap — the mechanical question of whether
+`free_after_database >= memory_cap + 64 MiB`, i.e. whether `balloon_size` can
+inflate a non-negative balloon at all rather than refusing to run (§6.3) — now
+requires `free_after_database >= 2 GiB + 64 MiB` = **2.0625 GiB**, against
+8.0625 GiB before. On this 3060, `free_after_database` = 11,999,707,136 B =
+11.18 GiB, so the cap is enforceable with **9.11 GiB of balloon** (up from the
+measured 3.11 GiB at the old 8 GiB cap — a smaller cap inflates a *larger*
+balloon on the same card, per §6.3's box) — measured. On a 16 GB T4, total
+usable is ~14.6–15.6 GiB depending on ECC; subtracting the same 466 MiB of
+context plus database leaves the same ~14.2–15.2 GiB as before (this figure
+does not depend on the cap), which clears the new, lower 2.0625 GiB threshold
+even more comfortably than it cleared 8.0625 GiB. **Mechanical enforceability
+is therefore not what the lower cap threatens — if anything it is more secure
+than before.** That arithmetic is on published T4 capacities, not a
+measurement: no T4 was available.
+
+The question that actually gets tighter is the substantive one this section
+was trying to answer, and it moves in the opposite direction from
+enforceability:
+
+1. **Open question 1, restated for 2 GiB: whether a 2 GiB cap leaves enough
+   room for a real index on a T4.** This is a **strictly tighter** question
+   than "whether 8 GiB leaves enough," not a scaled-down version of a solved
+   one — the algorithm's index now has to fit inside a quarter of the previous
+   headroom, and this note still has no measurement of what a real
+   700,000-vector ANN index costs to build (§6.3: `nullstub`'s `build_index`
+   allocates nothing, so it cannot inform this). No such number exists
+   anywhere in this repo, so this note cannot say whether 2 GiB is enough — only
+   that it is a materially harder bar to clear than 8 GiB was, and that nobody
+   has re-derived it.
 2. the query process's peak on a T4 with a real index loaded — measured here at
-   1,010 MiB with a zero-footprint index, leaving ~13–14 GiB of T4 headroom for
-   the index plus the algorithm's working set, but that headroom has never been
-   tested against anything that uses it.
+   1,010 MiB with a zero-footprint index, leaving ~13–14 GiB of T4 headroom at
+   the card level for the index plus the algorithm's working set. This figure
+   is independent of the build-phase cap (§6.1: the cap governs `build_index`,
+   not the query process) and is unchanged by the cap revision, but that
+   headroom has still never been tested against anything that uses it.
 
 ---
 
