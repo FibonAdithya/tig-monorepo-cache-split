@@ -181,8 +181,8 @@ runs the build.
 
 ### Seed derivation
 
-`tig-structs/src/core.rs`, mirrored in `tig-benchmarker/common/structs.py` and
-`tig-benchmarker/slave/common/structs.py`:
+`tig-structs/src/core.rs`, mirrored in `tig-benchmarker/common/structs.py` (the single Python copy;
+`slave/common` and `master/common` symlink to it):
 
 ```rust
 pub fn calc_seed(&self, rand_hash: &String, nonce: u64) -> [u8; 32]   // unchanged
@@ -354,8 +354,10 @@ on.*
 
 What does change:
 
-- `calc_db_seed` in three files that must not drift: `tig-structs/src/core.rs`,
-  `tig-benchmarker/common/structs.py`, `tig-benchmarker/slave/common/structs.py`.
+- `calc_db_seed` in two files that must not drift: `tig-structs/src/core.rs` and
+  `tig-benchmarker/common/structs.py`. There is exactly one Python copy -
+  `slave/common` and `master/common` are both symlinks to `../common` - so the
+  drift risk is Rust-vs-Python only, not three-way.
 - `tig-runtime`: `--build-index` mode, batched mode, watchdog, balloon.
 - `tig-benchmarker/slave/main.py`: one build invocation before the nonce loop.
 - `tig-protocol`: `build_fuel_budget` validation beside the existing
@@ -366,8 +368,12 @@ What does change:
   audit-salt change did, and needs the same treatment: paired plans on both
   sides, an explicit interface-contract table, and a unification step that is
   the first build of the two trees together.
-- `golden_vectors.json` regenerated - both halves now draw from different seeds,
-  so every vector value changes.
+- **Not** `golden_vectors.json`: it pins `forward_cpu` against PyTorch
+  (`generator.rs:114`, test `cpu_forward_matches_pytorch_golden_vectors`) and has
+  nothing to do with instance vectors. Generated database and query values do
+  change, but no test in this tree pins them - the GPU tests build instances from
+  an arbitrary `[seed_byte; 32]` via `gpu_instance`, so they are agnostic to the
+  seed split.
 
 ## Testing
 
