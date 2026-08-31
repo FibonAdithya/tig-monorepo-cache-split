@@ -95,6 +95,34 @@ means all 105 c004 algorithms rebuilt and resubmitted. A device-to-device copy
 of 358 MB costs ~1.4 ms at T4 bandwidth (~3% of an estimated 50 ms nonce) and
 358 MB of extra device memory, and buys a completely unbroken ABI.
 
+> **The justification above is VOIDED by measurement (2026-08-31, Validation
+> below). The layout claim survives; the reason for making it does not.**
+>
+> "All 105 c004 algorithms rebuilt and resubmitted" was the cost this copy was
+> bought to avoid. Part 1 of the Validation *measured* that all 105 must be
+> rebuilt anyway, because the GAN `kernels.cu` rewrite already on this branch
+> changed the kernel names the generation path calls. So the unbroken ABI is
+> unbroken only for algorithms **already rebuilt against this branch**, and this
+> spec's own Blast radius section records that there are currently **zero** of
+> those. The copy is being paid to preserve compatibility with a population that
+> is empty.
+>
+> **This decision should be revisited.** It is a design call with real tradeoffs
+> and it belongs to the user, not to this document. The alternative - borrowing
+> the database rather than copying it - would need a lifetime parameter on
+> `Challenge` (`Challenge<'a>` holding `&'a CudaSlice<f32>`), which is itself a
+> further ABI change on top of the one the GAN work already forces. Set against
+> that: ~358 MB of device memory per nonce and ~1.4 ms of copy, on a card where
+> the 12 GB budget is already the binding constraint. Since every algorithm has
+> to be rebuilt regardless, making both ABI changes in one rebuild is strictly
+> cheaper than making them in two - but only if the decision is taken *before*
+> the rebuild happens.
+>
+> Nothing downstream is blocked by this and no code was changed on account of
+> it: the implementation is correct and reviewed, and D5's layout claim is
+> measured to hold. What is recorded here is that the *rationale* no longer
+> follows from the evidence.
+
 **D6. The two new algorithm symbols are optional, and the index handle never
 crosses the FFI boundary.** The algorithm stashes it in its own `static` during
 `load_index`. `entry_point` keeps today's signature, so the `gpu` arm of
@@ -228,9 +256,17 @@ impl Challenge { pub fn for_nonce(db: &Database, seed, track, module, stream, pr
 `Database::generate` is the `(false, database_size)` pass of today's loop with
 `index_base = 0`; `Challenge::for_nonce` is the `(true, n_queries)` pass. The
 `index_base = database_size` offset is retained even though the differing seeds
-already separate the streams - keeping it means **`kernels.cu` is not touched**,
-which `scenarios.rs` documents as the thing that avoids forcing a network-wide
-rebuild of the generation path.
+already separate the streams - keeping it means **`kernels.cu` is not touched by
+this design**, which `scenarios.rs` documents as the thing that avoids forcing a
+network-wide rebuild of the generation path.
+
+**Stale as a benefit claim, corrected 2026-08-31 (Validation below):** *this
+design* touches no kernel, and that is measured - `kernels.cu` is byte-identical
+across `dbb30e99..be650a7c`. But the network-wide rebuild it is described as
+avoiding is **already forced** by the GAN `kernels.cu` rewrite earlier on this
+branch. Retaining `index_base` therefore avoids *adding* a second rebuild to one
+already owed; it does not avoid a rebuild. The same correction applies wherever
+this document treats "no kernel change" as implying "no resubmission".
 
 ### Algorithm ABI
 
@@ -346,18 +382,27 @@ find one; the honest fix for that is verified re-execution, which D2 defers.
 ("no existing algorithm needs rebuilding") was false as written.** The accurate
 statement is two-part:
 
-- **The split adds no blast radius of its own.** It is host-side, `kernels.cu` is
-  byte-identical across `dbb30e99..be650a7c`, and D5's `Challenge` layout is
-  unchanged. Both halves are now measured: an algorithm binary built before the
-  split runs unmodified against the split runtime and reads every `Challenge`
-  field correctly.
+- **The split adds no *algorithm-rebuild* blast radius of its own.** It is
+  host-side, `kernels.cu` is byte-identical across `dbb30e99..be650a7c`, and
+  D5's `Challenge` layout is unchanged. Both halves are now measured: an
+  algorithm binary built before the split runs unmodified against the split
+  runtime and reads every `Challenge` field correctly. **That scoping is
+  deliberate.** This design plainly has blast radius of other kinds - every item
+  in the "What does change" list below is real work, including a `calc_db_seed`
+  that must not drift between Rust and Python, new `tig-protocol` config, a new
+  build step in the benchmarker slave, a cross-repo `pentest-harness` break, and
+  a changed database instance. What was measured is narrower than "no blast
+  radius": it is that **no algorithm has to be rebuilt on account of this
+  design.**
 - **But the GAN `kernels.cu` rewrite already on this branch requires all 105
   mainnet c004 algorithms to be rebuilt and resubmitted, and that cost was
   already owed before this design existed.** Mainnet PTX exports
   `generate_clusters` / `generate_vectors`; this branch's generation path calls
-  `gan_sample_latents`, `gan_linear` and `recall_audit`, which no mainnet PTX
-  contains. A mainnet algorithm dies `CUDA_ERROR_NOT_FOUND "named symbol not
-  found"` against this branch — and dies identically against the commit
+  `gan_sample_latents`, `gan_linear` and `recall_audit`. Measured across every
+  mainnet c004 binary that exists (88 of the 105 listed algorithms have a
+  downloadable, non-empty artifact): **88/88 export the pre-GAN pair, 0/88 export
+  any GAN kernel.** A mainnet algorithm dies `CUDA_ERROR_NOT_FOUND "named symbol
+  not found"` against this branch — and dies identically against the commit
   immediately *before* this design's first commit.
 
 So "old algorithms keep running index-free, new ones opt in by exporting
@@ -384,9 +429,15 @@ What does change:
   the first build of the two trees together.
 - **Not** `golden_vectors.json`: it pins `forward_cpu` against PyTorch
   (`generator.rs:114`, test `cpu_forward_matches_pytorch_golden_vectors`) and has
-  nothing to do with instance vectors. Generated database and query values do
-  change, but no test in this tree pins them - the GPU tests build instances from
-  an arbitrary `[seed_byte; 32]` via `gpu_instance`, so they are agnostic to the
+  nothing to do with instance vectors. Generated **database** values do change;
+  **query values do not** - corrected 2026-08-31, and measured, not reasoned:
+  `for_nonce` generates queries from `seeds.nonce`, which is `calc_seed`
+  unchanged by this design, at the same `index_base = database_size` as before,
+  so query vectors are **bit-identical across the split**. The Validation section
+  below shows the same query bytes out of both the pre-split and post-split
+  runtimes, and the database bytes differing, on the same nonce. Either way no
+  test in this tree pins these values - the GPU tests build instances from an
+  arbitrary `[seed_byte; 32]` via `gpu_instance`, so they are agnostic to the
   seed split.
 
 ## Testing
@@ -432,8 +483,23 @@ belong here.
 ## Validation
 
 Measured 2026-08-31 on `tig-gpu` (RTX 3060, sm_86, CUDA 12.6.3) against branch HEAD
-`be650a7cc528655e19e576eeb089d0850ca6d328`. Full raw logs and provenance:
-`.superpowers/sdd/2026-08-31-c004-index-build-split-monorepo/task-7-report.md`.
+`be650a7cc528655e19e576eeb089d0850ca6d328`.
+
+**This section is self-contained on purpose.** An earlier draft pointed at
+`.superpowers/sdd/2026-08-31-c004-index-build-split-monorepo/task-7-report.md` for the raw logs.
+That pointer dangles for anyone reading the committed repository: `.gitignore:34` ignores
+`.superpowers/`, and `git ls-files .superpowers/` returns nothing, so the working notes are not
+part of the git record and never will be. Every load-bearing command and its raw output is
+therefore inlined below. The `.superpowers` report still exists in the working tree and carries the
+longer narrative, the environment provenance and the list of defects found in the task brief, but
+nothing here depends on it.
+
+**Which binaries were run.** Everything ran inside the `tig-dev-vector_search` container under a
+`gpu-claim`. The image's baked `/usr/local/bin/tig-runtime` (sha256 `79d6d510…`, dated
+2026-08-27) is **stale** and was never invoked; every runtime was built in-container with
+`cargo build -r -p tig-runtime -p tig-verifier --features vector_search` in an isolated `/tmp`
+clone and invoked by absolute path, and every run script re-printed the sha256 of the binary it was
+about to execute, so each raw block below certifies its own provenance.
 
 ### The claim under test
 
@@ -446,9 +512,11 @@ been run:
   generation path calls? **Measured, and refuted for mainnet — but the split is not what refutes
   it.**
 - **Part 2 — the D5 half.** Does an algorithm binary built before the split read `Challenge`'s
-  fields at the right offsets under the split runtime? **Measured, and it holds.** This is the half
-  that justifies `Challenge::for_nonce` taking an owned 358 MB device-to-device copy instead of a
-  borrow.
+  fields at the right offsets under the split runtime? **Measured, and it holds.**
+
+The two interact, and not comfortably: Part 2 confirms the layout is preserved, while Part 1
+measures that the population the preservation was for is empty. **D5's layout claim survives its
+own rationale.** See the voided-rationale note under D5.
 
 ### Part 1 result: the sentence is false for mainnet, and the split is not what makes it false
 
@@ -468,32 +536,78 @@ runtime built *in that container* (never the image's stale baked `/usr/local/bin
 sha256 `79d6d510…`, which was captured for contrast and never invoked). Every run script printed the
 sha256 of the binary it was about to execute.
 
-| # | Runtime tree | Commit | `tig-runtime` sha256 | `track_id` | Result | Exit |
-|---|---|---|---|---|---|---|
-| A | post-split (this design) | `be650a7c` | `2180fe7f…` | `s=sift_128` | `DriverError(CUDA_ERROR_NOT_FOUND, "named symbol not found")`, no output file | 84 |
-| B | **pre-split**, post-GAN | `dbb30e99` | `216af0f9…` | `s=sift_128` | `DriverError(CUDA_ERROR_NOT_FOUND, "named symbol not found")`, no output file | 84 |
-| C | **pre-GAN** | `3efbdec9` | `7dabf8f7…` | `n_queries=7000` | solution written in 3.8 s; `quality: 72174` | 0 |
+| # | Runtime tree | Commit | `tig-runtime` sha256 | `track_id` | `--fuel` | Result | Exit |
+|---|---|---|---|---|---|---|---|
+| A | post-split (this design) | `be650a7c` | `2180fe7f…` | `s=sift_128` | `2000000000` | `DriverError(CUDA_ERROR_NOT_FOUND, "named symbol not found")`, no output file | 84 |
+| B | **pre-split**, post-GAN | `dbb30e99` | `216af0f9…` | `s=sift_128` | `2000000000` | `DriverError(CUDA_ERROR_NOT_FOUND, "named symbol not found")`, no output file | 84 |
+| C1 | **pre-GAN** | `3efbdec9` | `7dabf8f7…` | `n_queries=7000` | `2000000000` | `DriverError(TIG_ERROR_OUT_OF_FUEL, "ran out of fuel")`, no output file | 84 |
+| C2 | **pre-GAN** | `3efbdec9` | `7dabf8f7…` | `n_queries=7000` | `5000000000000` | solution written in 3.8 s; `quality: 72174` | 0 |
 
-Commands (settings passed as a **file** — the inline-JSON form in the task brief loses its inner
-quotes to `bash -c` and dies `Failed to parse settings`):
+**C1 is not a failed attempt to be skipped over - it is what removes the fuel confound.** A and B
+ran at `--fuel 2000000000`, and if C had only ever been run at 5e12 a reader could reasonably ask
+whether A and B died of a budget that was simply too small. C1 answers that: **at the same 2e9
+budget as A and B**, on the pre-GAN runtime, the run got far enough to exhaust its fuel, which means
+PTX loading and every `module.load_function` had already succeeded. `OUT_OF_FUEL` and
+`CUDA_ERROR_NOT_FOUND` are different failures at different stages. C2 then re-ran at the live c004
+`max_fuel_budget` of 5e12 (recorded at line 42 above) and completed.
+
+**Where the isolation actually comes from.** It comes from **A vs B**, which is a genuinely
+single-variable comparison: same `.so`, same `.ptx`, same settings file, same `rand_hash`, same
+nonce, same `--fuel`, same container, same card - only the runtime commit differs. C is *not*
+single-variable against A: it differs in runtime commit, in `track_id` (`n_queries=7000` vs
+`s=sift_128`, because `Track` itself changed shape), therefore in the seed and the whole generated
+instance, and in C2 also in fuel. C's job is narrower and it should not be read as more: it shows
+the algorithm binary, the harness, the container, the claim and the invocation form are all sound,
+so A and B's failure is not an artifact of how they were run.
+
+Exact commands, per run - the settings are passed as a **file**, because the inline-JSON form in
+the task brief loses its inner quotes to `bash -c` and dies `Failed to parse settings`:
 
 ```bash
-# built in-container, in an isolated /tmp clone, not /workspace/tig-bench:
+# Built in-container, in an isolated /tmp clone, not /workspace/tig-bench.
+# Run once per tree: /tmp/task7/{head,presplit,pregan}
 cargo build -r -p tig-runtime -p tig-verifier --features vector_search
 
-# A (and B, C, with the tree and settings file swapped):
+# settings.json         {"player_id":"audit","block_id":"audit","challenge_id":"c004",
+#                        "algorithm_id":"c004_a100","track_id":"s=sift_128"}
+# settings-pregan.json  ... "track_id":"n_queries=7000"
+
+# --- A: post-split runtime ---
 docker run --rm --gpus all -v /tmp/task7/head:/app -v /tmp/task7/algo:/algo \
   -v /tmp/task7/out-head:/out -w /app -e CHALLENGE=vector_search \
   -e RUSTUP_TOOLCHAIN=nightly-2025-02-10 -e CUDA_VISIBLE_DEVICES=0 \
   tig-dev-vector_search bash -c '
     sha256sum /app/target/release/tig-runtime
     /app/target/release/tig-runtime /algo/settings.json norebuildcheck 0 \
-      /algo/there_v10.so --ptx /algo/there_v10.ptx --fuel 5000000000000 --output /out'
+      /algo/there_v10.so --ptx /algo/there_v10.ptx --fuel 2000000000 --output /out'
+2180fe7fe01e430c74c6e00c0cb692ad590818fd6ab5fd04e61c0cc62e43bbfe  /app/target/release/tig-runtime
+Runtime Error: DriverError(CUDA_ERROR_NOT_FOUND, "named symbol not found")
+INNER_EXIT=84
 
-# C only, after the solution was written:
+# --- B: pre-split runtime. Identical invocation, /tmp/task7/presplit mounted at /app ---
+216af0f968eaf4deae5b734e35d6fc480c71ed37700e81524cf252ebc06d1e26  /app/target/release/tig-runtime
+Runtime Error: DriverError(CUDA_ERROR_NOT_FOUND, "named symbol not found")
+INNER_EXIT=84
+
+# --- C1: pre-GAN runtime, SAME 2e9 fuel as A and B, settings-pregan.json ---
+7dabf8f76745f1a3cfe6280aadcf33dd1ce71adf38add0b8506dee75b5fd9fe3  /app/target/release/tig-runtime
+/app/target/release/tig-runtime /algo/settings-pregan.json norebuildcheck 0 \
+  /algo/there_v10.so --ptx /algo/there_v10.ptx --fuel 2000000000 --output /out
+Runtime Error: DriverError(TIG_ERROR_OUT_OF_FUEL, "ran out of fuel")
+INNER_EXIT=84
+
+# --- C2: same, at the live max_fuel_budget ---
+/app/target/release/tig-runtime /algo/settings-pregan.json norebuildcheck 0 \
+  /algo/there_v10.so --ptx /algo/there_v10.ptx --fuel 5000000000000 --output /out
+real    0m3.813s
+INNER_EXIT=0
+-rw-r--r-- 1 root root 31472 Aug 31 15:00 /out/0.json
+
+# --- C2 verified ---
 /app/target/release/tig-verifier /algo/settings-pregan.json norebuildcheck 0 /out/0.json \
   --ptx /algo/there_v10.ptx
 quality: 72174
+VERIFY_EXIT=0
 ```
 
 Reading the exit codes: **84 in A and B is the PTX trap, not a reap and not the teardown crash.**
@@ -506,25 +620,59 @@ to the 950000 recall bar, which exists only on this branch. There is no quality 
 split runtime, because no run against it produced a solution. `min_recall` was confirmed at the
 shipped 0.95 in every tree used.
 
+### The population claim, measured rather than asserted
+
+The `there_v10` grep above is n=1. Since this whole task exists to separate inference from
+measurement, the claim about the *population* was measured too: every c004 algorithm on mainnet at
+round 132 (block `03dca1bf547aa92e1bab9ea3d7d702e7`) was enumerated, its binary downloaded, and its
+PTX scanned for `.visible .entry` symbols.
+
+```
+TOTAL c004 algorithms listed: 105
+PTX successfully scanned:      88
+
+  exporting BOTH gan_sample_latents and gan_linear  : 0
+  exporting EITHER gan kernel                       : 0
+  exporting recall_audit                            : 0
+  exporting BOTH generate_clusters/generate_vectors : 88
+  exporting evaluate_total_distance                 : 88
+
+NO_BINARY (15): c004_a003 greedyvector, a004 hnsw_opt, a005 prodquant, a006 gpuvector,
+                a007 hnsw_alt, a008 hnsw_comp, a009 search, a010 lsearch, a011 notgreedy,
+                a012 nearest, a013 prodq, a031 tabus, a032 simulate, a039 vector_church,
+                a080 stat_filter_sigma
+ERROR    (2):  c004_a041 vs_test_wasm, c004_a067 is_floatfour  (both: empty tarball)
+```
+
+**88 of 88 scannable binaries export the pre-GAN kernel set and zero export any GAN kernel.** The
+17 not scanned are not a gap in the argument: 15 have no binary record at all and 2 serve an empty
+tarball, so none of them has a runnable artifact on mainnet in the first place. The accurate
+statement is therefore: **every mainnet c004 algorithm that has a runnable binary exports
+`generate_clusters`/`generate_vectors` and none exports `gan_sample_latents`, `gan_linear` or
+`recall_audit`.**
+
 ### What Part 1 establishes
 
-1. An unmodified mainnet c004 algorithm **cannot** run against the split runtime. All 105 mainnet
-   algorithms export `generate_clusters`/`generate_vectors` and none export `gan_sample_latents`,
-   `gan_linear` or `recall_audit`.
+1. An unmodified mainnet c004 algorithm **cannot** run against the split runtime — measured
+   directly for `there_v10`, and by PTX scan for all 88 mainnet c004 binaries that exist.
 2. It cannot run against the **pre-split** runtime either — run B is bit-for-bit the same failure at
    the commit immediately before this design's first commit (`43ed7cd0`). **The index-build split
-   adds no blast radius over the branch it sits on.** The mainnet rebuild-and-resubmit cost is real
-   and already owed, but it is owed by the GAN instance-generation feature that rewrote
-   `kernels.cu` (`git diff --stat main HEAD -- .../kernels.cu` → 423 insertions, 122 deletions),
-   not by this plan.
-3. Run C is the positive control: the same `.so`/`.ptx`, the same harness, container, claim and
-   settings shape, exits 0 against a pre-GAN runtime. The failure in A and B is specific to the
-   changed kernel set.
+   adds no *algorithm-rebuild* blast radius over the branch it sits on.** That scoping is
+   deliberate and is the only thing A-vs-B measured: the split plainly *does* have blast radius of
+   other kinds, all of it listed in the section above — `calc_db_seed` must stay in sync across
+   Rust and Python, `tig-protocol` gains config, the benchmarker slave gains a build step, the
+   cross-repo `pentest-harness` breaks, and the generated database instance itself changes. None of
+   those require an algorithm rebuild; all of them are real work.
+3. C is a **soundness** control, not a matched control. It shows the `.so`, the `.ptx`, the
+   container, the claim and the invocation form all work, so A and B's failure is not an artifact
+   of the harness. It is *not* a matched comparison against A and B: C runs a different runtime
+   commit, a different `track_id` (hence a different seed and a different generated instance), and
+   in C2 a different fuel budget. The single-variable comparison is A vs B.
 
-The Blast radius section's "no existing algorithm needs rebuilding" must therefore be read as
-scoped to *an algorithm already rebuilt against the GAN branch* — of which there are currently zero
-anywhere. Reworded honestly: **the split imposes no rebuild beyond the one the GAN work already
-imposes.**
+The Blast radius section's original "no existing algorithm needs rebuilding" must therefore be read
+as scoped to *an algorithm already rebuilt against the GAN branch* — of which there are currently
+zero anywhere. Reworded honestly: **the split imposes no algorithm rebuild beyond the one the GAN
+work already imposes.** That section has been corrected in place.
 
 Part 1 did **not** touch D5. Execution died inside `Database::generate` → `generate_vectors` →
 `module.load_function("gan_sample_latents")`, which the runtime reaches **before** it ever calls the
@@ -534,10 +682,12 @@ algorithm's `entry_point` with a `&Challenge` (see the `gpu_db` dispatch arm,
 ### Part 2 result: D5 holds — measured, not inferred
 
 **Why this needed measuring at all.** D5 is what makes `Challenge::for_nonce` take an owned
-device-to-device copy of ~358 MB rather than a cheap borrow, and the sole justification for that
+device-to-device copy of ~358 MB rather than a cheap borrow, and the stated justification for that
 cost is "the layout must not change or every existing algorithm reads its fields at the wrong
 offsets." If D5 were wrong the plan would have bought an expensive copy for nothing *and* broken
-the network.
+the network. (Part 1 has since shown the justification does not hold for a different reason — the
+population it protects is empty — but that is an argument for revisiting the decision, not for
+leaving its technical claim untested.)
 
 `kernels.cu` is **byte-identical** across `dbb30e99..be650a7c`
 (`git diff dbb30e99 be650a7c -- tig-challenges/src/vector_search/kernels.cu` outputs nothing), so
@@ -553,10 +703,83 @@ device-to-host copy of both trailing `CudaSlice` fields, and encodes the scalars
 `Solution`. A stub that merely exits 0 would prove nothing; this one cannot pass without actually
 dereferencing the struct.
 
-That unmodified `.so`/`.ptx` (sha256 `68b643ce…` / `98936af1…`) was then run against **two**
-runtimes with identical settings, `rand_hash` and nonce — the `dbb30e99` runtime, where the
-probe's `tig-challenges` and the runtime's are the same copy and the offsets are correct by
-construction, and the `be650a7c` split runtime, which is the test:
+Build, in the container, at `dbb30e99`:
+
+```
+$ python3 tig-binary/scripts/build_ptx d5probe
+kernel: initialize_kernel,        #blocks: 1,   status: SKIPPED
+kernel: finalize_kernel,          #blocks: 1,   status: SKIPPED
+kernel: gan_sample_latents,       #blocks: 31,  status: SKIPPED
+kernel: evaluate_total_distance,  #blocks: 15,  status: SKIPPED
+kernel: gan_linear,               #blocks: 147, status: SKIPPED
+kernel: recall_audit,             #blocks: 353, status: SKIPPED
+Wrote ptx to tig-algorithms/lib/vector_search/ptx/d5probe.ptx
+
+$ bash tig-binary/scripts/build_so d5probe
+Linking into shared library 'tig-algorithms/lib/vector_search/amd64/d5probe.so'
+Done
+
+$ nm -D --defined-only d5probe.so | grep -E 'entry_point|help|__fuel_remaining|__runtime_signature'
+0000000000908030 D __fuel_remaining
+0000000000908038 D __runtime_signature
+0000000000045bf0 T entry_point
+0000000000047200 T help
+
+$ sha256sum d5probe.so d5probe.ptx
+68b643ced745cd64ee59568e58653928008d76da508b93f5b5385814fbb67d06  d5probe.so
+98936af1564a6cb734fddfbe87f3cb341bd49cbe2493d1ec287565d6b6165fab  d5probe.ptx
+```
+
+That unmodified `.so`/`.ptx` was then run against **two** runtimes with identical settings,
+`rand_hash`, nonce and `--fuel 5000000000000` — the `dbb30e99` runtime, where the probe's
+`tig-challenges` and the runtime's are the same copy and the offsets are correct by construction,
+and the `be650a7c` split runtime, which is the test. Raw stdout of both, verbatim:
+
+```
+##### D5-A: runtime /tmp/task7/presplit  (dbb30e99) #####
+216af0f968eaf4deae5b734e35d6fc480c71ed37700e81524cf252ebc06d1e26  /app/target/release/tig-runtime
+68b643ced745cd64ee59568e58653928008d76da508b93f5b5385814fbb67d06  /algo/d5probe.so
+98936af1564a6cb734fddfbe87f3cb341bd49cbe2493d1ec287565d6b6165fab  /algo/d5probe.ptx
+D5PROBE scenario=sift_128
+D5PROBE num_queries=7000
+D5PROBE vector_dims=128
+D5PROBE database_size=700000
+D5PROBE seed=a22085613ccf2c029517e8b68f3d008f77acd3cc0f4df4995e11366da94f7e27
+D5PROBE qslice_len=896000
+D5PROBE dbslice_len=89600000
+D5PROBE qv_len=896000
+D5PROBE qv_head8=3f112c3e,3d5c1f3c,3db7c65e,3dc85ebe,bb6a20c8,3c02a7aa,3b683b16,3efeb50c
+D5PROBE qv_tail4=3e5db0cc,3cd5715d,3cb0a28d,3d46c139
+D5PROBE db_len=89600000
+D5PROBE db_head8=3d5a85a9,3cb7af31,3cb01224,bbb21b4b,3e5bd249,3e47e741,3c0e42c8,3c8cdad9
+real    0m3.923s
+INNER_EXIT=0
+{"cpu_arch":"amd64","fuel_consumed":3315,"nonce":0,"runtime_signature":13667326539545663817,
+ "solution":"\"H4sIAAAAAAAA/y3HMQ0AQAhD0VtYLkEBJnADI1IQRNBISOny+ulhLjCvoz9OMVSjZQBwH3cvMAAAAA==\""}
+
+##### D5-B: runtime /tmp/task7/head  (be650a7c, THE SPLIT RUNTIME) #####
+2180fe7fe01e430c74c6e00c0cb692ad590818fd6ab5fd04e61c0cc62e43bbfe  /app/target/release/tig-runtime
+68b643ced745cd64ee59568e58653928008d76da508b93f5b5385814fbb67d06  /algo/d5probe.so
+98936af1564a6cb734fddfbe87f3cb341bd49cbe2493d1ec287565d6b6165fab  /algo/d5probe.ptx
+D5PROBE scenario=sift_128
+D5PROBE num_queries=7000
+D5PROBE vector_dims=128
+D5PROBE database_size=700000
+D5PROBE seed=a22085613ccf2c029517e8b68f3d008f77acd3cc0f4df4995e11366da94f7e27
+D5PROBE qslice_len=896000
+D5PROBE dbslice_len=89600000
+D5PROBE qv_len=896000
+D5PROBE qv_head8=3f112c3e,3d5c1f3c,3db7c65e,3dc85ebe,bb6a20c8,3c02a7aa,3b683b16,3efeb50c
+D5PROBE qv_tail4=3e5db0cc,3cd5715d,3cb0a28d,3d46c139
+D5PROBE db_len=89600000
+D5PROBE db_head8=3c1ee431,3def408d,3d726fb3,3b1d4856,3d45e27b,3d5b170e,3d91f2bd,3c2e9bce
+real    0m3.992s
+INNER_EXIT=0
+{"cpu_arch":"amd64","fuel_consumed":3315,"nonce":0,"runtime_signature":13667326539545663817,
+ "solution":"\"H4sIAAAAAAAA/y3HMQ0AQAhD0VtYLkEBJnADI1IQRNBISOny+ulhLjCvoz9OMVSjZQBwH3cvMAAAAA==\""}
+```
+
+Side by side:
 
 | Field read across the FFI boundary | `dbb30e99` runtime (`216af0f9…`) | `be650a7c` split runtime (`2180fe7f…`) | |
 |---|---|---|---|
@@ -575,32 +798,91 @@ Both runs exited **0** in ~3.9 s, both wrote a solution, and both produced byte-
 files (`fuel_consumed: 3315`, the same `runtime_signature`, the same solution blob). The solution
 decodes to `indexes = [7000, 128, 700000, 896000, 89600000]`, which matches
 `ScenarioConfig::from(Scenario::SIFT_128)` at `be650a7c` (`n_queries: 7_000`, `vector_dims: 128`,
-`database_size: 700_000`) exactly. The scalars are three *distinct* values, so any shift in field
-order would have shown up rather than aliasing to the same number.
+`database_size: 700_000`) exactly.
 
-**The one difference is the load-bearing part of this result.** The database vectors differ, and
-that is precisely what D1/D3 intend: post-split the database is generated from the nonce-free
-`db_seed` while queries still come from `calc_seed`, which is unchanged. Everything the split
-promises to preserve is bit-identical, and the single thing it promises to change is the single
-thing that changed. **This is what makes the experiment non-vacuous:** a probe reading at wrong
-offsets, or reading stale or cached values, could not produce "every field identical except exactly
-the one field the design says should differ."
+**Why a layout change was a priori very unlikely, which bears on how much this proves.**
+`Challenge` is declared with **no `#[repr]` attribute**, so it is `repr(Rust)`: its field order and
+padding are rustc's choice, not the declaration order, and reasoning about "field order shifting"
+is not the right model. What rustc guarantees is that the layout is a deterministic function of the
+type list and the compiler version. Both are pinned here:
+
+- the type list is field-for-field identical between `dbb30e99` and `be650a7c` (shown above);
+- **`Cargo.lock`'s `cudarc` entry is byte-identical** across the two commits - version `0.16.4`,
+  git rev `b3fccf5003c6e356bdd36e6808bf6e66f08f98d2` - so `CudaSlice<f32>`, the only non-primitive
+  field type, is *literally the same type*, not merely a same-named one. The `tig-challenges`
+  `Cargo.lock` entry is likewise unchanged. (For precision: `Cargo.lock` as a whole is **not**
+  unchanged across the split - exactly one line differs, `libc` added to **`tig-runtime`**'s
+  dependency list for the watchdog/balloon work. Nothing on the algorithm side of the boundary
+  moved.)
+- both `.so` and both runtimes were built with the same pinned `nightly-2025-02-10`.
+
+With an identical type list *and* an identical dependency pin *and* the same compiler, a layout
+difference would have required a rustc bug. **So this experiment is confirmatory, not
+discriminating:** it establishes that the thing did not happen, which is worth having written down
+against a decision this expensive, but it was never likely to fail.
+
+**What the database difference does and does not prove.** The database vectors differ, and that is
+precisely what D1/D3 intend: post-split the database is generated from the nonce-free `db_seed`
+while queries still come from `calc_seed`, which is unchanged. That difference is genuinely
+valuable - it proves the probe is reading **live device data through the struct**, not printing
+constants, not returning a cached buffer, and not silently no-op'ing. But it is a *data* mutation,
+not a *layout* mutation, so it does not make the experiment discriminating about layout. The
+control that would have done that is one I did not run: rebuild the probe against a deliberately
+mutated `Challenge` - a reordered or inserted field - and show that it then faults or reads
+garbage. Without that, "the probe would have caught a layout change" is itself an inference.
 
 **Verdict: D5 holds.** An algorithm binary built before the split reads `Challenge`'s fields
-correctly under the split runtime, including dereferencing both `CudaSlice` fields. The owned
-358 MB copy in `for_nonce` is doing the job it was added for. Open question 3 above is **closed**.
+correctly under the split runtime, including dereferencing both `CudaSlice` fields for 3.6 MB and
+358 MB. Open question 3 above is **closed** - though see the voided-rationale note under D5, since
+what this result now protects is a population of zero.
 
-### What remains unestablished
+**Coverage this run picked up for free, worth recording because none of it was separately tested.**
+The probe crossing the boundary successfully also exercised, on the split runtime, against a
+binary built before the split:
 
-- **No mainnet algorithm has been run end-to-end against the split runtime, and none can be** until
-  it is rebuilt against the GAN branch. There is therefore still no measured `quality` figure for a
-  *real* c004 algorithm on this branch, and in particular the ≥ 950000 recall bar has not been
-  demonstrated as reachable by any competitive algorithm. That is a gap in the GAN work, not in
-  this design, but it is unmeasured either way.
-- D5 was verified on **one** algorithm shape (`entry_point` only, no index). An algorithm that also
-  exports `build_index`/`load_index` crosses the boundary with `&Database` as well as `&Challenge`;
-  `Database` is new in this design, so no pre-split binary can exercise it, and Task 4's stub work
-  is the only coverage there.
+- `entry_point`'s **signature and calling convention** - six arguments including a `&dyn Fn`
+  trait object and two `Arc<...>` - resolved and called correctly;
+- the **`save_solution` callback** invoked from inside the `.so` back into the runtime, and
+  `Solution`'s base64/gzip/bincode round-trip;
+- the **`__fuel_remaining` and `__runtime_signature` globals**, which the runtime reads out of the
+  `.so` by symbol: `fuel_consumed: 3315` and `runtime_signature: 13667326539545663817` came out
+  **identical** from both runtimes, so the fuel and signature accounting path is unbroken across
+  the split as well.
+
+None of that was the target of the experiment; all of it would have shown up as a failure or a
+mismatch had the split disturbed it.
+
+### BRANCH-LEVEL BLOCKER — not a Task 7 residual, do not retire this with this task
+
+**No competitive c004 algorithm has ever been shown to clear the 0.95 recall bar on this branch,
+and none can be run until it is rebuilt against the GAN `kernels.cu`.** This is recorded here as a
+**branch-level** open item rather than a Task 7 note precisely so that closing Task 7 does not
+close it. It is out of scope for this design - it belongs to the GAN instance-generation work
+underneath - but it is the difference between *"the split works"* and *"the challenge is
+solvable"*, and only the first has been demonstrated.
+
+The two are independent: everything Part 1 and Part 2 establish would remain true on a branch whose
+recall bar no algorithm could reach. `scenarios.rs` concedes the gap in its own comment on
+`min_recall` - "the upper end is not measured - no ANN method was run - so '0.95 is not trivially
+cleared by an approximate method' is judgement, not measurement". The only end-to-end quality figure
+anywhere in this validation is `quality: 72174`, and that is from a **pre-GAN** runtime on the
+retired mean-distance map; it says nothing about recall. Whoever ships this branch owes a
+measurement of a real ANN algorithm against the 950000 bar before the rebuild-and-resubmit is asked
+of 105 algorithm authors.
+
+### What else remains unestablished
+
+- **`Database`'s layout is a brand-new ABI commitment with no baseline to appeal to.** D5 was
+  verified on one algorithm shape (`entry_point` only, no index). An algorithm exporting
+  `build_index`/`load_index` also crosses the boundary with `&Database`, and `Database` is
+  `repr(Rust)` and **new in this design** - there is no "unchanged from today" argument available
+  for it, because there is no previous version of it. Its layout is therefore **frozen from the
+  moment the first algorithm ships against it**, and any later field added, removed or retyped is
+  a silent ABI break with exactly the failure mode D5 exists to prevent. No pre-split binary can
+  exercise it; Task 4's stub work is the only coverage. This deserves the same explicit
+  "layout is fixed" discipline D5 gives `Challenge`.
 - The measurement was taken on one card (RTX 3060, sm_86). Struct layout is ABI-determined and
   architecture-independent for this target, so this is noted for completeness rather than as a real
   doubt.
+- The discriminating control described above - a probe rebuilt against a deliberately mutated
+  `Challenge`, shown to fault - was not run.
