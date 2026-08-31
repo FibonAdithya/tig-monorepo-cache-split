@@ -1504,24 +1504,22 @@ mod tests {
         );
     }
 
-    /// The code of the `gpu_common!` macro -- comment lines stripped -- bounded
-    /// at both ends by the two macro definitions that surround it.
+    /// Comment-stripped source between two unique markers.
     ///
-    /// Four tests below assert on offsets inside this slice, and every one of
-    /// them is only as good as the bounding, so a slice that silently matched
-    /// nothing (or matched this helper's own source) would be worse than no
-    /// test. Comments are stripped because the prose inside `gpu_common!`
-    /// names `fuel_remaining_ptr`, `initialize_kernel` and `output_file`
+    /// Every source-scan test below is only as good as its bounding, so this
+    /// fails loudly rather than hand back a slice that matched nothing, matched
+    /// this test module instead of the code, or runs backwards. Comment lines
+    /// are dropped because the prose inside these macros names
+    /// `fuel_remaining_ptr`, `initialize_kernel`, `output_file` and `nonce`
     /// verbatim, and an ordering assertion a comment can satisfy is not an
     /// ordering assertion.
-    fn gpu_common_code() -> String {
+    ///
+    /// Callers pass `concat!`-split needles on purpose: written as one literal,
+    /// each would occur in this module's own source and `find` would match
+    /// there rather than at the definition.
+    fn code_between(open: &str, close: &str, min_len: usize, must_contain: &str) -> String {
         const SRC: &str = include_str!("main.rs");
-        // `concat!` throughout: written as one literal, each needle would occur
-        // in this helper's own source and `find` would match here rather than
-        // at the definition.
-        const OPEN: &str = concat!("macro_rules! gpu", "_common {");
-        const CLOSE: &str = concat!("macro_rules! dispatch", "_challenge {");
-        for needle in [OPEN, CLOSE] {
+        for needle in [open, close] {
             assert_eq!(
                 SRC.matches(needle).count(),
                 1,
@@ -1530,23 +1528,98 @@ mod tests {
                 needle
             );
         }
-        let start = SRC.find(OPEN).unwrap();
-        let end = SRC.find(CLOSE).unwrap();
+        let start = SRC.find(open).unwrap();
+        let end = SRC.find(close).unwrap();
         assert!(
             start < end,
-            "gpu_common! must be defined before dispatch_challenge! or the slice \
-             runs backwards"
+            "`{}` must come before `{}` or the slice runs backwards",
+            open,
+            close
         );
         let body = &SRC[start..end];
         assert!(
-            body.len() > 2000 && body.contains("solve_challenge_fn"),
-            "sliced {} bytes that do not look like gpu_common!'s body",
-            body.len()
+            body.len() > min_len && body.contains(must_contain),
+            "sliced {} bytes between `{}` and `{}`, which do not look like the \
+             intended region (no `{}`)",
+            body.len(),
+            open,
+            close,
+            must_contain
         );
         body.lines()
             .filter(|l| !l.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// The `gpu_common!` macro: the single copy of the GPU per-nonce loop,
+    /// shared by c004, c005 and c006.
+    fn gpu_common_code() -> String {
+        code_between(
+            concat!("macro_rules! gpu", "_common {"),
+            concat!("macro_rules! dispatch", "_challenge {"),
+            2000,
+            "solve_challenge_fn",
+        )
+    }
+
+    /// The `cpu` arm of `dispatch_challenge!`.
+    ///
+    /// A second, independent copy of the same per-nonce loop -- and the only
+    /// arm the `--features c001` test build compiles, so it is the one arm CI
+    /// can actually reach. A regression here would ship.
+    fn cpu_arm_code() -> String {
+        code_between(
+            concat!("($c:ident, ", "cpu) => {{"),
+            concat!("($c:ident, ", "gpu) => {{"),
+            800,
+            "generate_instance",
+        )
+    }
+
+    /// The `gpu` arm: c005/c006, which have no `Database` and no index ABI.
+    fn gpu_nodb_arm_code() -> String {
+        code_between(
+            concat!("($c:ident, ", "gpu) => {{"),
+            concat!("($c:ident, ", "gpu_db) => {{"),
+            200,
+            "generate_instance",
+        )
+    }
+
+    /// The `gpu_db` arm: c004, the only arm that may accept `--index`.
+    fn gpu_db_arm_code() -> String {
+        code_between(
+            concat!("($c:ident, ", "gpu_db) => {{"),
+            concat!("match settings.challenge", "_id.as_str() {"),
+            200,
+            "for_nonce",
+        )
+    }
+
+    /// The `nonce` field of the one `OutputData` literal in `code`, trimmed.
+    ///
+    /// Returned as text rather than asserted in place because each arm has its
+    /// own literal and both must be checked, and because the assertion wants to
+    /// print what it actually found.
+    fn output_data_nonce_field(code: &str) -> String {
+        let at = offset_of(code, concat!("Output", "Data {"));
+        let rest = &code[at..];
+        let end = rest
+            .find("};")
+            .expect("the OutputData literal must be a statement ending in `};`");
+        let field: Vec<&str> = rest[..end]
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| l.starts_with("nonce"))
+            .collect();
+        assert_eq!(
+            field.len(),
+            1,
+            "expected exactly one `nonce` field in the OutputData literal, found {:?}",
+            field
+        );
+        field[0].to_string()
     }
 
     #[test]
@@ -1656,6 +1729,7 @@ mod tests {
         let code = gpu_common_code();
         let loop_start = offset_of(&code, concat!("for nonce in ", "nonces {"));
         for needle in [
+            concat!("seeds_for(&settings, &rand", "_hash, nonce)"),
             concat!("*fuel_remaining", "_ptr = max_fuel"),
             concat!("*runtime_signature", "_ptr ="),
             concat!("launch_builder(&initialize", "_kernel)"),
@@ -1783,5 +1857,96 @@ mod tests {
         );
         assert_eq!(*sub.get_one::<u64>("start-nonce").unwrap(), 3);
         assert_eq!(*sub.get_one::<u64>("num-nonces").unwrap(), 5);
+    }
+
+    #[test]
+    fn every_per_nonce_step_lives_inside_the_cpu_arms_loop() {
+        // The twin of `every_per_nonce_step_lives_inside_the_loop`, which scans
+        // `gpu_common!` only. The cpu arm is a SEPARATE copy of the same loop,
+        // and it is the arm the `--features c001` test build compiles -- so it
+        // is the one arm CI can reach, and a hoisted reset here would ship.
+        //
+        // Every way of getting it wrong is silent in exactly the same way as on
+        // the GPU side: the run still writes one well-formed file per nonce and
+        // still exits 0, and only the fuel and signature numbers are wrong.
+        let code = cpu_arm_code();
+        let loop_start = offset_of(&code, concat!("for nonce in ", "nonces {"));
+        for needle in [
+            concat!("seeds_for(&settings, &rand", "_hash, nonce)"),
+            concat!("*fuel_remaining", "_ptr = max_fuel"),
+            concat!("*runtime_signature", "_ptr ="),
+            concat!("output_dir.join(format!(\"{}", ".json\", nonce))"),
+            concat!("let save_solution", "_fn = |solution:"),
+        ] {
+            let at = offset_of(&code, needle);
+            assert!(
+                at > loop_start,
+                "`{}` must be inside the cpu arm's per-nonce loop (loop@{} found@{})",
+                needle,
+                loop_start,
+                at
+            );
+        }
+    }
+
+    #[test]
+    fn the_output_file_is_stamped_with_the_loops_nonce() {
+        // `save_solution_fn` is built inside the loop and no `nonce` binding
+        // survives in `compute_solution`'s scope, so an ACCIDENTAL revert to an
+        // outer binding is a compile error. That is a strong guarantee, and it
+        // is not this test's job.
+        //
+        // This catches the DELIBERATE mutation, which is the dangerous one:
+        // `nonce: start_nonce` compiles, writes five well-formed files all
+        // stamped with the batch's first nonce, exits 0, and leaves every other
+        // test in this module green. Nothing fails -- the files parse, the
+        // verifier is never asked about the mismatch -- and the Merkle root the
+        // slave computes is silently wrong. Only the container's Step 2
+        // assertion catches it otherwise, and that does not run in CI.
+        for (arm, code) in [
+            ("gpu_common!", gpu_common_code()),
+            ("the cpu arm", cpu_arm_code()),
+        ] {
+            let field = output_data_nonce_field(&code);
+            assert_eq!(
+                field, "nonce,",
+                "{}'s OutputData must stamp the loop's `nonce` by field \
+                 shorthand, not an explicit value; found `{}`",
+                arm, field
+            );
+        }
+    }
+
+    #[test]
+    fn index_is_refused_on_every_arm_that_cannot_load_one() {
+        // c004 is the only challenge with a `Database`, and its ABI is the only
+        // one with `load_index`. On any other arm `--index` cannot mean
+        // anything -- and the dangerous outcome there is not an error, it is
+        // solving WITHOUT the index the caller asked for and exiting 0.
+        const CALL: &str = concat!("refuse", "_index!($c);");
+        for (arm, code) in [
+            ("the cpu arm", cpu_arm_code()),
+            ("the c005/c006 gpu arm", gpu_nodb_arm_code()),
+        ] {
+            assert!(
+                code.contains(CALL),
+                "{} must refuse --index: it has no load_index in its ABI",
+                arm
+            );
+        }
+        // The positive half, and it is not a restatement: an implementation
+        // that refused --index on EVERY arm would satisfy the loop above while
+        // making the flag useless, and `batch_and_index_are_no_longer_guarded`
+        // would still pass, because the call it looks for would still be in the
+        // file -- just unreachable from every arm.
+        let db = gpu_db_arm_code();
+        assert!(
+            !db.contains(CALL),
+            "the c004 arm must ACCEPT --index; it is the only arm that can load one"
+        );
+        assert!(
+            db.contains(concat!("b\"load_", "index\"")),
+            "the c004 arm must resolve `load_index` from the algorithm"
+        );
     }
 }
