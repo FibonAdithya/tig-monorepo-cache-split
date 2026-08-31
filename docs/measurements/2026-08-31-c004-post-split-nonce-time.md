@@ -1,12 +1,11 @@
 # c004 post-split per-nonce time, `alpha`, and the memory cap
 
-**Date:** 2026-08-31
+**Date:** 2026-08-31 (revised the same day after review — see §11 for what changed)
 **Measures:** `docs/superpowers/specs/2026-08-31-c004-index-build-split-design.md`
 **Code under test:** branch `vector_search/gan_instance_gen` at `d0487f97`
-(byte-identical in code to `be650a7c`; `be650a7c..d0487f97` is
-`docs/superpowers/specs/...design.md` only — `git diff --stat be650a7c d0487f97`
-shows exactly one file changed, 519 insertions and 17 deletions, and no source
-file at all).
+(byte-identical in code to `be650a7c`; `git diff --stat be650a7c d0487f97` shows
+exactly one file changed, 519 insertions and 17 deletions, and no source file at
+all).
 
 This note replaces the design's **estimate** of 0.05 s/nonce, and the 1.2 s/nonce
 figure it is measured against, with measurements. It also revises `alpha` and
@@ -14,33 +13,42 @@ reports what the memory and lifespan measurements can and cannot settle.
 
 ---
 
-## 0. Summary of what changed
+## 0. Summary
 
 | Quantity | Design said | Measured here | Where |
 |---|---|---|---|
-| post-split per-nonce (marginal) | 0.05 s (estimated) | **0.0227 s** | §3 |
-| post-split per-nonce (bundle-amortised, the number that matters) | — | **0.165 s** | §3.3 |
-| pre-split per-nonce | 1.2 s (unsourced, see §2) | **3.24 s** | §2 |
-| break-even for a 600 s build | ~520 nonces | **195 nonces** | §4 |
-| `alpha` | 0.25 (provisional) | **0.005** | §5 |
-| `max_build_fuel_budget` | unset | **1.0e13** suggested | §5.4 |
+| post-split per-nonce, **marginal** | 0.05 s (estimated) | **0.0227 s** | §3.1 |
+| post-split per-nonce, **amortised at the shipped `batch_size` of 8** | — | **0.378 s** | §3.3 |
+| `Database::generate` (once per batch) | — | **765.6 ms** | §3.2 |
+| per-process startup (once per batch) | — | **2077.7 ms**, of which **2005 ms is `CudaContext::new`** | §2.2 |
+| pre-split per-nonce | 1.2 s (unsourced, §2.1) | **3.24 s** (3.31 s in the exact production shape) | §2.1, §2.4 |
+| break-even for a *flat* 600 s build | ~520 nonces | **210 nonces** | §4.2 |
+| `alpha` | 0.25 (provisional) | **0.003** | §5.4 |
+| `max_build_fuel_budget` | unset | **7.0e12** | §5.5 |
 | build-phase peak device memory | 8 GiB cap assumed | **1010 MiB** with a zero-footprint index | §6 |
-| build vs. precommit lifespan | open question | 600 s of **7200 s** (8.3 %) | §7 |
+| build vs. precommit lifespan | open question 2 | 600 s of **7200 s** (8.3 %) | §7 |
 
-Two findings matter more than any single number:
+Three findings matter more than any single number:
 
-1. **The verifier is not amortised and now dominates.** The reference slave runs
-   one `tig-verifier` process per nonce, and that process regenerates the whole
-   700,000-vector database from scratch. Measured at **3.29 s/nonce**, unchanged
-   by the split. The benchmarker's end-to-end per-nonce cost therefore falls from
-   6.53 s to 3.46 s — **1.9x**, not the ~24x that 1.2 s → 0.05 s implies. See §8.
-2. **`alpha` cannot be 0.25.** `build_fuel_budget = alpha * num_nonces *
+1. **The dominant cost on both sides of the comparison is `CudaContext::new`, at
+   2.0 s per process — and it is not cacheable.** It is 96 % of per-process
+   startup, 62 % of the pre-split per-nonce cost, and therefore the origin of
+   most of `delta`. The CUDA JIT cache *is* working (PTX JIT falls from 479 ms to
+   4.7 ms once warm), and the same 2.0 s is paid in a long-lived container with
+   `docker exec` per nonce — the exact production shape. §2.2, §2.4.
+2. **The verifier is not amortised and now dominates.** The reference slave runs
+   one `tig-verifier` process per nonce, which regenerates the whole
+   700,000-vector database. Measured at **3.25 s/nonce**, unchanged by the split
+   — and decomposed: 2006 ms setup, 768 ms regeneration, **91 ms** of actual
+   recall audit. The benchmarker's end-to-end per-nonce cost falls from 6.49 s to
+   3.63 s — **1.8x**, not the ~24x that 1.2 s → 0.05 s implies. §8.
+3. **`alpha` cannot be 0.25.** `build_fuel_budget = alpha * num_nonces *
    fuel_budget` is denominated in `fuel_budget`, which the *player* chooses up to
    `max_fuel_budget` = 5e12 at **zero marginal fee** (`per_nonce_fee` is 0 for
    c004). A real algorithm consumes ~4.67e9 fuel, so the budget can be ~1,071x
-   the fuel a nonce actually spends. At `alpha` = 0.25 and `fuel_budget` = 5e12
-   the build is authorised 4,791 s of wall-clock at the 80-nonce protocol floor,
-   against 246 s of saving. Only the flat 600 s watchdog prevents that. See §5.
+   the fuel a nonce actually spends. At `alpha` = 0.25 the build is authorised
+   4,791 s of wall-clock at the 80-nonce protocol floor, against 229 s of saving.
+   Only the flat 600 s watchdog prevents that. §5.
 
 ---
 
@@ -66,10 +74,9 @@ Three consequences, stated plainly rather than buried:
   arithmetic.
 - **This is not the card the old baseline was taken on.** The design's 1165 ms /
   1171 ms figures are attributed to an RTX 4060. **Rather than mix cards, the
-  pre-split baseline was re-measured here on the 3060** (§2). Every `alpha` and
+  pre-split baseline was re-measured here on the 3060** (§2.1). Every `alpha` and
   break-even number in this note uses the 3060 baseline against the 3060
-  post-split figure. The 4060 numbers are quoted for context only and are used
-  in no arithmetic.
+  post-split figure. No 4060-derived number enters any arithmetic chain.
 - **A T4 is slower than a 3060** (T4 ~8.1 TFLOPS fp32 / 320 GB/s; RTX 3060 ~12.7
   TFLOPS / 360 GB/s). Where a rate measured here is converted into a protocol
   constant, it is derated by 1.25x for the T4. That derate is an estimate from
@@ -105,25 +112,26 @@ contributes no metered work at all.
 existed on the box as untracked scratch (read, not modified). One kernel,
 700,000 x 7,000 x 128 distances. Used for two things only: an anchor for "a real
 solver actually solving" (its solutions verify at quality 1,000,000), and the
-fuel-to-wall-clock rate in §5. It is **not** representative of a production
+fuel-to-wall-clock rate in §5.1. It is **not** representative of a production
 algorithm: it is ~112x more expensive in fuel than `there_v10` and uses no index.
 
 Scenario: this branch has exactly **one** scenario, `SIFT_128` (7,000 queries,
 700,000 database rows, 128 dims, `min_recall` 0.95), so `track_id` is
 `s=sift_128` throughout. It corresponds in size to mainnet's `n_queries=7000`
-track, whose `num_nonces_per_bundle` is **20** — the bundle size used in §3.3.
-The other live tracks (`n_queries=9000..15000`, bundle sizes 17/15/10/5) have no
-counterpart on this branch and were **not** measured; see §9.
+track. The other live tracks (`n_queries=9000..15000`) have no counterpart on
+this branch and were **not** measured; see §9.
 
 ### 1.3 How time was measured
 
-`tig-runtime` and `tig-challenges` were given `eprintln!` probes reading
-`SystemTime::now()` at: process entry; after `CudaContext::new` + `load_module` +
-`get_device_prop`; after `Database::generate`; and at the end of every nonce
-iteration. `cuMemGetInfo` was printed at the same points. **These probes exist
-only in an isolated `/tmp/task8/repo` copy on the box; nothing was committed and
-`/workspace/tig-bench` was never touched** (verified: it is still at `d53ceef4`
-with exactly the pre-existing scratch it had before this work).
+`tig-runtime`, `tig-challenges` and `tig-verifier` were given `eprintln!` probes
+reading `SystemTime::now()` at: process entry; settings parsed; algorithm
+`dlopen`ed; PTX read and fuel-patched; `CudaContext::new` returned;
+`load_module` returned; `get_device_prop` returned; `Database::generate`
+returned; and at the end of every nonce iteration. `cuMemGetInfo` was printed at
+the same points. **These probes exist only in an isolated `/tmp/task8/repo` copy
+on the box; nothing was committed and `/workspace/tig-bench` was never touched**
+(verified: it is still at `d53ceef4` with exactly the pre-existing scratch it had
+before this work).
 
 One measurement per process invocation, looping in the shell — a fresh
 `CudaContext` per iteration inside one process exhausts the card after ~10
@@ -131,7 +139,9 @@ iterations, and surfaces as `NVRM: Out of memory` in `dmesg`, not as a panic.
 
 ---
 
-## 2. The pre-split baseline, re-measured on this card
+## 2. The pre-split baseline, and where its time actually goes
+
+### 2.1 Re-measured on this card
 
 **The design's 1165 ms / 1171 ms figures cannot be traced to their cited source.**
 The spec attributes them to the `## Validation` section of
@@ -145,29 +155,111 @@ halved, which would make them a derived split of a combined figure rather than a
 measurement of the runtime alone. **Treat `t_old = 1.2 s` as unsourced.**
 
 So the baseline was re-measured, on this card, on this branch, in the shape the
-production benchmarker actually uses: `tig-benchmarker/slave/main.py:60`
+production benchmarker uses: `tig-benchmarker/slave/main.py:60`
 (`run_tig_runtime`) launches **one `tig-runtime` process per nonce** via
 `docker exec`, in the legacy four-positional form. Twenty consecutive processes,
-`nullstub`, nonces 0–19:
+`nullstub`, nonces 0–19, all in one already-running container:
 
 | | mean | sd | min | max |
 |---|---|---|---|---|
 | full process wall (as the shell sees it, n=20) | **3238.8 ms** | 133.0 | 3131.7 | 3646.2 |
 | in-process (entry -> solution written) | 2846.8 ms | 138.4 | 2726.0 | 3263.8 |
 
-Breakdown of the in-process figure: 2055.4 ms of process start + `dlopen` + CUDA
-context + PTX patch and JIT; 763.7 ms of `Database::generate`; 27.6 ms of
-per-nonce work.
+**`t_old` = 3.24 s/nonce.** This excludes `tig-verifier`, which the slave also
+runs per nonce; the verifier is measured separately in §8 and appears
+identically on both sides of the comparison.
 
-**`t_old` = 3.24 s/nonce** (the shell-observed figure, which is what the slave
-pays). This excludes `tig-verifier`, which the slave also runs per nonce; the
-verifier is measured separately in §8 and appears identically on both sides of
-the comparison.
+### 2.2 Where the 2,078 ms of startup goes — it is not the JIT
 
-That is 2.8x the design's 1.2 s. Part of that is the slower card, but 2055 ms of
-it is fixed per-process startup dominated by JIT of the challenge PTX, which the
-1.2 s figure may never have included. This is the reason the baseline was
-re-measured instead of being carried across cards.
+An earlier draft of this note guessed that the startup term was "dominated by JIT
+of the challenge PTX". **That is wrong, and the measurement says so.** Probes
+between each stage, first run of each container excluded as cold:
+
+| stage | mean | sd |
+|---|---|---|
+| exec + Rust init -> settings parsed | 0.4 ms | 0.1 |
+| `dlopen` of the algorithm `.so` | 2.3 ms | 0.4 |
+| PTX read + fuel patch (1,110,707 B) | 3.8 ms | 0.6 |
+| **`CudaContext::new` + `set_blocking_synchronize`** | **2005.0 ms** | 33.5 |
+| `load_module` — the PTX JIT, cache warm | 4.7 ms | 0.2 |
+| `get_device_prop` and the rest | 3.6 ms | 0.5 |
+| **startup subtotal** | **2019.9 ms** | |
+
+(n=11, phase G — the production shape of §2.4. Phase F, batch mode in a
+throwaway container, gives 2017.9 ms; the phase-A mean of 2077.7 ms over 21 runs
+is used elsewhere in this note and agrees to 3 %.)
+
+**96 % of startup is CUDA primary-context creation.** Every other term together
+is 15 ms.
+
+### 2.3 The JIT cache works; it is not the explanation
+
+The fuel-patched PTX is byte-identical across every run (constant
+`--fuel 2000000000`), so a working cache should collapse the JIT after the first
+run. It does. Two containers, eight sequential 5-nonce batches each:
+
+| | `load_module` (warm runs) | cache directory after |
+|---|---|---|
+| default (cache enabled) | **4.7 ms** | 1,412,463 B in `~/.nv/ComputeCache` |
+| `CUDA_CACHE_DISABLE=1` | **479.1 ms** | absent |
+
+So JIT is ~479 ms cold and ~5 ms cached, the cache is populated and hit, and
+**`CudaContext::new` is unmoved at 2005 ms / 2017 ms in the two arms.** The
+cacheable component is already cached in every measurement in this note.
+
+### 2.4 The exact production shape: one long-lived container, `docker exec` per nonce
+
+The slave `docker exec`s into a container that stays up. Reproduced literally —
+`docker run -d ... sleep 3600`, then 12 sequential `docker exec` invocations of
+the legacy single-nonce form, first excluded as cold:
+
+| | mean | sd | min | max |
+|---|---|---|---|---|
+| host-side `docker exec` wall (n=11) | **3310.1 ms** | 186.4 | 2736.0 | 3427.6 |
+| in-process entry -> solution (n=10) | 2816.4 ms | 34.4 | | |
+| `docker exec` client overhead (difference) | 493.7 ms | | | |
+
+`CudaContext::new` in this shape: 2005.0 ms — identical to the throwaway-container
+case. **The 2.0 s is structural, not an artefact of running one container per
+measurement.** And `t_old` = 3.2388 s used throughout this note is 2.2 % *below*
+the production-shape 3310.1 ms, i.e. conservative: the real pre-split cost is
+slightly higher than the figure the arithmetic uses.
+
+### 2.5 Sensitivity: what if startup were smaller?
+
+`delta` exists largely because startup is paid once per nonce pre-split and once
+per batch post-split, so it is worth showing the exposure explicitly. Holding
+everything else and varying startup `s` (at `batch_size` 8, see §3.3):
+
+```
+t_old(s) = 3.2388 - (2.0777 - s)          t_new(s) = (s + 0.7656)/8 + 0.022711
+```
+
+| `s` | `t_old` | `t_new` | `delta` | net-win bound | + T4 derate | + 2x margin | |
+|---|---|---|---|---|---|---|---|
+| 2078 ms | 3.239 s | 0.378 s | 2.861 s | 0.00879 | 0.00703 | 0.00352 | **measured** (warm container, warm JIT cache) |
+| 2497 ms | 3.658 s | 0.431 s | 3.228 s | 0.00991 | 0.00793 | 0.00397 | `CUDA_CACHE_DISABLE=1` |
+| 1600 ms | 2.761 s | 0.318 s | 2.443 s | 0.00750 | 0.00600 | **0.00300** | full margin exhausted here |
+| 1000 ms | 2.161 s | 0.243 s | 1.918 s | 0.00589 | 0.00471 | 0.00236 | hypothetical |
+| 500 ms | 1.661 s | 0.181 s | 1.480 s | 0.00455 | 0.00364 | 0.00182 | hypothetical |
+| 204 ms | 1.365 s | 0.144 s | 1.221 s | 0.00375 | **0.00300** | 0.00150 | net win with the T4 derate exhausted here |
+| 0 ms | 1.161 s | 0.118 s | 1.043 s | 0.00320 | 0.00256 | 0.00128 | floor |
+
+All three bound columns use the conservative `R_low` (§5.1). Read against the
+recommended `alpha` = 0.003:
+
+- **The net-win property never breaks.** Even with per-process startup at zero,
+  the bare net-win bound is 0.00320 > 0.003. The split still beats the pre-split
+  baseline at every precommit size for any startup cost whatsoever.
+- **With the 1.25x T4 derate**, 0.003 holds down to `CudaContext::new` ~= 204 ms
+  — a 10x reduction from what is measured.
+- **The full 2x margin** holds down to ~1,600 ms, i.e. a 21 % reduction. That is
+  the term that erodes first.
+
+**Trigger for revisiting:** if `CudaContext::new` is measured below ~1.6 s on the
+deployment hardware — a different driver, persistence mode, a bare-metal host —
+`alpha` still delivers a net win but no longer with a 2x cushion, and should be
+recut. Nothing in this note makes 2.0 s a property of anything but this host.
 
 ---
 
@@ -196,9 +288,9 @@ Consecutive `nonce_done` timestamps within one process:
 
 The spread is 2.1 % of the mean and shows no drift with N: the per-run means of
 the 18 runs that have a marginal interval (N >= 2) lie between 22.36 and
-23.21 ms, with no trend in N. An ordinary-least-squares fit
-of in-process total against N over all 21 runs gives slope **21.50 ms/nonce**,
-intercept 2882 ms — consistent with the direct interval measurement.
+23.21 ms, with no trend in N. An ordinary-least-squares fit of in-process total
+against N over all 21 runs gives slope **21.50 ms/nonce**, intercept 2882 ms —
+consistent with the direct interval measurement.
 
 **The design's estimate was 0.05 s. The measured marginal cost is 0.0227 s —
 2.2x better than estimated.**
@@ -210,59 +302,87 @@ probes give it directly rather than by subtraction:
 
 | phase | mean | sd | n |
 |---|---|---|---|
-| process start + `dlopen` + `CudaContext::new` + PTX JIT | 2077.7 ms | 160.5 | 21 |
+| process start + `dlopen` + `CudaContext::new` + PTX JIT (decomposed in §2.2) | 2077.7 ms | 160.5 | 21 |
 | **`Database::generate`** (700,000 x 128, + `load_index`) | **765.6 ms** | 5.2 | 21 |
 | **total one-off, paid once per batch** | **2843.3 ms** | | |
 
 `Database::generate` is remarkably stable (sd 0.7 %). The startup term is the
 variable one, and it is the larger of the two: **73 % of the one-off cost is not
-database generation at all, it is process start and PTX JIT.** That matters for
-D4 — batching pays for itself on process startup before it pays for anything the
+database generation at all, and 96 % of *that* is `CudaContext::new`.** So
+batching pays for itself on CUDA context creation before it pays for anything the
 design talks about.
 
-Cross-check from the `build-index` path, which generates the same database in a
-different code path: 750.1 ms and 751.2 ms in the two runs of §6. Agrees with
-765.6 ms to within 2 %.
+Cross-checks from two independent code paths that generate the same database:
+`build-index` gives 750.1 ms and 751.2 ms; `tig-verifier`'s `generate_instance`
+(database + queries) gives 768.3 ms. All within 2 % of 765.6 ms.
 
-### 3.3 The number that should be used: 0.165 s/nonce
+### 3.3 The amortisation denominator is an operator config knob, not a protocol constant
 
-D4 puts **one bundle** in one batched query process, not one precommit. On the
-`SIFT_128`-sized track `num_nonces_per_bundle` is **20**, so the 2843 ms one-off
-is amortised over 20 nonces, not over the whole precommit:
+D4 says "the bundle's nonces run in one batched query process" — but the
+reference benchmarker does not size its batches by `num_nonces_per_bundle`. It
+uses a per-algorithm **`batch_size`** chosen by the operator
+(`master/master/job_manager.py:66-73` selects it from `algo_selection`;
+`slave_manager.py:42` turns it into the batch's `start_nonce`/`num_nonces`), it
+is validated to be a **power of two** (`client_manager.py:87-89` rejects 0 and
+any non-power-of-two), and the value shipped in `postgres/init.sql` is **8** for
+every challenge. The spec's D4 is itself inconsistent on this, saying "the
+bundle's nonces" in one place and "once per **precommit**" in another.
+
+So the amortised per-nonce cost is a curve, not a constant:
 
 ```
-t_new = 2.8433 / 20 + 0.022711 = 0.14217 + 0.02271 = 0.16488 s/nonce
+t_new(batch_size) = 2.8433 / batch_size + 0.022711
 ```
 
-**`t_new` = 0.165 s/nonce.** The design's 0.05 s estimate is 3.3x optimistic
-against this, even though the *marginal* cost it was estimating is 2.2x better
-than it guessed. The gap is entirely the per-bundle setup the design does not
-account for.
+| `batch_size` | `t_new` | `delta` = `t_old` - `t_new` | |
+|---|---|---|---|
+| 1 | 2.8660 s | 0.3728 s | degenerate — no batching at all |
+| 2 | 1.4444 s | 1.7944 s | |
+| 4 | 0.7335 s | 2.5053 s | |
+| **8** | **0.3781 s** | **2.8607 s** | **shipped default (`init.sql`)** |
+| 16 | 0.2004 s | 3.0384 s | |
+| 20 | 0.1649 s | 3.0739 s | D4's bundle reading (not a power of two, so not reachable) |
+| 64 | 0.0671 s | 3.1717 s | |
+| 512 | 0.0283 s | 3.2105 s | |
+| ∞ | 0.0227 s | 3.2161 s | the marginal cost of §3.1 |
+
+**This note uses `batch_size` = 8 throughout**, because it is what the reference
+benchmarker ships and because it is the conservative choice among realistic
+values (smallest `delta`, smallest `alpha`). **`t_new` = 0.378 s/nonce.**
+
+`delta` — which is what break-even and `alpha` actually depend on — moves only
+12 % across `batch_size` 8 → 512, and only 7 % from 8 → 20, so the constants in
+§5 are insensitive to this choice. `t_new` itself is not: quote it with its
+`batch_size`.
 
 ### 3.4 Where the 22.7 ms goes — and what D5's copy really costs
 
 A second instrumented build split `Challenge::for_nonce` into phases with a
 `stream.synchronize()` between them. **That added sync is itself expensive: it
 breaks pipelining and raises the per-nonce total from 22.7 ms to 31.7 ms.** So
-these are attributions under a perturbed build, not a decomposition of the 22.7 ms:
+these are attributions under a perturbed build, and each is therefore an
+**upper bound** on the corresponding phase in the unperturbed 22.7 ms:
 
 | phase (with the attribution sync) | mean | sd | n |
 |---|---|---|---|
 | `generate_queries` (7,000 vectors) | 26.795 ms | 0.658 | 60 |
-| **database device-to-device alloc + copy (D5)** | **3.894 ms** | 0.198 | 60 |
+| **database device-to-device alloc + copy (D5)** | **<= 3.894 ms** | 0.198 | 60 |
 | `initialize_kernel` + solve + `finalize_kernel` + write | 1.017 ms | 0.143 | 60 |
 | for_nonce entry -> output written | 31.705 ms | 0.839 | 60 |
 
 **The spec prices D5's owned copy at "~1.4 ms at T4 bandwidth". Measured here it
-is 3.9 ms**, i.e. 358 MB moved at ~92 GB/s of one-way traffic (~184 GB/s counting
-read and write, which is a reasonable fraction of the 3060's 360 GB/s). The
-1.4 ms figure appears to count only one direction at full advertised bandwidth.
-On a T4 (320 GB/s) the same copy would be ~4.4 ms. Against the measured 22.7 ms
-nonce that is **~17 % of the per-nonce cost**, not the "~3 % of an estimated
-50 ms nonce" the spec claims. This does not by itself overturn D5 — the progress
-ledger already records that D5's *rationale* is void and the decision belongs to
-the user — but the cost side of that decision is 3x larger and the denominator
-2.2x smaller than the spec states.
+is at most 3.9 ms.** Two qualifications, both of which cut against over-reading
+that number: the phase measured is `alloc` + `clone_dtod`, so the implied
+~92 GB/s of one-way traffic (~184 GB/s counting read and write) **understates**
+the copy's own bandwidth by however long the 358 MB allocation took; and the
+3.894 ms comes from the perturbed build while the 22.7 ms denominator does not,
+so the derived **"~17 % of a nonce" is likewise an upper bound**, not a
+measurement of the unperturbed ratio. What survives cleanly is that the spec's
+1.4 ms counts only one direction at full advertised bandwidth, and that the true
+cost is materially larger than 1.4 ms against a denominator materially smaller
+than 50 ms. This does not by itself overturn D5 — the progress ledger already
+records that D5's *rationale* is void and the decision belongs to the user — but
+both sides of that cost/benefit have moved.
 
 ---
 
@@ -271,10 +391,10 @@ the user — but the cost side of that decision is 3x larger and the denominator
 ### 4.1 Why the algorithm's search time cancels
 
 Let `S` be an algorithm's per-nonce search cost. Then `t_old = 3.2388 + S` and
-`t_new = 0.1649 + S`, so
+`t_new = 0.3781 + S`, so
 
 ```
-delta = t_old - t_new = 3.0739 s/nonce,  independent of S.
+delta = t_old - t_new = 2.8607 s/nonce,  independent of S.
 ```
 
 Verified against `refsearch`: legacy single-nonce wall 28.80 s, batch marginal
@@ -284,131 +404,207 @@ whose search cost the split leaves unchanged**, and is a *conservative* bound fo
 one whose index makes search cheaper — which is the entire point of the design,
 and is unmeasured because no indexed c004 algorithm exists yet.
 
-### 4.2 Break-even
+### 4.2 Break-even for a flat 600 s build
 
 ```
-B / (t_old - t_new) = 600 / 3.0739 = 195.2 nonces
+B / (t_old - t_new) = 600 / 2.8607 = 209.7 nonces
 ```
 
-**195 nonces**, against the spec's ~520. The spec's figure is too pessimistic
+**210 nonces**, against the spec's ~520. The spec's figure is too pessimistic
 because its `t_old` was too small; the larger measured saving per nonce pays off
-a 600 s build 2.7x sooner.
+a 600 s build 2.5x sooner.
 
 ### 4.3 The "Why not a flat 10 minutes" table, recomputed
 
-600 s build; bundles of 20; `nullstub` floor on both sides, so the numbers are
-instance-handling cost only:
+Flat 600 s build; `batch_size` 8; `nullstub` floor on both sides, so the numbers
+are instance-handling cost only:
 
-| nonces/precommit | today | with a 600 s build | verdict |
+| nonces/precommit | today | with a flat 600 s build | verdict |
 |---|---|---|---|
-| 80 (protocol floor: `min_num_bundles` 4 x `num_nonces_per_bundle` 20) | 259 s | 613 s | **2.37x worse** |
-| 195 | 632 s | 633 s | break-even |
-| 500 | 1,619 s | 682 s | 2.37x better |
-| 2,000 | 6,478 s | 930 s | 6.97x better |
-| 10,000 | 32,388 s | 2,249 s | 14.4x better |
+| 80 (protocol floor: `min_num_bundles` 4 x `num_nonces_per_bundle` 20) | 259 s | 630 s | **2.43x worse** |
+| 210 | 680 s | 680 s | break-even |
+| 500 | 1,619 s | 790 s | 2.05x better |
+| 2,000 | 6,478 s | 1,356 s | 4.78x better |
+| 10,000 | 32,388 s | 4,381 s | 7.39x better |
 
-The spec's qualitative conclusion survives — a flat 10-minute cap is a footgun at
-the protocol floor — but the floor is 2.4x worse rather than 6.3x worse, and the
-crossover is at 195 nonces rather than ~520.
+The spec's qualitative conclusion survives — a **flat** 10-minute cap is a footgun
+at the protocol floor — but the floor is 2.4x worse rather than 6.3x worse, and
+the crossover is at 210 nonces rather than ~520. Under the proportional rule at
+the recommended `alpha` the footgun does not arise at all (§5.4): the build is
+never more than 0.42x the wall-clock it saves, at any precommit size.
 
 ---
 
 ## 5. `alpha`
 
-### 5.1 The fuel-to-wall-clock rate
+### 5.1 The fuel-to-wall-clock rate, and a 36 % discrepancy in it
 
 `alpha` is denominated in fuel; every constraint on it is about wall-clock. The
 bridge is a measured rate. `refsearch`, one nonce, in a batch:
 
 ```
-fuel_consumed  = 521,857,948,686      (from /out/C_bat2/0.json; nonce 1 gives 521,857,948,674)
+fuel_consumed  = 521,857,948,686      (/out/C_bat2/0.json; nonce 1 gives 521,857,948,674)
 marginal wall  = 25.0006 s            (nonce_done[1] - nonce_done[0], same process)
-R              = 2.0874e10 fuel-units per second
+R_measured     = 2.0874e10 fuel-units per second
 ```
 
-**Caveats on `R`, which are real:** fuel is a static instruction-cost model, so
-`R` is kernel-dependent, not merely hardware-dependent. `refsearch` is a
-memory-bound scan, which gives a *low* `R` — and a low `R` is the conservative
-direction for sizing `alpha`, because it makes a given fuel budget buy more
-seconds. A compute-bound build kernel would show a higher `R` and would therefore
-be safer than these numbers assume. `R` is also a single-algorithm, single-card
-datum: it is derated 1.25x for a T4 in §5.3 and nowhere else validated.
+**This does not agree with the only other recorded figure for the same solver on
+the same track.** `2026-08-13-gan-instance-generation-design.md` records
+"`fuel_consumed` is 3.84e11 at n_queries=7000" for exact 1-NN — 36 % below
+5.2186e11. Fuel is a static instruction-cost model, so it should be reproducible.
+What was checked:
 
-Sanity check: `there_v10` at ~4.67e9 fuel implies 0.224 s of search on this card,
-which is the right order for a production ANN solver.
+- **`refsearch` has not been edited.** `refsearch.rs` and `refsearch/kernels.cu`
+  are byte-identical across all four copies on the box
+  (`/workspace/keepsafe-2026-08-31/`, `/workspace/refsearch*`,
+  `/workspace/tig-bench/`, and the `/tmp` copy built here) and both carry an
+  mtime of 2026-08-25 14:49. It is untracked, so it has no git history and the
+  version that produced 3.84e11 cannot be recovered.
+- **`build_ptx` has not changed** since the datum was recorded
+  (`git log 3818f656..HEAD -- tig-binary/scripts/build_ptx` is empty), so the
+  instruction cost table and the injection are the same.
+- **`kernels.cu` has changed, four times, after the datum.** The datum landed in
+  `3818f656` (2026-08-14); `tig-challenges/src/vector_search/kernels.cu` was
+  modified on 2026-08-27 by `4481c873`, `f55b7577`, `d56daa91` and `b09a26e3`
+  (the recall-audit work). `build_ptx` concatenates `framework.cu` + every
+  challenge `.cu` + the algorithm's `.cu` into **one translation unit** and runs
+  `nvcc -dopt=on --use_fast_math` once over it, so an algorithm's instrumented
+  instruction count is not independent of the challenge's kernels.
+
+That is a plausible mechanism, **not a verified one** — reproducing it would need
+a build at the pre-audit `kernels.cu` with the `refsearch` of that date, which no
+longer exists. The datum also predates the per-scenario track redesign
+(2026-08-25), so it was taken under a different track scheme.
+
+`R` enters `alpha` linearly, and the older figure is the **less** favourable one,
+so both are carried through §5.3 and the recommendation is sized against the
+lower:
+
+```
+R_measured = 5.21858e11 / 25.0006 = 2.0874e10 fuel/s
+R_low      = 3.84e11    / 25.0006 = 1.5360e10 fuel/s   (the 2026-08-14 datum)
+```
+
+**Other caveats on `R`, which are real.** Fuel is a static instruction-cost
+model, so `R` is kernel-dependent, not merely hardware-dependent. `refsearch` is
+a memory-bound scan, which gives a *low* `R` — the conservative direction, since
+a low `R` makes a given fuel budget buy more seconds. A compute-bound build
+kernel would show a higher `R` and would be safer than these numbers assume.
+
+Sanity check: `there_v10` at ~4.67e9 fuel implies 0.22–0.30 s of search on this
+card, which is the right order for a production ANN solver.
 
 ### 5.2 The two constraints, and why both are N-independent
 
 Because the budget is `alpha * num_nonces * fuel_budget`, the build's wall-clock
 grows linearly in `N` exactly as the saving does, so both constraints collapse to
 bounds on `alpha` that do not mention `N`. With `F = max_fuel_budget = 5e12`
-(the worst case, and a free choice for the player — see §5.5):
+(the worst case, and a free choice for the player — see §5.6), `batch_size` = 8:
 
-| constraint | inequality | bound on `alpha` |
-|---|---|---|
-| the split is a net win at **every** precommit size | `alpha*F/R <= delta` | **0.01283** |
-| the build is a minority of the benchmarker's total per-nonce work (runtime + verifier, §8) | `alpha*F/R <= t_new + t_verify` | **0.01442** |
-| the build is a minority of the *runtime-only* query phase | `alpha*F/R <= t_new` | 0.00069 |
+| constraint | inequality | at `R_measured` | at `R_low` |
+|---|---|---|---|
+| the split is a net win at **every** precommit size | `alpha*F/R <= delta` | 0.01194 | 0.00879 |
+| the build is a minority of the benchmarker's total per-nonce work (runtime + verifier, §8) | `alpha*F/R <= t_new + t_verify` | 0.01516 | 0.01115 |
+| the build is a minority of the *runtime-only* query phase | `alpha*F/R <= t_new` | 0.00158 | 0.00116 |
+| **if the verifier were ever batched too** (§5.3) | `alpha*F/R <= t_new + 0.44` | 0.00341 | 0.00251 |
 
 The third row is included because it is the reading the spec's own framing
 suggests, and it is worth being explicit that it is a *much* harsher test: after
-the split the runtime's query phase is only 0.165 s/nonce, so "the build must be
-smaller than that" allows a build of just 13 s at the 80-nonce floor. **The
+the split the runtime's query phase is only 0.378 s/nonce, so "the build must be
+smaller than that" allows a build of just 30 s at the 80-nonce floor. **The
 honest accounting is the second row**: `tig-verifier` is mandatory, per-nonce,
-and the benchmarker really pays it, so it is part of "total work". Both readings
+and the benchmarker really pays it, so it is part of "total work". All readings
 are reported so the choice is visible rather than hidden in a constant.
 
-### 5.3 The recommended value
+### 5.3 The tension between this note's two recommendations
 
-Sitting exactly at 0.01283 makes the split *break even* at every size, which is
-not a win. Taking half of it leaves a 2x margin, and derating 1.25x for a T4:
+Row 2 counts the verifier's 3.25 s as legitimate work — while §8 of this same
+note recommends **batching the verifier**, which would remove most of it. That is
+a real tension and it is stated rather than buried.
+
+Using the verifier's measured decomposition (§8: 2006 ms setup, 768 ms
+regeneration, 91 ms audit) and the same batching argument as the runtime, a
+batched verifier at `batch_size` 8 would cost roughly
+`(2006 + 768)/8 + ~2 + 91 = 440 ms/nonce` — a **derivation from measured parts,
+not a measurement of a batched verifier, which does not exist.** At that value
+the row-2 bound falls from 0.01516 to **0.00341** (`R_measured`) or **0.00251**
+(`R_low`).
+
+**So: `alpha` must be recut if the verifier is ever batched.** The recommended
+0.003 survives that change at `R_measured` with 12 % to spare and violates it by
+19 % at `R_low`. The net-win bound (row 1), which is the primary constraint, is
+unaffected by verifier batching in either case, and 0.003 clears it by 4x.
+
+### 5.4 The recommended value
+
+Sitting exactly at the net-win bound makes the split *break even* at every size,
+which is not a win. Taking half of it leaves a 2x margin, derating 1.25x for a
+T4, at `batch_size` 8 and the lower of the two rates:
 
 ```
-alpha = delta * R / (2 * F) / 1.25
-      = 3.0739 * 2.0874e10 / (2 * 5e12) / 1.25
-      = 5.13e-3   ->   alpha = 0.005
+alpha = delta * R_low / (2 * F) / 1.25
+      = 2.8607 * 1.5360e10 / (2 * 5e12) / 1.25
+      = 3.52e-3   ->   alpha = 0.003
 ```
 
-**Recommended `alpha` = 0.005** (5e-3), against the provisional 0.25 — 50x
-smaller. Behaviour at that value, `F` = 5e12, 600 s watchdog:
+**Recommended `alpha` = 0.003 (3e-3)**, against the provisional 0.25 — 83x
+smaller. Each digit of that reduction is traceable: 0.01194 is the bare net-win
+bound at `R_measured`; halving it for margin gives 0.00597; derating for a T4
+gives 0.00478; taking the older `R_low` datum instead gives 0.00352; rounding
+down to a clean value gives 0.003. A reader who rejects the `R_low` datum (§5.1)
+can justify 0.005 instead; a reader who wants the batched-verifier future covered
+at `R_low` too needs 0.0025.
 
-| N | build fuel | build s (uncapped) | build s (after watchdog) | saving | build as % of query+verify work |
-|---|---|---|---|---|---|
-| 80 (floor) | 2.00e12 | 95.8 | 95.8 | 245.9 s | 34.7 % |
-| 400 | 1.00e13 | 479.1 | 479.1 | 1,229.6 s | 34.7 % |
-| 2,000 | 5.00e13 | 2,395.3 | **600** | 6,147.8 s | 8.7 % |
-| 10,000 | 2.50e14 | 11,976.7 | **600** | 30,739.2 s | 1.7 % |
-| 100,000 | 2.50e15 | 119,767.3 | **600** | 307,392.4 s | 0.2 % |
+Behaviour at `alpha` = 0.003, `F` = 5e12, `max_build_fuel_budget` = 7.0e12
+(§5.5), 600 s watchdog, `batch_size` 8 — **this table applies all three limits,
+which is what makes it usable for Task 9**:
+
+| N | `alpha*N*F` | after the fuel cap | build s @`R_measured` | build s @`R_low` | what binds | saving | build as % of query+verify |
+|---|---|---|---|---|---|---|---|
+| 80 (floor) | 1.20e12 | 1.20e12 | 57.5 | 78.1 | `alpha` | 228.9 s | 19.8 % |
+| 200 | 3.00e12 | 3.00e12 | 143.7 | 195.3 | `alpha` | 572.1 s | 19.8 % |
+| 466 | 6.99e12 | 6.99e12 | 334.9 | 455.1 | `alpha` | 1,333.1 s | 19.8 % |
+| 500 | 7.50e12 | **7.00e12** | 335.3 | 455.7 | **fuel cap** | 1,430.3 s | 18.5 % |
+| 2,000 | 3.00e13 | **7.00e12** | 335.3 | 455.7 | **fuel cap** | 5,721.4 s | 4.6 % |
+| 10,000 | 1.50e14 | **7.00e12** | 335.3 | 455.7 | **fuel cap** | 28,606.8 s | 0.9 % |
+| 100,000 | 1.50e15 | **7.00e12** | 335.3 | 455.7 | **fuel cap** | 286,067.6 s | 0.1 % |
 
 Both constraints hold at every size, including the 80-nonce floor: the build
-costs 95.8 s and saves 245.9 s, a 2.6x net win, and is 34.7 % of the
-benchmarker's total per-nonce work. **The break-even footgun of §4.3 disappears
-entirely** — it exists only because a *flat* 600 s build is charged to an
-80-nonce precommit, which `alpha` at this value never authorises.
+costs 57.5–78.1 s and saves 228.9 s, a 2.9–4.0x net win, and is 19.8 % of the
+benchmarker's per-nonce work (16.5 % of the total including the build itself).
+**The break-even footgun of §4.3 disappears entirely** — it exists only because a
+*flat* 600 s build is charged to an 80-nonce precommit, which `alpha` at this
+value never authorises. Note also that **the 600 s watchdog never fires in this
+table**: the fuel cap binds first at every N above 466, and the watchdog is a
+genuine safety net rather than the budget. That is the intended relationship and
+it only holds because §5.5 sizes the two to agree.
 
 For comparison, at the provisional `alpha` = 0.25 and `F` = 5e12: N=80
-authorises 1.00e14 fuel = 4,791 s of build against 246 s of saving; N=2,000
+authorises 1.00e14 fuel = 4,791 s of build against 229 s of saving; N=2,000
 authorises 2.50e15 fuel = 119,767 s. In both cases only the flat 600 s watchdog
 stops it, which means at `alpha` = 0.25 **the watchdog is the budget and D7's
 proportional rule does nothing**.
 
-### 5.4 `max_build_fuel_budget`
+### 5.5 `max_build_fuel_budget`
 
 The fuel cap and the wall-clock watchdog should agree, or one of them is dead
-config. 600 s at the measured rate:
+config — and the fuel cap should bind *first*, so the watchdog stays a safety
+net. That means sizing it against the **slowest** modelled rate:
 
 ```
-600 * 2.0874e10  = 1.252e13        on this RTX 3060
-600 * 2.0874e10 / 1.25 = 1.002e13  derated for a T4
+R_low / 1.25 (T4 derate) = 1.229e10 fuel/s
+600 s * 1.229e10          = 7.37e12   ->   round DOWN to 7.0e12
 ```
 
-**Suggested `max_build_fuel_budget` = 1.0e13.** Overflow check the spec asks for:
-`1.0e13 * gpu_fuel_scale(20) = 2.0e14`, against `u64::MAX` = 1.84e19 — five
+**Suggested `max_build_fuel_budget` = 7.0e12.** It buys 335 s on this 3060 and
+570 s at the slowest modelled rate — under the 600 s watchdog in both cases, so
+the watchdog never fires first. Overflow check the spec asks for:
+`7.0e12 * gpu_fuel_scale(20) = 1.4e14`, against `u64::MAX` = 1.84e19 — five
 orders of margin. The *unclamped* product still needs `u128`/`checked_mul`: at
-`alpha` 0.005, `num_nonces` 100,000, `fuel_budget` 5e12 it is 2.5e15 before the
-`min`, which is fine, but the spec's own worst case is unchanged in kind.
+`alpha` 0.003, `num_nonces` 100,000, `fuel_budget` 5e12 it is 1.5e15 before the
+`min`.
 
-### 5.5 A gaming vector the design does not address
+### 5.6 A gaming vector the design does not address
 
 `tig-protocol/src/contracts/benchmarks.rs` (`submit_precommit`):
 
@@ -420,7 +616,7 @@ orders of margin. The *unclamped* product still needs `u128`/`checked_mul`: at
   `per_nonce_fee` is **`"0"`** in the live config. So the fee is **flat** in both
   `num_bundles` and `fuel_budget`.
 - D2 makes fuel a spend limit rather than a score term, so there is no
-  competitive cost to declaring a huge budget either.
+  competitive cost to declaring a large budget either.
 
 A player therefore maximises their free build budget by setting `fuel_budget` to
 `max_fuel_budget` and `num_bundles` as high as they can run, at no marginal cost.
@@ -452,8 +648,8 @@ captured at launch and killed by exact PID.
 
 ### 6.2 Results
 
-`cuMemGetInfo`, identical to the byte across all 21 batch runs and both
-`build-index` runs (device total 11,910 MiB):
+`cuMemGetInfo`, identical to the byte in every run that printed it (device total
+11,910 MiB):
 
 | point | free | used, cumulative | attributable to |
 |---|---|---|---|
@@ -526,30 +722,32 @@ code.)
 
 The build is serial latency ahead of the precommit's first nonce, because it
 cannot start until `rand_hash` is known. At the 600 s watchdog ceiling that is
-**600 / 7200 = 8.3 % of the lifespan**.
+**600 / 7200 = 8.3 % of the lifespan**; at the recommended `alpha` it is at most
+335 s (4.7 %) on this card, or 456 s (6.3 %) at `R_low`.
 
-A whole 80-nonce floor precommit, including the per-nonce verifier (§8):
+A whole 80-nonce floor precommit at `alpha` = 0.003 and `batch_size` 8 (10
+batches), including the per-nonce verifier (§8):
 
-| solver | total | % of lifespan | margin |
-|---|---|---|---|
-| `nullstub` floor | 876 s | 12.2 % | 6,324 s |
-| `refsearch` (25 s/nonce brute force) | 2,876 s | 39.9 % | 4,324 s |
+| solver | total | % of lifespan | margin | headroom |
+|---|---|---|---|---|
+| `nullstub` floor | 348 s | 4.8 % | 6,852 s | 20.7x |
+| `refsearch` (25 s/nonce brute force) | 2,348 s | 32.6 % | 4,852 s | 3.1x |
 
-Nonce ceiling within one lifespan, after a 600 s build:
+Nonce ceiling within one lifespan, after the build:
 
 | solver | post-split | pre-split (no build) |
 |---|---|---|
-| `nullstub` floor | 1,911 nonces | 1,103 nonces |
-| `refsearch` | 232 nonces | 228 nonces |
+| `nullstub` floor | 1,967 nonces | 1,109 nonces |
+| `refsearch` | 249 nonces | 229 nonces |
 
-**Finding: the build does not consume a large fraction of the lifespan.** At
-8.3 % it is not the binding constraint; amortisation is, and so is the verifier.
-Open question 2 can be closed: a whole 80-nonce floor precommit including its
-600 s build and its per-nonce verification uses 876 s of the 7,200 s lifespan —
-**8.2x headroom** — and even a brute-force solver leaves 4,324 s of margin.
+**Finding: the build does not consume a large fraction of the lifespan.** Open
+question 2 can be closed: a whole 80-nonce floor precommit including its build
+and its per-nonce verification uses 348 s of the 7,200 s lifespan — **20.7x
+headroom** — and even a brute-force solver leaves 4,852 s of margin. The lifespan
+is not the binding constraint; amortisation is, and so is the verifier.
 
 The `refsearch` row is the honest warning attached to that: for an expensive
-solver the split barely raises the nonce ceiling (232 vs 228), because the
+solver the split barely raises the nonce ceiling (249 vs 229), because the
 ceiling is then set by search and verification, not by instance generation.
 
 ---
@@ -559,36 +757,48 @@ ceiling is then set by search and verification, not by instance generation.
 `tig-benchmarker/slave/main.py` runs `tig-verifier` **once per nonce**, as a
 separate `docker exec`, immediately after each `tig-runtime` call (lines 95–110).
 Its `quality` output is written into the nonce's result file, so it is mandatory
-work, not an optional check. The verifier regenerates both halves of the
-instance from the seeds — the full 700,000-vector database included — and audits
-1,000 salt-sampled queries. **The split does not touch it.**
+work, not an optional check. **The split does not touch it.**
 
-Measured, `refsearch`'s exact solutions at nonces 0 and 1, three repetitions
-each, all six exiting 0 with `quality: 1000000`:
+Measured, `refsearch`'s exact solutions at nonces 0 and 1, five repetitions each,
+all exiting 0 with `quality: 1000000`, first excluded as cold (n=9):
 
-```
-3.791  3.308  3.322  3.290  3.278  3.245   (s)
-excluding the cold first run: mean 3.289 s, sd 0.026 s
-```
+| phase | mean | sd |
+|---|---|---|
+| process + CUDA context + PTX JIT | 2005.6 ms | 25.9 |
+| `generate_instance` — database 700k + queries 7k | 768.3 ms | 3.2 |
+| `evaluate_solution` — the recall audit, 1,000 samples | **90.9 ms** | 0.5 |
+| in-process total | 2864.7 ms | 28.2 |
+| **shell-observed process wall** | **3252.4 ms** | 35.2 |
+
+(An earlier, uninstrumented set of 5 warm runs gave 3288.7 ms, sd 25.6 — the two
+agree to 1.1 %.)
+
+**Only 91 ms of the 3.25 s is the audit the verifier exists to do.** The other
+97 % is process setup and regenerating an instance the runtime had already
+generated moments earlier.
 
 So the benchmarker's real per-nonce cost, excluding search:
 
 | | runtime | verifier | total |
 |---|---|---|---|
-| pre-split | 3.239 s | 3.289 s | **6.53 s** |
-| post-split | 0.165 s | 3.289 s | **3.45 s** |
+| pre-split | 3.239 s | 3.252 s | **6.49 s** |
+| post-split (`batch_size` 8) | 0.378 s | 3.252 s | **3.63 s** |
 
-**1.9x, not 24x.** After the split, **95 % of the benchmarker's per-nonce
+**1.8x, not 24x.** After the split, **90 % of the benchmarker's per-nonce
 overhead is the verifier**, and the runtime — the thing this design optimises —
-is 5 %. The design's economic case is sound in direction and correct about the
+is 10 %. The design's economic case is sound in direction and correct about the
 runtime, but the end-to-end benefit it implies is roughly an order of magnitude
 optimistic, because the verifier regenerates per nonce exactly what the split
 was built to stop regenerating per nonce.
 
 This is a finding about the design, not a defect in the implementation. It is
 also the obvious next lever: the same `Database`/`for_nonce` split already exists
-in `tig-challenges`, so a batched verifier would take the same 3.289 s down to
-roughly `2.8/20 + small`, by the same argument and the same code.
+in `tig-challenges`, and the verifier's amortisable share is now measured
+(2005.6 ms setup + the database part of the 768.3 ms regeneration) against a
+91 ms irreducible audit. **A batched verifier at `batch_size` 8 would cost
+roughly `(2006 + 766)/8 + ~2 + 91 = 440 ms/nonce` — that is a derivation from
+measured parts, not a measurement**; no batched verifier exists. If it is ever
+built, §5.3 says what happens to `alpha`.
 
 ---
 
@@ -599,19 +809,24 @@ roughly `2.8/20 + small`, by the same argument and the same code.
   premise — which is what makes the split worth doing at all — is untested. Every
   number here is either a floor (`nullstub`) or an unrepresentative upper anchor
   (`refsearch`, brute force, 112x `there_v10`'s fuel).
-- **Any card other than an RTX 3060.** No T4, no 4060. §6.4's T4 fit and §5.3's
-  1.25x derate are arithmetic on published specifications.
+- **Any card other than an RTX 3060.** No T4, no 4060. §6.4's T4 fit and §5.4's
+  1.25x derate are arithmetic on published specifications. In particular the
+  2.0 s `CudaContext::new` (§2.2), which is the single largest term in `delta`,
+  is a property of this host and driver and is not known to generalise.
 - **Any scenario other than `SIFT_128`.** This branch has one. Mainnet's live
   config still lists five tracks with `num_nonces_per_bundle` of 20/17/15/10/5.
-  If a larger scenario is ever added with a small bundle size, §3.3's
-  amortisation gets much worse in both directions at once — a bigger database to
-  generate, divided over fewer nonces. At a hypothetical 1.5M-row scenario with a
-  5-nonce bundle, linear extrapolation puts `t_new` near 0.8 s/nonce rather than
-  0.165 s, which would move `alpha` by roughly 5x. **Extrapolation, not
-  measurement** — flagged because the constants in §5 would need revisiting.
+  If a larger scenario is ever added, §3.3's amortisation gets worse: a bigger
+  database to generate, divided over the same `batch_size`. At a hypothetical
+  1.5M-row scenario, linear extrapolation puts `t_new` near 0.6 s/nonce at
+  `batch_size` 8 rather than 0.378 s. **Extrapolation, not measurement** —
+  flagged because the constants in §5 would need revisiting.
 - **`build_index` under real memory pressure.** The balloon was never made to
   bite: `nullstub` allocates nothing inside the cap.
+- **The 36 % fuel discrepancy of §5.1** is explained by a plausible mechanism
+  that could not be reproduced, not by a verified cause.
 - **`R` for anything but one memory-bound kernel.** §5.1.
+- **A batched verifier**, and therefore the 440 ms figure in §8 and the
+  batched-verifier row in §5.2.
 - **The reaper's effect on longer runs.** Two runs were SIGKILLed at ~23 s
   (`C_leg1`, exit 137, no output; `C_bat4`, killed inside its first nonce) by
   gpuq's orphan-CUDA sweep, which kills any containerised CUDA process alive when
@@ -628,12 +843,52 @@ roughly `2.8/20 + small`, by the same argument and the same code.
 
 | constant | value | derivation |
 |---|---|---|
-| `build_fuel_alpha` | **0.005** | `delta * R / (2 * max_fuel_budget) / 1.25` = `3.0739 * 2.0874e10 / 1e13 / 1.25` |
-| `max_build_fuel_budget` | **1.0e13** | 600 s watchdog x `R`, derated 1.25x for a T4 |
+| `build_fuel_alpha` | **0.003** | `delta * R_low / (2 * max_fuel_budget) / 1.25` = `2.8607 * 1.5360e10 / 1e13 / 1.25` = 3.52e-3, rounded down |
+| `max_build_fuel_budget` | **7.0e12** | `600 s * R_low / 1.25` = 7.37e12, rounded down so the fuel cap binds before the watchdog |
 | memory cap | **8 GiB** unchanged | not contradicted (1,010 MiB measured floor); not confirmed for a real index |
-| build watchdog | **600 s** unchanged | 8.3 % of a 7,200 s lifespan |
+| build watchdog | **600 s** unchanged | safety net; never the binding limit at these constants |
 
 `build_fuel_alpha * num_nonces * fuel_budget` must still be computed in `u128` or
 with `checked_mul`, and `max_build_fuel_budget * gpu_fuel_scale < u64::MAX` must
-still be asserted at config load; `1.0e13 * 20 = 2.0e14` passes with five orders
+still be asserted at config load; `7.0e12 * 20 = 1.4e14` passes with five orders
 of margin.
+
+**Revisit these constants if any of the following changes:** the verifier is
+batched (§5.3); `CudaContext::new` falls below ~1.6 s on the deployment hardware
+(§2.5); a scenario larger than `SIFT_128` is added (§9); or the 36 % fuel
+discrepancy of §5.1 is resolved in favour of the higher rate, in which case 0.005
+is justified.
+
+---
+
+## 11. Revision history
+
+**2026-08-31, after review.** Substantive changes:
+
+- **§2.2/§2.3/§2.4 are new.** The first draft attributed the 2,078 ms startup to
+  PTX JIT without decomposing it. Measured: it is 2,005 ms of `CudaContext::new`;
+  JIT is 4.7 ms with the cache warm and 479 ms with `CUDA_CACHE_DISABLE=1`, and
+  the cache is populated and hit. Confirmed in the exact production shape (one
+  long-lived container, `docker exec` per nonce), where `t_old` is 3,310 ms — so
+  the 3,238.8 ms used in the arithmetic is conservative. §2.5 adds the
+  sensitivity of `delta` and `alpha` to that term.
+- **§3.3 rewritten.** The amortisation denominator is the operator's
+  power-of-two `batch_size` (shipped default **8**), not `num_nonces_per_bundle`.
+  The headline `t_new` moves from 0.165 s (`batch_size` 20) to **0.378 s**
+  (`batch_size` 8); `delta` moves 7 %.
+- **§5.1 extended** with the 36 % discrepancy against the 2026-08-14 `3.84e11`
+  figure, what was checked, and the mechanism that plausibly explains it. The
+  lower rate is now carried through the recommendation.
+- **`alpha` revised 0.005 -> 0.003** and `max_build_fuel_budget` **1.0e13 ->
+  7.0e12**, from `batch_size` 8 and `R_low` (both conservative directions).
+  §5.4's behaviour table now applies the fuel cap as well as the watchdog.
+- **§5.3 is new**: the tension between the `alpha` justification and §8's own
+  recommendation to batch the verifier, with the number `alpha` would have to
+  become.
+- **§8 extended** with the verifier's measured decomposition (2006 / 768 / 91 ms)
+  and the batched-verifier figure explicitly labelled a derivation.
+- **§3.4** now labels the D5 copy figure and the 17 % ratio as upper bounds, and
+  notes the phase includes the allocation.
+- Corrected: 6.53 -> 3.46 s became 6.49 -> 3.63 s (`batch_size` 8, and the
+  verifier value from the larger sample); "34.7 % of total work" was
+  build/(query+verify), now given as both.
