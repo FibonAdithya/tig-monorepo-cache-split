@@ -142,6 +142,22 @@ fn main() {
     let matches = cli().get_matches();
 
     if let Some(sub) = matches.subcommand_matches("build-index") {
+        // Same reasoning as the `batch` guard below: an argument that parses
+        // and is then ignored is the silent-wrong-answer class. Both of these
+        // have a `default_value`, so "supplied" has to mean *explicitly passed
+        // on the command line* -- `get_one` cannot tell the difference and
+        // would reject every invocation.
+        for flag in ["memory-cap", "build-timeout"] {
+            if sub.value_source(flag) == Some(clap::parser::ValueSource::CommandLine) {
+                eprintln!(
+                    "Runtime Error: --{} is parsed but not enforced yet (Task 5 wires it); \
+                     refusing rather than silently ignoring it",
+                    flag
+                );
+                std::process::exit(84);
+            }
+        }
+
         // Must exit non-zero, not fall through: a `--features c005` build has
         // `cuda` but no `c004`, and a bare `return` here would exit 0 having
         // built nothing.
@@ -183,6 +199,17 @@ fn main() {
         // non-zero here is deliberate -- a silent exit 0 would be
         // indistinguishable from a batch that ran.
         eprintln!("Runtime Error: the 'batch' subcommand is not implemented yet");
+        std::process::exit(84);
+    }
+
+    // `--index` is declared on the root command but nothing reads it yet, so
+    // without this guard `tig-runtime S H 7 lib.so --index blob` would exit 0
+    // having solved *without* the index and no caller could tell.
+    if matches.value_source("index") == Some(clap::parser::ValueSource::CommandLine) {
+        eprintln!(
+            "Runtime Error: --index is parsed but not loaded yet (Task 6 wires it); \
+             refusing rather than solving without the index"
+        );
         std::process::exit(84);
     }
 
@@ -525,6 +552,18 @@ pub fn load_module(path: &PathBuf) -> Result<Library> {
     }
 }
 
+/// The path `build_index` writes to before renaming into place. Appends
+/// `.tmp` rather than replacing the extension: `with_extension("tmp")` maps
+/// both `idx.blob` and `idx.bin` onto the same `idx.tmp`, so two concurrent
+/// builds writing different outputs in one directory would collide. Staying in
+/// the same directory keeps the rename atomic and same-filesystem.
+#[cfg(any(feature = "c004", test))]
+fn index_tmp_path(index_out: &std::path::Path) -> PathBuf {
+    let mut tmp = index_out.to_path_buf().into_os_string();
+    tmp.push(".tmp");
+    PathBuf::from(tmp)
+}
+
 #[cfg(feature = "c004")]
 pub fn build_index(
     settings: String,
@@ -645,7 +684,7 @@ pub fn build_index(
 
     // Atomic: a watchdog kill must never leave a partial blob for the query
     // process to load.
-    let tmp = index_out.with_extension("tmp");
+    let tmp = index_tmp_path(&index_out);
     fs::write(&tmp, &blob)?;
     fs::rename(&tmp, &index_out)?;
     eprintln!(
@@ -784,7 +823,34 @@ mod tests {
                 "0",
             ])
             .unwrap_err();
+        // `contains("num-nonces")` alone is satisfied by clap's "unexpected
+        // argument '--num-nonces'", so deleting the argument outright would
+        // leave this test green. Pin the error *kind* to the range check, and
+        // pin the positive case too: an argument that rejects everything
+        // would also satisfy an assertion about rejection.
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ValueValidation,
+            "0 must be rejected by the range check (ValueValidation), not by the \
+             argument being absent (UnknownArgument); got: {}",
+            err
+        );
         assert!(err.to_string().contains("num-nonces"), "got: {}", err);
+
+        let m = cli()
+            .try_get_matches_from(vec![
+                "tig-runtime",
+                "batch",
+                "{}",
+                "hash",
+                "lib.so",
+                "--start-nonce",
+                "0",
+                "--num-nonces",
+                "1",
+            ])
+            .expect("a batch of one nonce must parse");
+        assert_eq!(*m.subcommand_matches("batch").unwrap().get_one::<u64>("num-nonces").unwrap(), 1);
     }
 
     #[test]
@@ -805,5 +871,88 @@ mod tests {
             .unwrap();
         assert_eq!(m.subcommand_name(), None);
         assert_eq!(*m.get_one::<u64>("NONCE").unwrap(), 7);
+    }
+
+    #[test]
+    fn build_index_never_derives_a_nonce_seed() {
+        // A source-level assertion, deliberately, and it is the right tool for
+        // this one property specifically:
+        //
+        //   * The claim is structural -- "a build process cannot obtain a
+        //     nonce" -- not behavioural. Nothing observable at runtime
+        //     distinguishes a build that could have derived a query seed from
+        //     one that could not.
+        //   * `build_index` is `#[cfg(feature = "c004")]` and is therefore not
+        //     even compiled in the `--features c001` lane these tests run in,
+        //     so no ordinary test can call it or link against it.
+        //   * Adding `settings.calc_seed(&rand_hash, 0)` to `build_index`
+        //     today leaves every other test in this file green. That single
+        //     mutation silently destroys the anti-gaming guarantee the whole
+        //     index-build design rests on, and this is the only thing that
+        //     catches it.
+        //
+        // The slicing below fails loudly if it cannot locate the function --
+        // a source scan that silently matches nothing is worse than no test.
+        const SRC: &str = include_str!("main.rs");
+
+        // The needle is assembled with `concat!` on purpose: written as one
+        // literal it would appear verbatim in this test's own source, `find`
+        // would match *here* instead of at the definition, and the scan would
+        // silently examine the wrong function. Split, the literal never occurs
+        // in the file as a contiguous string except at the real definition.
+        const NEEDLE: &str = concat!("pub fn ", "build_index(");
+        assert_eq!(
+            SRC.matches(NEEDLE).count(),
+            1,
+            "expected exactly one `{}` in main.rs; the scan cannot tell which \
+             one to bound",
+            NEEDLE
+        );
+        let start = SRC.find(NEEDLE).expect(
+            "could not find the definition of build_index in main.rs -- it was \
+             renamed or removed; fix this test rather than letting it scan the \
+             wrong slice",
+        );
+        let rest = &SRC[start..];
+        // Inside the function every closing brace is indented; the first
+        // brace alone on a line at column 0 is the function's own.
+        let end = rest.find("\n}\n").expect(
+            "could not find the closing brace of `build_index` -- the source \
+             layout changed and this test can no longer bound the function",
+        );
+        let body = &rest[..end];
+
+        // Guard against a slice that is technically non-empty but does not
+        // actually contain the function.
+        assert!(
+            body.len() > 500 && body.contains("index_out"),
+            "sliced {} bytes that do not look like build_index's body",
+            body.len()
+        );
+
+        assert!(
+            body.contains("calc_db_seed("),
+            "build_index must derive the nonce-free database seed"
+        );
+        assert!(
+            !body.contains("calc_seed("),
+            "build_index must never derive a per-nonce seed: the build process \
+             having no way to compute a query set is the anti-gaming property \
+             the whole design rests on"
+        );
+    }
+
+    #[test]
+    fn the_index_temp_file_appends_rather_than_replacing_the_extension() {
+        // `with_extension("tmp")` collapses idx.blob and idx.bin onto one
+        // idx.tmp, so two builds in one directory would race on the same
+        // temp path while renaming to different outputs.
+        let a = index_tmp_path(std::path::Path::new("/x/idx.blob"));
+        let b = index_tmp_path(std::path::Path::new("/x/idx.bin"));
+        assert_eq!(a, PathBuf::from("/x/idx.blob.tmp"));
+        assert_ne!(a, b, "distinct outputs must not share a temp path");
+        // Same directory, or the rename is neither atomic nor guaranteed
+        // same-filesystem.
+        assert_eq!(a.parent(), std::path::Path::new("/x/idx.blob").parent());
     }
 }
