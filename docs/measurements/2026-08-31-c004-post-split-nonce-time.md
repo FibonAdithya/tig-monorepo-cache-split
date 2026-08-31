@@ -189,8 +189,11 @@ between each stage, first run of each container excluded as cold:
 throwaway container, gives 2017.9 ms; the phase-A mean of 2077.7 ms over 21 runs
 is used elsewhere in this note and agrees to 3 %.)
 
-**96 % of startup is CUDA primary-context creation.** Every other term together
-is 15 ms.
+**`CudaContext::new` is 99.3 % of that 2,019.9 ms subtotal; every other term
+together is 14.9 ms.** Measured against the phase-A startup mean of 2,077.7 ms
+used elsewhere in this note the share is 96.5 %, with a 72.7 ms complement — the
+extra 58 ms is the difference between the two runs' means, not a stage this table
+omits. Both framings appear in this document; they differ only in denominator.
 
 ### 2.3 The JIT cache works; it is not the explanation
 
@@ -248,9 +251,16 @@ t_old(s) = 3.2388 - (2.0777 - s)          t_new(s) = (s + 0.7656)/8 + 0.022711
 All three bound columns use the conservative `R_low` (§5.1). Read against the
 recommended `alpha` = 0.003:
 
-- **The net-win property never breaks.** Even with per-process startup at zero,
-  the bare net-win bound is 0.00320 > 0.003. The split still beats the pre-split
-  baseline at every precommit size for any startup cost whatsoever.
+- **At `batch_size` 8 the net-win property never breaks.** Even with
+  per-process startup at zero, the bare net-win bound is 0.00320 > 0.003, so the
+  split still beats the pre-split baseline at every precommit size for any
+  startup cost whatsoever. **This is a `batch_size` 8 statement and does not
+  generalise to every legal `batch_size`.** At `s` = 0 the bare bound is 0.00320
+  at `batch_size` 8, 0.00291 at 4, 0.00232 at 2 and 0.00115 at 1 — so an operator
+  running the legal `batch_size` 4 on a host with zero process-startup cost would
+  sit below break-even. At the *measured* startup the bound is 0.00879 (bs 8),
+  0.00770 (bs 4) and 0.00551 (bs 2), so it holds for every `batch_size` >= 2, and
+  fails only at `batch_size` 1, which is not batching at all.
 - **With the 1.25x T4 derate**, 0.003 holds down to `CudaContext::new` ~= 204 ms
   — a 10x reduction from what is measured.
 - **The full 2x margin** holds down to ~1,600 ms, i.e. a 21 % reduction. That is
@@ -431,7 +441,12 @@ The spec's qualitative conclusion survives — a **flat** 10-minute cap is a foo
 at the protocol floor — but the floor is 2.4x worse rather than 6.3x worse, and
 the crossover is at 210 nonces rather than ~520. Under the proportional rule at
 the recommended `alpha` the footgun does not arise at all (§5.4): the build is
-never more than 0.42x the wall-clock it saves, at any precommit size.
+**never more than 0.43x** the wall-clock it saves, at any precommit size. That
+ratio is `alpha * F / (R * delta)` below the fuel cap and falls further above it,
+so it is a ceiling — and it is rounded *up* from the most conservative basis.
+Its value depends on which rate is assumed: **0.26 at `R_measured`, 0.35 at
+`R_low`, 0.43 at `R_low` with the T4 derate.** The §5.4 table, which is sized on
+`R_measured` and `R_low`, corresponds to the first two.
 
 ---
 
@@ -522,17 +537,24 @@ Row 2 counts the verifier's 3.25 s as legitimate work — while §8 of this same
 note recommends **batching the verifier**, which would remove most of it. That is
 a real tension and it is stated rather than buried.
 
-Using the verifier's measured decomposition (§8: 2006 ms setup, 768 ms
-regeneration, 91 ms audit) and the same batching argument as the runtime, a
-batched verifier at `batch_size` 8 would cost roughly
-`(2006 + 768)/8 + ~2 + 91 = 440 ms/nonce` — a **derivation from measured parts,
-not a measurement of a batched verifier, which does not exist.** At that value
-the row-2 bound falls from 0.01516 to **0.00341** (`R_measured`) or **0.00251**
-(`R_low`).
+Using the verifier's measured decomposition (§8: 2005.6 ms setup, 768.3 ms
+`generate_instance` of which 765.6 ms is the database and 2.7 ms the queries,
+90.9 ms audit) and the same batching argument as the runtime — only the setup and
+the database half amortise — a batched verifier at `batch_size` 8 would cost
+
+```
+(2005.6 + 765.6)/8 + 2.7 + 90.9 = 440.0 ms/nonce
+```
+
+— a **derivation from measured parts, not a measurement of a batched verifier,
+which does not exist.** At that value the row-2 bound falls from 0.01516 to
+**0.00342** (`R_measured`) or **0.00251** (`R_low`).
 
 **So: `alpha` must be recut if the verifier is ever batched.** The recommended
-0.003 survives that change at `R_measured` with 12 % to spare and violates it by
-19 % at `R_low`. The net-win bound (row 1), which is the primary constraint, is
+0.003 survives that change at `R_measured` (88 % of the bound) and exceeds it at
+`R_low` (119 % of it). The overshoot is soft: it means the build would be 54 %
+rather than under 50 % of query+verify work, on a rate that is itself a hedge
+against a verifier that does not exist. The net-win bound (row 1), which is the primary constraint, is
 unaffected by verifier batching in either case, and 0.003 clears it by 4x.
 
 ### 5.4 The recommended value
@@ -547,13 +569,28 @@ alpha = delta * R_low / (2 * F) / 1.25
       = 3.52e-3   ->   alpha = 0.003
 ```
 
+> **What the 1.25x T4 derate is and is not doing here.** In the net-win bound
+> `alpha <= delta * R / F` it is *not* a physical correction — it is extra
+> margin. On a uniformly 1.25x slower card `delta` rises by 1.25x (the saving is
+> wall-clock on that card) at the same time as `R` falls by 1.25x, so the product
+> `delta * R` is invariant and the bound does not move. Derating `R` while
+> holding `delta` at its 3060 value prices the *build* at T4 speed and the
+> *saving* at 3060 speed, which is safe but self-cancelling conservatism rather
+> than a needed adjustment. The derate **is** genuinely required in §5.5, where
+> the 600 s watchdog is an absolute wall-clock number that does not scale with
+> the card, so the fuel that must fit inside it really does shrink on slower
+> hardware. Do not remove it from §5.5; treat it in §5.4 as one of the two
+> margins, alongside the /2.
+
 **Recommended `alpha` = 0.003 (3e-3)**, against the provisional 0.25 — 83x
 smaller. Each digit of that reduction is traceable: 0.01194 is the bare net-win
 bound at `R_measured`; halving it for margin gives 0.00597; derating for a T4
 gives 0.00478; taking the older `R_low` datum instead gives 0.00352; rounding
 down to a clean value gives 0.003. A reader who rejects the `R_low` datum (§5.1)
-can justify 0.005 instead; a reader who wants the batched-verifier future covered
-at `R_low` too needs 0.0025.
+lands on 0.00478 and, by the same round-down convention, would ship **0.004** —
+not 0.005, which was this note's pre-revision value and reached 0.005 only
+because the pre-revision chain ended at 5.13e-3. A reader who wants the
+batched-verifier future covered at `R_low` too needs 0.0025.
 
 Behaviour at `alpha` = 0.003, `F` = 5e12, `max_build_fuel_budget` = 7.0e12
 (§5.5), 600 s watchdog, `batch_size` 8 — **this table applies all three limits,
@@ -722,33 +759,48 @@ code.)
 
 The build is serial latency ahead of the precommit's first nonce, because it
 cannot start until `rand_hash` is known. At the 600 s watchdog ceiling that is
-**600 / 7200 = 8.3 % of the lifespan**; at the recommended `alpha` it is at most
-335 s (4.7 %) on this card, or 456 s (6.3 %) at `R_low`.
+**600 / 7200 = 8.3 % of the lifespan**; at the recommended `alpha` the build is
+capped by `max_build_fuel_budget` at 335 s (4.7 %) on this card, or 456 s (6.3 %)
+at `R_low`, so the watchdog ceiling is never reached.
+
+**The build cost below is always the one `alpha` authorises at that row's own
+`N`**, which matters because the budget is proportional to `N`: at the 80-nonce
+floor it is 1.20e12 fuel (57.5 s at `R_measured`, 78.1 s at `R_low`), while at
+~1,900 nonces it has hit the 7.0e12 fuel cap (335.3 s / 455.7 s). Both rates are
+shown, since the rest of this note sizes constants on `R_low`.
 
 A whole 80-nonce floor precommit at `alpha` = 0.003 and `batch_size` 8 (10
 batches), including the per-nonce verifier (§8):
 
-| solver | total | % of lifespan | margin | headroom |
-|---|---|---|---|---|
-| `nullstub` floor | 348 s | 4.8 % | 6,852 s | 20.7x |
-| `refsearch` (25 s/nonce brute force) | 2,348 s | 32.6 % | 4,852 s | 3.1x |
+| solver | rate | build | total | % of lifespan | margin | headroom |
+|---|---|---|---|---|---|---|
+| `nullstub` floor | `R_measured` | 57.5 s | 347.9 s | 4.8 % | 6,852 s | 20.7x |
+| `nullstub` floor | `R_low` | 78.1 s | 368.6 s | 5.1 % | 6,831 s | 19.5x |
+| `refsearch` (25 s/nonce brute force) | `R_measured` | 57.5 s | 2,348.0 s | 32.6 % | 4,852 s | 3.1x |
+| `refsearch` | `R_low` | 78.1 s | 2,368.6 s | 32.9 % | 4,831 s | 3.0x |
 
-Nonce ceiling within one lifespan, after the build:
+Nonce ceiling within one lifespan. Each row solves
+`N*(t_new + S + t_verify) + min(alpha*N*F, 7.0e12)/R = 7200` for `N`, so the
+build is sized at that row's own `N` rather than borrowed from another:
 
-| solver | post-split | pre-split (no build) |
-|---|---|---|
-| `nullstub` floor | 1,967 nonces | 1,109 nonces |
-| `refsearch` | 249 nonces | 229 nonces |
+| solver | rate | build at that N | what caps it | post-split | pre-split (no build) |
+|---|---|---|---|---|---|
+| `nullstub` floor | `R_measured` | 335.3 s | fuel cap | **1,890** | 1,109 |
+| `nullstub` floor | `R_low` | 455.7 s | fuel cap | **1,857** | 1,109 |
+| `refsearch` | `R_measured` | 176.3 s | `alpha` | **245** | 229 |
+| `refsearch` | `R_low` | 237.5 s | `alpha` | **243** | 229 |
 
 **Finding: the build does not consume a large fraction of the lifespan.** Open
 question 2 can be closed: a whole 80-nonce floor precommit including its build
-and its per-nonce verification uses 348 s of the 7,200 s lifespan — **20.7x
-headroom** — and even a brute-force solver leaves 4,852 s of margin. The lifespan
-is not the binding constraint; amortisation is, and so is the verifier.
+and its per-nonce verification uses 348 s of the 7,200 s lifespan at
+`R_measured` and 369 s at `R_low` — **19.5x to 20.7x headroom** — and even a
+brute-force solver leaves ~4,850 s of margin. The lifespan is not the binding
+constraint; amortisation is, and so is the verifier.
 
-The `refsearch` row is the honest warning attached to that: for an expensive
-solver the split barely raises the nonce ceiling (249 vs 229), because the
-ceiling is then set by search and verification, not by instance generation.
+The `refsearch` rows are the honest warning attached to that: for an expensive
+solver the split barely raises the nonce ceiling (245 vs 229, or 243 vs 229),
+because the ceiling is then set by search and verification, not by instance
+generation.
 
 ---
 
@@ -796,8 +848,10 @@ also the obvious next lever: the same `Database`/`for_nonce` split already exist
 in `tig-challenges`, and the verifier's amortisable share is now measured
 (2005.6 ms setup + the database part of the 768.3 ms regeneration) against a
 91 ms irreducible audit. **A batched verifier at `batch_size` 8 would cost
-roughly `(2006 + 766)/8 + ~2 + 91 = 440 ms/nonce` — that is a derivation from
-measured parts, not a measurement**; no batched verifier exists. If it is ever
+`(2005.6 + 765.6)/8 + 2.7 + 90.9 = 440.0 ms/nonce` — the setup and the database
+half amortise, the 2.7 ms of query generation and the 90.9 ms audit do not. That
+is a derivation from measured parts, not a measurement**; no batched verifier
+exists. §5.3 uses this same formula. If it is ever
 built, §5.3 says what happens to `alpha`.
 
 ---
@@ -856,12 +910,29 @@ of margin.
 **Revisit these constants if any of the following changes:** the verifier is
 batched (§5.3); `CudaContext::new` falls below ~1.6 s on the deployment hardware
 (§2.5); a scenario larger than `SIFT_128` is added (§9); or the 36 % fuel
-discrepancy of §5.1 is resolved in favour of the higher rate, in which case 0.005
-is justified.
+discrepancy of §5.1 is resolved in favour of the higher rate, in which case the
+chain ends at 0.00478 and, rounded down, **0.004** is justified.
 
 ---
 
 ## 11. Revision history
+
+### Known imprecisions, reviewed and deliberately not chased
+
+Each was raised in review, checked, and judged too small or too benign to be
+worth another round. Recorded so they are not rediscovered as new findings.
+
+| # | Item | Direction and size |
+|---|---|---|
+| 1 | `t_old` is a shell-observed wall while `t_new` is built from in-process phases, so the two are not on the same measurement plane. Fully consistent accounting gives `delta` = 2.8703 s. | This note's 2.8607 s is **0.3 % conservative**; no constant moves. |
+| 2 | `docker exec` client overhead appears as 392 ms (§2.1 shell minus in-process) and 493.7 ms (§2.4). Unreconciled. | Both are excluded from `delta`; excluding a real per-nonce pre-split cost is conservative. |
+| 3 | The verifier's `generate_instance` implies ~2.7 ms for 7,000 queries, while §3.4 measures 20–27 ms for the same 7,000 queries in the runtime. A 7x gap; one of the two attributions is wrong. | Using the smaller figure in §5.3/§8 makes the batched verifier look *cheaper*, i.e. makes the `alpha` bound *tighter*. Benign direction. |
+| 4 | §5.4's "% of query+verify" column and §7's headline 348 s use `R_measured`, in a document that otherwise sizes constants on `R_low`. | Both now show the `R_low` figure alongside; the mixed basis is flagged in place rather than removed. |
+| 5 | §2.1's n=20 baseline set includes what looks like one cold run (max 3,646 ms against a 3,239 ms mean). Excluding it raises `delta` and gives `alpha` = 3.49e-3. | Still rounds down to 0.003. Keeping the run is conservative. |
+| 6 | §2.5's `s` = 2,497 ms row double-counts the 4.7 ms of warm JIT that the 479 ms cold-JIT figure replaces. | 4.7 ms on a 2,497 ms row. |
+| 7 | §2.4 differences an n=11 mean against an n=10 mean to get the `docker exec` overhead. | See #2; the quantity is not used in any constant. |
+
+### Changes
 
 **2026-08-31, after review.** Substantive changes:
 
@@ -892,3 +963,32 @@ is justified.
 - Corrected: 6.53 -> 3.46 s became 6.49 -> 3.63 s (`batch_size` 8, and the
   verifier value from the larger sample); "34.7 % of total work" was
   build/(query+verify), now given as both.
+
+**2026-08-31, fix round 2 (arithmetic and prose only; no new measurement).**
+Six errors introduced by fix round 1, four of them optimistic:
+
+- **§7's nonce-ceiling table applied the 80-nonce build budget (57.5 s) to rows
+  of ~1,900 and ~245 nonces.** Every row now solves for `N` with the build sized
+  at that row's own `N` and both rates shown: 1,890 / 1,857 (`nullstub`) and
+  245 / 243 (`refsearch`). The floor-precommit table also gains its `R_low` row
+  (368.6 s, 5.1 %, 19.5x).
+- **§4.3's "never more than 0.42x" rounded a ceiling down** and did not state its
+  rate basis. Now 0.43x, with 0.26 / 0.35 / 0.43 given for `R_measured` /
+  `R_low` / `R_low` + derate.
+- **§5.4's fallback said "can justify 0.005"**, which rounds *up* against this
+  note's own convention. That branch derives 0.00478, so it is 0.004. §10 too.
+- **§2.2 said "96 % ... every other term together is 15 ms"**, which cannot both
+  be true. Against the table's own 2,019.9 ms subtotal it is 99.3 % and 14.9 ms;
+  against the phase-A 2,077.7 ms mean it is 96.5 % and 72.7 ms. Both stated.
+- **§5.3 and §8 gave different formulas** for the batched verifier. Both now use
+  §8's, which is the correct one: `(2005.6 + 765.6)/8 + 2.7 + 90.9 = 440.0 ms`.
+- **§5.4 gains a note that the 1.25x T4 derate is self-cancelling in the net-win
+  bound** — `delta` rises and `R` falls by the same factor — so it is extra
+  margin there, while in §5.5 it is a real correction, because the 600 s watchdog
+  is absolute wall-clock. It should not be removed from §5.5.
+- **§2.5's "for any startup cost whatsoever" now carries "at `batch_size` 8"**,
+  with the bounds by `batch_size` at `s` = 0 (0.00320 / 0.00291 / 0.00232 /
+  0.00115 at bs 8 / 4 / 2 / 1) and at the measured startup (holds for every
+  `batch_size` >= 2).
+
+Constants unchanged: `build_fuel_alpha` = 0.003, `max_build_fuel_budget` = 7.0e12.
