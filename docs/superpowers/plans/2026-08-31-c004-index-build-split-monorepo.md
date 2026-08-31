@@ -22,23 +22,32 @@
   docker run --rm -v "$(pwd)/tig-benchmarker:/src" -w /src tig-bench-py python -m unittest tests.data -v
   ```
 - **Tasks marked [local] are verified locally.** `cargo test -p tig-structs` and `cargo build -p tig-runtime --features c001` both work here (verified).
-- **`build_so` does not work on `tig-gpu`.** Verified 2026-08-31: `/opt/llvm/bin/opt` and
-  `/opt/llvm/bin/llc` both die with ``version `GLIBC_2.36' not found`` (box is Ubuntu 22.04,
-  glibc 2.35; the LLVM release needs 2.36). So **no task in this plan may build an algorithm
-  `.so` with `build_so`.** Two consequences, both already verified on the box today:
-  - **Stub algorithms are hand-written `cdylib`s built with plain `cargo build --release`**
-    (verified: a `crate-type = ["cdylib"]` crate builds and exports `#[unsafe(no_mangle)]`
-    symbols under `nightly-2025-02-10`). A stub must hand-export the four symbols the runtime
-    looks up — `__fuel_remaining` and `__runtime_signature` (each a `*mut u64`, i.e. the symbol
-    holds a *pointer*, so export `static mut FUEL: u64` plus
-    `#[unsafe(no_mangle)] pub static mut __fuel_remaining: *mut u64 = ...`), `entry_point`, and
-    whichever of `build_index` / `load_index` the step under test needs. Plain `cargo build`
-    skips the LLVM fuel-instrumentation pass, so a stub's **CPU** fuel is never metered; that
-    is fine, because every fuel assertion in this plan is about **GPU** fuel, which comes from
-    the PTX trap and is unaffected.
-  - **Real algorithm binaries come prebuilt.** Task 7 uses `scripts/download_algorithm`, which
-    fetches an already-built `.so`; it never needs `build_so`. `build_ptx` is nvcc-only and
-    still works.
+- **Everything that touches an algorithm `.so` runs inside Docker on `tig-gpu`.** Verified
+  2026-08-31, in this order:
+  - `build_so` **cannot** run on the host: `/opt/llvm/bin/{opt,llc}` die with
+    ``version `GLIBC_2.36' not found`` (host is Ubuntu 22.04, glibc 2.35).
+  - `build_so` **does** work inside the `tig-dev-vector_search` image (Ubuntu 24.04, glibc 2.39,
+    LLVM 19.1.7 with `LLVMFuelRTSig.so`, `nightly-2025-02-10` + `rust-src`, CUDA 12.6). It runs
+    to completion and the `.so` exports `entry_point`, `__fuel_remaining`, `__runtime_signature`.
+    So stubs and real algorithms are built normally, with `build_so`, in the container — and the
+    LLVM fuel instrumentation is real, not stubbed out.
+  - A container-built `.so` **cannot be `dlopen`'d on the host** (``GLIBC_2.39' not found``;
+    the offending symbols are *weak*, which makes it look skippable — it is not, the loader
+    rejects the version reference before symbol binding). Every prebuilt mainnet `.so` from
+    `scripts/download_algorithm` has the same requirement. **Therefore `tig-runtime` itself must
+    also run inside the container** for Tasks 4, 5, 6 and 7.
+  - **`/usr/local/bin/tig-runtime` inside the image is STALE** — baked by a `COPY .` at
+    image-build time. Task 2 changed `tig-runtime` and `tig-challenges`, so every task must
+    `cargo build -r -p tig-runtime --features vector_search` inside the container and invoke the
+    binary it just built, by path. Running the baked binary gives a **silently wrong answer, not
+    a crash.**
+  - Only 4 of 58 `.ll` files get fuel instrumentation (`cudarc` triggers `build_so`'s CUDA
+    whitelist: `std-`, `tig_challenges`, `tig_binary`, `tig_algorithms`). An algorithm's own code
+    is in `tig_algorithms` and *is* instrumented — but do not over-claim fuel coverage.
+  - `build_so` silently clobbers `tig-binary/src/entry_point.rs` on every run.
+  - `build_ptx` is nvcc-only and works on the host or in the container.
+  - The exact verified `docker run` recipes live in the SDD workspace's `gpu-context.md`.
+  - Tasks 3 and 8 need no `.so` and run directly on the host under a `gpu-claim`.
 - **`tig-gpu` is an RTX 3060, 12 GB** (verified 2026-08-31), *not* the 16 GB T4 the spec sizes
   the memory cap against. Any memory measurement taken here is a lower bound on a T4 and must
   say so; a passing 8 GiB cap cannot be demonstrated on this box.
@@ -1154,52 +1163,37 @@ because Step 3 marks all four `.required(true)`. If that changes, these become p
 
 - [ ] **Step 7: Verify end to end on tig-gpu with a stub algorithm**
 
-`build_so` cannot run on this box (see Global Constraints), so the stub is a plain cdylib. Create
-it **outside the workspace** (e.g. `/tmp/stub`) so `cargo test --workspace` never picks it up:
+The stub is a **real algorithm built with `build_so`, inside the container** (see Global
+Constraints — `build_so` works there and only there, and a container-built `.so` cannot be loaded
+on the host, so `tig-runtime` runs in the container too).
+
+Write it as a normal c004 algorithm under `tig-algorithms/src/vector_search/<stub_name>/`, add
+its `pub mod` line to `tig-algorithms/src/vector_search/mod.rs`, and give it a `solve_challenge`
+plus the two new symbols. It needs **Task 4b's `index_build` feature** to export `build_index`
+and `load_index` — `build_so`'s version script hides everything it does not name, so without 4b
+the runtime cannot find them no matter what the source exports. If 4b is not done yet, do it
+first or temporarily add the two names to the version script and say so in your report.
+
+The stub's `build_index` returns `Ok(vec![1, 2, 3])` and its `load_index` returns `Ok(())`.
+Because `build_so` applies the real LLVM fuel pass, this stub's CPU fuel **is** metered, unlike
+the plain-cargo route this plan originally specified.
+
+Remove the stub's `pub mod` line and its directory when the task is done, and say so.
 
 ```bash
-cargo new --lib /tmp/stub && cd /tmp/stub
-cat >> Cargo.toml <<'EOF'
-[lib]
-crate-type = ["cdylib"]
-EOF
-# add anyhow, cudarc (the tig-foundation fork, same rev as the workspace) and
-# tig-challenges by path, with features = ["c004"]
-```
-
-`src/lib.rs` exports exactly what the runtime looks up. `__fuel_remaining` and
-`__runtime_signature` are read as `*mut u64` — the *symbol holds a pointer*, so a bare
-`static mut X: u64` is the wrong shape and the runtime will scribble over the wrong address:
-
-```rust
-static mut FUEL: u64 = 0;
-static mut RTSIG: u64 = 0;
-#[unsafe(no_mangle)] pub static mut __fuel_remaining: *mut u64 = unsafe { &raw mut FUEL };
-#[unsafe(no_mangle)] pub static mut __runtime_signature: *mut u64 = unsafe { &raw mut RTSIG };
-
-#[unsafe(no_mangle)]
-pub fn build_index(
-    _db: &Database, _hp: Option<String>,
-    _m: Arc<CudaModule>, _s: Arc<CudaStream>, _p: &cudaDeviceProp,
-) -> Result<Vec<u8>> { Ok(vec![1, 2, 3]) }
-
-#[unsafe(no_mangle)]
-pub fn load_index(
-    _db: &Database, _blob: &[u8],
-    _m: Arc<CudaModule>, _s: Arc<CudaStream>, _p: &cudaDeviceProp,
-) -> Result<()> { Ok(()) }
-```
-
-Build with `cargo build --release` (no `build_so`, no `-Z build-std`) and use
-`target/release/libstub.so`. Its PTX comes from `build_ptx`, which is nvcc-only and works.
-Because plain `cargo build` skips the LLVM fuel pass, the stub's CPU fuel is never decremented;
-every fuel assertion below is about GPU fuel, which comes from the PTX trap.
-
-```bash
-tig-runtime build-index "$SETTINGS" "$RAND_HASH" /tmp/stub/target/release/libstub.so \
-            --ptx stub.ptx --build-fuel 100000000000 --index-out /tmp/idx.blob
-test -f /tmp/idx.blob && wc -c /tmp/idx.blob
-ls /tmp/idx.tmp 2>/dev/null && echo "BUG: temp file left behind"
+docker run --rm --gpus all -v /workspace/tig-bench:/app -w /app \
+  -e CHALLENGE=vector_search -e RUSTUP_TOOLCHAIN=nightly-2025-02-10 \
+  tig-dev-vector_search bash -c '
+    set -e
+    bash tig-binary/scripts/build_so <STUB>
+    cargo build -r -p tig-runtime --features vector_search   # MANDATORY: baked binary is stale
+    ./target/release/tig-runtime build-index "$SETTINGS" "$RAND_HASH" \
+        tig-algorithms/lib/vector_search/amd64/<STUB>.so \
+        --ptx tig-algorithms/lib/vector_search/ptx/<STUB>.ptx \
+        --build-fuel 100000000000 --index-out /tmp/idx.blob
+    test -f /tmp/idx.blob && wc -c /tmp/idx.blob
+    ls /tmp/idx.tmp 2>/dev/null && echo "BUG: temp file left behind"
+  '
 ```
 Expected: exit 0, `3 /tmp/idx.blob`, and no `.tmp` file left behind.
 
@@ -1313,20 +1307,36 @@ variable, never a string comparison against `"0"`.
 
 - [ ] **Step 3: Prove existing algorithms still build**
 
-`build_so` cannot run on `tig-gpu` (Global Constraints), so this is a **local, static** check —
-say so in the report rather than claiming a build you did not run:
+`build_so` works inside the `tig-dev-vector_search` container (Global Constraints), so this is a
+**real build test**, not a grep. That matters here more than anywhere else in the plan: the whole
+point of this task is that a symbol can be present in the source and still be absent from the
+`.so`, which is exactly what a grep cannot see.
+
+Using any c004 algorithm (the Task 4 stub, or a throwaway one):
 
 ```bash
-# the version script must now list both symbols
-grep -c 'build_index;\|load_index;' tig-binary/scripts/build_so   # expect 2
-# the shims must be behind the feature, so an unfeatured build sees neither
-grep -c 'feature = "index_build"' tig-binary/src/entry_point_template.rs  # expect 2
-# and the default feature set must not turn it on
-grep -A5 '^\[features\]' tig-binary/Cargo.toml | grep -q 'default' && \
-  echo "CHECK: does default include index_build?" || echo "no default feature list"
+docker run --rm -v /workspace/tig-bench:/app -w /app \
+  -e CHALLENGE=vector_search -e RUSTUP_TOOLCHAIN=nightly-2025-02-10 \
+  tig-dev-vector_search bash -c '
+    set -e
+    SO=tig-algorithms/lib/vector_search/amd64/<ALGO>.so
+    # 1. WITHOUT the feature: the two symbols must be ABSENT, and every
+    #    existing algorithm must still build. This is the regression guard.
+    bash tig-binary/scripts/build_so <ALGO>
+    nm -D --defined-only "$SO" | grep -Ec "build_index|load_index"   # expect 0
+    nm -D --defined-only "$SO" | grep -c entry_point                 # expect 1
+    # 2. WITH the feature: both must now be exported.
+    INDEX_BUILD=1 bash tig-binary/scripts/build_so <ALGO>
+    nm -D --defined-only "$SO" | grep -Ec "build_index|load_index"   # expect 2
+  '
 ```
 
-Expected: `2`, `2`, and `index_build` absent from any default feature set.
+Expected: `0`, `1`, then `2`. The first block is what proves the change is backward compatible;
+the second is what proves it does anything. A run that only does the second half has not tested
+the version script at all.
+
+`build_so` clobbers `tig-binary/src/entry_point.rs` on every invocation — back it up first if it
+exists as untracked scratch on the box, and restore it afterwards.
 
 - [ ] **Step 4: Commit**
 
@@ -1415,14 +1425,15 @@ in this tree.
 
 - [ ] **Step 3: Verify the cap holds, on tig-gpu**
 
-Change the stub algorithm's `build_index` to allocate `memory_cap + 256 MB` (same plain-cdylib
-stub as Task 4 Step 7; `build_so` is unavailable). Use a cap small enough to leave room on a
-12 GB RTX 3060:
+Change the stub algorithm's `build_index` to allocate `memory_cap + 256 MB` (same `build_so`
+stub as Task 4 Step 7, rebuilt and run **inside the container** — see Global Constraints). Use a
+cap small enough to leave room on a 12 GB RTX 3060:
 
 ```bash
-tig-runtime build-index "$SETTINGS" "$RAND_HASH" /tmp/stub/target/release/libstub.so \
-            --ptx stub.ptx --build-fuel 100000000000 --memory-cap 2147483648 \
-            --index-out /tmp/idx.blob
+./target/release/tig-runtime build-index "$SETTINGS" "$RAND_HASH" \
+    tig-algorithms/lib/vector_search/amd64/<STUB>.so \
+    --ptx tig-algorithms/lib/vector_search/ptx/<STUB>.ptx \
+    --build-fuel 100000000000 --memory-cap 2147483648 --index-out /tmp/idx.blob
 echo "exit: $?"; ls /tmp/idx.blob 2>/dev/null && echo "BUG: index written"
 ```
 Expected: non-zero exit, an allocation failure from inside `build_index`, and no
@@ -1443,8 +1454,10 @@ works, at a cap the box can hold.
 Change the stub's `build_index` to sleep 10 s, then:
 
 ```bash
-tig-runtime build-index "$SETTINGS" "$RAND_HASH" /tmp/stub/target/release/libstub.so \
-            --ptx stub.ptx --build-fuel 100000000000 --build-timeout 2 --index-out /tmp/idx.blob
+./target/release/tig-runtime build-index "$SETTINGS" "$RAND_HASH" \
+    tig-algorithms/lib/vector_search/amd64/<STUB>.so \
+    --ptx tig-algorithms/lib/vector_search/ptx/<STUB>.ptx \
+    --build-fuel 100000000000 --build-timeout 2 --index-out /tmp/idx.blob
 echo "exit: $?"; ls /tmp/idx.blob /tmp/idx.tmp 2>/dev/null
 ```
 Expected: `exit: 85`, stderr names the watchdog, and neither `idx.blob` nor `idx.tmp` exists.
@@ -1455,8 +1468,10 @@ Change the stub to launch a kernel that burns more than `--build-fuel`, then run
 with a small `--build-fuel`:
 
 ```bash
-tig-runtime build-index "$SETTINGS" "$RAND_HASH" /tmp/stub/target/release/libstub.so \
-            --ptx stub.ptx --build-fuel 1000 --index-out /tmp/idx.blob
+./target/release/tig-runtime build-index "$SETTINGS" "$RAND_HASH" \
+    tig-algorithms/lib/vector_search/amd64/<STUB>.so \
+    --ptx tig-algorithms/lib/vector_search/ptx/<STUB>.ptx \
+    --build-fuel 1000 --index-out /tmp/idx.blob
 echo "exit: $?"; ls /tmp/idx.blob 2>/dev/null && echo "BUG: index written after a fuel trap"
 ```
 Expected: non-zero exit naming `error_stat`, and **no index file** — a partially built index must
@@ -1586,16 +1601,19 @@ and the CPU counter is a process global; if either is not reset per nonce, fuel
 accumulates across a bundle and the batch dies partway through with an
 out-of-fuel exit that names nothing.
 
-On tig-gpu, with a stub algorithm whose `entry_point` launches a kernel burning a fixed, known
-amount of **GPU** fuel and then calls `save_solution` (a plain-cdylib stub as in Task 4 Step 7 —
-`build_so` is unavailable, so the stub's *CPU* fuel is never metered and only the GPU counter is
-under test here; say so in the report):
+Inside the container, with a stub algorithm whose `entry_point` launches a kernel burning a
+fixed, known amount of GPU fuel and then calls `save_solution` (the same `build_so` stub as
+Task 4 Step 7). Because `build_so` applies the real fuel pass, **both** the CPU counter and the
+GPU counter are genuinely under test here — which is what makes this the plan's highest-value
+test.
 
 ```bash
 rm -rf /tmp/batch
-tig-runtime batch "$SETTINGS" "$RAND_HASH" /tmp/stub/target/release/libstub.so \
-            --start-nonce 0 --num-nonces 5 \
-            --ptx stub.ptx --fuel 2000000000 --output /tmp/batch
+./target/release/tig-runtime batch "$SETTINGS" "$RAND_HASH" \
+    tig-algorithms/lib/vector_search/amd64/<STUB>.so \
+    --start-nonce 0 --num-nonces 5 \
+    --ptx tig-algorithms/lib/vector_search/ptx/<STUB>.ptx \
+    --fuel 2000000000 --output /tmp/batch
 python3 - <<'EOF'
 import json, glob
 files = sorted(glob.glob("/tmp/batch/*.json"))
@@ -1619,12 +1637,13 @@ implementation at all.
 
 - [ ] **Step 3: Verify single-nonce output is unchanged**
 
-Use the prebuilt algorithm from Task 7 (`scripts/download_algorithm`) — this step needs a real
-solver, and no `.so` can be built on this box.
+Use a real solver — either the prebuilt algorithm from Task 7 or one you build with `build_so`.
+Both sides must run **inside the container** with the **freshly built** `tig-runtime`, not the
+stale baked one.
 
 ```bash
-tig-runtime "$SETTINGS" "$RAND_HASH" 7 real_algo.so --ptx real.ptx --fuel 2000000000 --output /tmp/a
-tig-runtime batch "$SETTINGS" "$RAND_HASH" real_algo.so --start-nonce 7 --num-nonces 1 --ptx real.ptx --fuel 2000000000 --output /tmp/b
+./target/release/tig-runtime "$SETTINGS" "$RAND_HASH" 7 "$ALGO_SO" --ptx "$ALGO_PTX" --fuel 2000000000 --output /tmp/a
+./target/release/tig-runtime batch "$SETTINGS" "$RAND_HASH" "$ALGO_SO" --start-nonce 7 --num-nonces 1 --ptx "$ALGO_PTX" --fuel 2000000000 --output /tmp/b
 diff /tmp/a/7.json /tmp/b/7.json && echo IDENTICAL
 ```
 Expected: `IDENTICAL`. Note that both sides run the *post-split* runtime, so this checks the
@@ -1682,10 +1701,22 @@ faults.
 ```bash
 export RAND_HASH=norebuildcheck
 export SETTINGS='{"player_id":"audit","block_id":"audit","challenge_id":"c004","algorithm_id":"there_v10","track_id":"<track>"}'
-tig-runtime "$SETTINGS" "$RAND_HASH" 0 there_v10.so --ptx there_v10.ptx \
-            --fuel 2000000000 --output /tmp/norebuild
-echo "exit: $?"
+# Inside the container: the prebuilt .so needs GLIBC_2.39 and the host has 2.35,
+# and the image's baked tig-runtime is stale, so build the runtime first.
+docker run --rm --gpus all -v /workspace/tig-bench:/app -w /app \
+  -e CHALLENGE=vector_search -e RUSTUP_TOOLCHAIN=nightly-2025-02-10 \
+  tig-dev-vector_search bash -c '
+    set -e
+    cargo build -r -p tig-runtime --features vector_search
+    ./target/release/tig-runtime "'"$SETTINGS"'" "'"$RAND_HASH"'" 0 \
+        there_v10.so --ptx there_v10.ptx --fuel 2000000000 --output /tmp/norebuild
+    echo "exit: $?"
+  '
 ```
+
+Note the exit code but judge on the output file: `tig-runtime` has a **pre-existing** teardown
+crash that exits 137/139 *after* the solution is written, reproducible on unmodified binaries
+(found in Task 2). Do not chase it, and do not read it as a failure of the no-rebuild claim.
 `algorithm_id` and `track_id` must be the real ones for the algorithm you downloaded —
 `calc_seed` and `calc_db_seed` both hash the jsonified settings, and an unparseable `track_id`
 fails at dispatch before any of this is exercised. Use the legacy single-nonce form here
