@@ -76,17 +76,163 @@ const AUDIT_TQ: u32 = 18;
 const AUDIT_MAX_DIMS: u32 = 128;
 
 
-impl Challenge {
-    pub fn generate_instance(
-        seeds: &Seeds,
+/// One forward pass of the generator into `dest`.
+///
+/// `index_base` is preserved from the pre-split generator even though the two
+/// halves now use different seeds and no longer need it to separate their
+/// latent streams. Keeping it means `gan_sample_latents` is called exactly as
+/// before, so `kernels.cu` and every algorithm's PTX are untouched.
+fn generate_vectors(
+    seed: &[u8; 32],
+    count: usize,
+    index_base: usize,
+    dest: &mut CudaSlice<f32>,
+    layers: &[generator::Layer],
+    widest: usize,
+    module: Arc<CudaModule>,
+    stream: Arc<CudaStream>,
+) -> Result<()> {
+    let sample_latents_kernel = module.load_function("gan_sample_latents")?;
+    let linear_kernel = module.load_function("gan_linear")?;
+
+    let d_seed = stream.memcpy_stod(seed)?;
+    let mut d_weights = Vec::with_capacity(layers.len());
+    for layer in layers {
+        d_weights.push((
+            stream.memcpy_stod(&layer.weights)?,
+            stream.memcpy_stod(&layer.bias)?,
+        ));
+    }
+
+    let mut d_scratch_a = stream.alloc_zeros::<f32>(FORWARD_CHUNK * widest)?;
+    let mut d_scratch_b = stream.alloc_zeros::<f32>(FORWARD_CHUNK * widest)?;
+    let mut d_latents = stream.alloc_zeros::<f32>(FORWARD_CHUNK * LATENT_DIM)?;
+
+    for chunk_start in (0..count).step_by(FORWARD_CHUNK) {
+        let rows = FORWARD_CHUNK.min(count - chunk_start);
+
+        unsafe {
+            stream
+                .launch_builder(&sample_latents_kernel)
+                .arg(&d_seed)
+                .arg(&(rows as i32))
+                .arg(&(LATENT_DIM as i32))
+                .arg(&mut d_latents)
+                .arg(&((index_base + chunk_start) as i32))
+                .launch(LaunchConfig {
+                    grid_dim: ((rows as u32 + 255) / 256, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+
+        for (i, layer) in layers.iter().enumerate() {
+            let is_last = i + 1 == layers.len();
+            let (d_weight, d_bias) = &d_weights[i];
+            let cfg = LaunchConfig {
+                grid_dim: (
+                    (rows as u32 + 127) / 128,
+                    (layer.out_dim as u32 + 63) / 64,
+                    1,
+                ),
+                block_dim: (16, 16, 1),
+                shared_mem_bytes: 0,
+            };
+            let apply_activation = (!is_last) as i32;
+            let out_row_offset = if is_last { chunk_start as i32 } else { 0 };
+
+            if is_last {
+                let input: &CudaSlice<f32> = if i == 0 {
+                    &d_latents
+                } else if i % 2 == 1 {
+                    &d_scratch_a
+                } else {
+                    &d_scratch_b
+                };
+                unsafe {
+                    stream
+                        .launch_builder(&linear_kernel)
+                        .arg(input)
+                        .arg(d_weight)
+                        .arg(d_bias)
+                        .arg(&mut *dest)
+                        .arg(&(rows as i32))
+                        .arg(&(layer.in_dim as i32))
+                        .arg(&(layer.out_dim as i32))
+                        .arg(&apply_activation)
+                        .arg(&out_row_offset)
+                        .launch(cfg)?;
+                }
+            } else if i == 0 {
+                unsafe {
+                    stream
+                        .launch_builder(&linear_kernel)
+                        .arg(&d_latents)
+                        .arg(d_weight)
+                        .arg(d_bias)
+                        .arg(&mut d_scratch_a)
+                        .arg(&(rows as i32))
+                        .arg(&(layer.in_dim as i32))
+                        .arg(&(layer.out_dim as i32))
+                        .arg(&apply_activation)
+                        .arg(&out_row_offset)
+                        .launch(cfg)?;
+                }
+            } else if i % 2 == 1 {
+                unsafe {
+                    stream
+                        .launch_builder(&linear_kernel)
+                        .arg(&d_scratch_a)
+                        .arg(d_weight)
+                        .arg(d_bias)
+                        .arg(&mut d_scratch_b)
+                        .arg(&(rows as i32))
+                        .arg(&(layer.in_dim as i32))
+                        .arg(&(layer.out_dim as i32))
+                        .arg(&apply_activation)
+                        .arg(&out_row_offset)
+                        .launch(cfg)?;
+                }
+            } else {
+                unsafe {
+                    stream
+                        .launch_builder(&linear_kernel)
+                        .arg(&d_scratch_b)
+                        .arg(d_weight)
+                        .arg(d_bias)
+                        .arg(&mut d_scratch_a)
+                        .arg(&(rows as i32))
+                        .arg(&(layer.in_dim as i32))
+                        .arg(&(layer.out_dim as i32))
+                        .arg(&apply_activation)
+                        .arg(&out_row_offset)
+                        .launch(cfg)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The database half of a c004 instance: the rows every nonce of a precommit
+/// searches. It is derived from `Seeds::db`, which carries no nonce, so it is
+/// constant across a precommit and an index over it can be built once and
+/// amortised over every nonce.
+pub struct Database {
+    pub scenario: Scenario,
+    pub vector_dims: u32,
+    pub database_size: u32,
+    pub d_database_vectors: CudaSlice<f32>,
+}
+
+impl Database {
+    pub fn generate(
+        db_seed: &[u8; 32],
         track: &Track,
         module: Arc<CudaModule>,
         stream: Arc<CudaStream>,
         _prop: &cudaDeviceProp,
     ) -> Result<Self> {
-        // Signature-only for now: c004 still derives the whole instance from
-        // the per-nonce seed. Task 3 splits the database off onto `seeds.db`.
-        let seed = &seeds.nonce;
         let config = ScenarioConfig::from(track.s);
         let weights = weights_from(config.weights)?;
         let layers = &weights.layers;
@@ -104,158 +250,99 @@ impl Challenge {
         }
         let widest = layers.iter().map(|layer| layer.out_dim).max().unwrap();
         let database_size = config.database_size;
-        let n_queries = config.n_queries;
 
-        let sample_latents_kernel = module.load_function("gan_sample_latents")?;
-        let linear_kernel = module.load_function("gan_linear")?;
-
-        let d_seed = stream.memcpy_stod(seed)?;
-        let mut d_weights = Vec::with_capacity(layers.len());
-        for layer in layers {
-            d_weights.push((
-                stream.memcpy_stod(&layer.weights)?,
-                stream.memcpy_stod(&layer.bias)?,
-            ));
-        }
-
-        let mut d_scratch_a = stream.alloc_zeros::<f32>(FORWARD_CHUNK * widest)?;
-        let mut d_scratch_b = stream.alloc_zeros::<f32>(FORWARD_CHUNK * widest)?;
-        let mut d_latents = stream.alloc_zeros::<f32>(FORWARD_CHUNK * LATENT_DIM)?;
         let mut d_database_vectors =
             stream.alloc_zeros::<f32>(database_size as usize * vector_dims)?;
-        let mut d_query_vectors =
-            stream.alloc_zeros::<f32>(n_queries as usize * vector_dims)?;
-
-        for (dest_is_query, count) in [
-            (false, database_size as usize),
-            (true, n_queries as usize),
-        ] {
-            let index_base = if dest_is_query {
-                database_size as usize
-            } else {
-                0
-            };
-
-            for chunk_start in (0..count).step_by(FORWARD_CHUNK) {
-                let rows = FORWARD_CHUNK.min(count - chunk_start);
-
-                unsafe {
-                    stream
-                        .launch_builder(&sample_latents_kernel)
-                        .arg(&d_seed)
-                        .arg(&(rows as i32))
-                        .arg(&(LATENT_DIM as i32))
-                        .arg(&mut d_latents)
-                        .arg(&((index_base + chunk_start) as i32))
-                        .launch(LaunchConfig {
-                            grid_dim: ((rows as u32 + 255) / 256, 1, 1),
-                            block_dim: (256, 1, 1),
-                            shared_mem_bytes: 0,
-                        })?;
-                }
-
-                for (i, layer) in layers.iter().enumerate() {
-                    let is_last = i + 1 == layers.len();
-                    let (d_weight, d_bias) = &d_weights[i];
-                    let cfg = LaunchConfig {
-                        grid_dim: (
-                            (rows as u32 + 127) / 128,
-                            (layer.out_dim as u32 + 63) / 64,
-                            1,
-                        ),
-                        block_dim: (16, 16, 1),
-                        shared_mem_bytes: 0,
-                    };
-                    let apply_activation = (!is_last) as i32;
-                    let out_row_offset = if is_last { chunk_start as i32 } else { 0 };
-
-                    if is_last {
-                        let input: &CudaSlice<f32> = if i == 0 {
-                            &d_latents
-                        } else if i % 2 == 1 {
-                            &d_scratch_a
-                        } else {
-                            &d_scratch_b
-                        };
-                        let destination = if dest_is_query {
-                            &mut d_query_vectors
-                        } else {
-                            &mut d_database_vectors
-                        };
-                        unsafe {
-                            stream
-                                .launch_builder(&linear_kernel)
-                                .arg(input)
-                                .arg(d_weight)
-                                .arg(d_bias)
-                                .arg(destination)
-                                .arg(&(rows as i32))
-                                .arg(&(layer.in_dim as i32))
-                                .arg(&(layer.out_dim as i32))
-                                .arg(&apply_activation)
-                                .arg(&out_row_offset)
-                                .launch(cfg)?;
-                        }
-                    } else if i == 0 {
-                        unsafe {
-                            stream
-                                .launch_builder(&linear_kernel)
-                                .arg(&d_latents)
-                                .arg(d_weight)
-                                .arg(d_bias)
-                                .arg(&mut d_scratch_a)
-                                .arg(&(rows as i32))
-                                .arg(&(layer.in_dim as i32))
-                                .arg(&(layer.out_dim as i32))
-                                .arg(&apply_activation)
-                                .arg(&out_row_offset)
-                                .launch(cfg)?;
-                        }
-                    } else if i % 2 == 1 {
-                        unsafe {
-                            stream
-                                .launch_builder(&linear_kernel)
-                                .arg(&d_scratch_a)
-                                .arg(d_weight)
-                                .arg(d_bias)
-                                .arg(&mut d_scratch_b)
-                                .arg(&(rows as i32))
-                                .arg(&(layer.in_dim as i32))
-                                .arg(&(layer.out_dim as i32))
-                                .arg(&apply_activation)
-                                .arg(&out_row_offset)
-                                .launch(cfg)?;
-                        }
-                    } else {
-                        unsafe {
-                            stream
-                                .launch_builder(&linear_kernel)
-                                .arg(&d_scratch_b)
-                                .arg(d_weight)
-                                .arg(d_bias)
-                                .arg(&mut d_scratch_a)
-                                .arg(&(rows as i32))
-                                .arg(&(layer.in_dim as i32))
-                                .arg(&(layer.out_dim as i32))
-                                .arg(&apply_activation)
-                                .arg(&out_row_offset)
-                                .launch(cfg)?;
-                        }
-                    }
-                }
-            }
-        }
+        generate_vectors(
+            db_seed,
+            database_size as usize,
+            0,
+            &mut d_database_vectors,
+            layers,
+            widest,
+            module,
+            stream.clone(),
+        )?;
         stream.synchronize()?;
 
         Ok(Self {
-            seed: seed.clone(),
             scenario: track.s,
-            num_queries: n_queries,
             vector_dims: vector_dims as u32,
             database_size,
             d_database_vectors,
+        })
+    }
+}
+
+impl Challenge {
+    pub fn for_nonce(
+        db: &Database,
+        seeds: &Seeds,
+        track: &Track,
+        module: Arc<CudaModule>,
+        stream: Arc<CudaStream>,
+        _prop: &cudaDeviceProp,
+    ) -> Result<Self> {
+        // A `Database` built for a different scenario has different dims and a
+        // different row count; silently mixing them would produce a Challenge
+        // whose fields disagree with its buffers.
+        if db.scenario != track.s {
+            return Err(anyhow!(
+                "database was generated for scenario {} but this nonce is on {}",
+                db.scenario,
+                track.s
+            ));
+        }
+        let config = ScenarioConfig::from(track.s);
+        let weights = weights_from(config.weights)?;
+        let layers = &weights.layers;
+        let widest = layers.iter().map(|layer| layer.out_dim).max().unwrap();
+        let vector_dims = db.vector_dims as usize;
+        let n_queries = config.n_queries;
+
+        let mut d_query_vectors = stream.alloc_zeros::<f32>(n_queries as usize * vector_dims)?;
+        generate_vectors(
+            &seeds.nonce,
+            n_queries as usize,
+            db.database_size as usize,
+            &mut d_query_vectors,
+            layers,
+            widest,
+            module,
+            stream.clone(),
+        )?;
+
+        // Owned copy, not a borrow: `Challenge`'s layout must stay
+        // byte-identical or every existing algorithm .so reads these fields at
+        // the wrong offsets. ~358 MB at T4 bandwidth is ~1.4 ms.
+        let d_database_vectors = stream.clone_dtod(&db.d_database_vectors)?;
+        stream.synchronize()?;
+
+        Ok(Self {
+            seed: seeds.nonce,
+            scenario: db.scenario,
+            num_queries: n_queries,
+            vector_dims: db.vector_dims,
+            database_size: db.database_size,
+            d_database_vectors,
             d_query_vectors,
         })
+    }
+}
+
+impl Challenge {
+    /// The whole instance in one call: the database pass followed by the query
+    /// pass. Kept as a thin wrapper so callers that do not amortise an index
+    /// across nonces (tests, `vs-evaluate`) need not know about the split.
+    pub fn generate_instance(
+        seeds: &Seeds,
+        track: &Track,
+        module: Arc<CudaModule>,
+        stream: Arc<CudaStream>,
+        _prop: &cudaDeviceProp,
+    ) -> Result<Self> {
+        let db = Database::generate(&seeds.db, track, module.clone(), stream.clone(), _prop)?;
+        Self::for_nonce(&db, seeds, track, module, stream, _prop)
     }
 
     /// Diagnostic only -- NOT the quality path. Since quality became audited
@@ -1510,6 +1597,138 @@ extern "C" __global__ void reference_nn_search(
              achievable bandwidth is below that floor -- check which before \
              assuming a regression",
             ms
+        );
+    }
+
+    #[test]
+    fn the_database_is_identical_across_nonces_and_the_queries_are_not() {
+        // This is the design in one assertion. If it fails, an index built once
+        // per precommit is worthless because every nonce sees different rows.
+        let ptx = Ptx::from_file(test_ptx_path().clone());
+        let ctx = CudaContext::new(0).unwrap();
+        ctx.set_blocking_synchronize().unwrap();
+        let module = ctx.load_module(ptx).unwrap();
+        let stream = ctx.default_stream();
+        let prop = get_device_prop(0).unwrap();
+        let track = Track {
+            s: Scenario::SIFT_128,
+        };
+
+        let db_seed = [7u8; 32];
+        let a = Challenge::generate_instance(
+            &Seeds {
+                nonce: [1u8; 32],
+                db: db_seed,
+            },
+            &track,
+            module.clone(),
+            stream.clone(),
+            &prop,
+        )
+        .unwrap();
+        let b = Challenge::generate_instance(
+            &Seeds {
+                nonce: [2u8; 32],
+                db: db_seed,
+            },
+            &track,
+            module.clone(),
+            stream.clone(),
+            &prop,
+        )
+        .unwrap();
+
+        // Compare a prefix rather than 358 MB twice: a seed change perturbs
+        // every row, so the first 4,096 floats are as decisive as all of them
+        // and the test stays fast enough to keep.
+        let head = |c: &Challenge, which: u8| -> Vec<f32> {
+            let src = if which == 0 {
+                &c.d_database_vectors
+            } else {
+                &c.d_query_vectors
+            };
+            stream.memcpy_dtov(&src.slice(0..4096)).unwrap()
+        };
+
+        assert_eq!(
+            head(&a, 0),
+            head(&b, 0),
+            "database must not depend on the nonce seed"
+        );
+        assert_ne!(
+            head(&a, 1),
+            head(&b, 1),
+            "queries must depend on the nonce seed"
+        );
+    }
+
+    #[test]
+    fn for_nonce_keeps_the_index_base_offset() {
+        // Pins `for_nonce` against `generate_vectors` called directly at both
+        // candidate offsets. Comparing it against `generate_instance` instead
+        // would assert nothing: after the split `generate_instance` IS
+        // `Database::generate` + `for_nonce`, so an `index_base` mutation moves
+        // both sides of that equality together and the test still passes.
+        // Against a direct call the mutation is visible.
+        let ptx = Ptx::from_file(test_ptx_path().clone());
+        let ctx = CudaContext::new(0).unwrap();
+        ctx.set_blocking_synchronize().unwrap();
+        let module = ctx.load_module(ptx).unwrap();
+        let stream = ctx.default_stream();
+        let prop = get_device_prop(0).unwrap();
+        let track = Track {
+            s: Scenario::SIFT_128,
+        };
+        let seeds = Seeds {
+            nonce: [3u8; 32],
+            db: [9u8; 32],
+        };
+
+        let config = ScenarioConfig::from(track.s);
+        let weights = weights_from(config.weights).unwrap();
+        let layers = &weights.layers;
+        let widest = layers.iter().map(|l| l.out_dim).max().unwrap();
+        let dims = layers.last().unwrap().out_dim;
+        let n = config.n_queries as usize;
+
+        let db = Database::generate(&seeds.db, &track, module.clone(), stream.clone(), &prop)
+            .unwrap();
+        let split =
+            Challenge::for_nonce(&db, &seeds, &track, module.clone(), stream.clone(), &prop)
+                .unwrap();
+
+        let direct = |index_base: usize| -> Vec<f32> {
+            let mut dest = stream.alloc_zeros::<f32>(n * dims).unwrap();
+            generate_vectors(
+                &seeds.nonce,
+                n,
+                index_base,
+                &mut dest,
+                layers,
+                widest,
+                module.clone(),
+                stream.clone(),
+            )
+            .unwrap();
+            stream.synchronize().unwrap();
+            stream.memcpy_dtov(&dest.slice(0..4096)).unwrap()
+        };
+
+        let got = stream
+            .memcpy_dtov(&split.d_query_vectors.slice(0..4096))
+            .unwrap();
+        let at_db_size = direct(db.database_size as usize);
+        let at_zero = direct(0);
+
+        // The two offsets must actually differ, or the assertion below is
+        // vacuous and would pass against any implementation.
+        assert_ne!(
+            at_db_size, at_zero,
+            "index_base has no effect on the generator; this test cannot discriminate"
+        );
+        assert_eq!(
+            got, at_db_size,
+            "for_nonce must offset latents by database_size"
         );
     }
 }
