@@ -20,6 +20,7 @@ from glob import glob
 from threading import Thread
 from common.structs import OutputData, MerkleProof
 from common.merkle_tree import MerkleTree, MerkleHash
+from common.batch import needs_index_build
 
 logger = logging.getLogger(os.path.splitext(os.path.basename(__file__))[0])
 PENDING_BATCH_IDS = set()
@@ -57,7 +58,33 @@ def download_library(algorithms_dir, batch):
         return so_path, ptx_path
 
 
-def run_tig_runtime(nonce, batch, so_path, ptx_path, results_dir):
+def run_build_index(batch, so_path, ptx_path, results_dir):
+    """Build the index once per batch, before any nonce is computed.
+
+    Deliberately passes no nonce: the build process must not be able to derive
+    a query set. See docs/superpowers/specs/2026-08-31-c004-index-build-split-design.md.
+    """
+    index_path = f"{results_dir}/{batch['id']}/index.blob"
+    os.makedirs(os.path.dirname(index_path), exist_ok=True)
+    settings = json.dumps(batch["settings"], separators=(',', ':'))
+    cmd = [
+        "docker", "exec", batch["challenge"], "tig-runtime",
+        "build-index", settings, batch["rand_hash"], so_path,
+        "--build-fuel", str(batch["build_fuel_budget"]),
+        "--index-out", index_path,
+    ]
+    if ptx_path is not None:
+        cmd += ["--ptx", ptx_path]
+    if batch["hyperparameters"] is not None:
+        cmd += ["--hyperparameters", json.dumps(batch["hyperparameters"], separators=(',', ':'))]
+    logger.debug(f"building index: {' '.join(cmd)}")
+    ret = subprocess.run(cmd, capture_output=True, text=True)
+    if ret.returncode != 0:
+        raise Exception(f"index build failed (exit {ret.returncode}): {ret.stderr.strip()}")
+    return index_path
+
+
+def run_tig_runtime(nonce, batch, so_path, ptx_path, index_path, results_dir):
     output_dir = f"{results_dir}/{batch['id']}"
     output_file = f"{output_dir}/{nonce}.json"
     settings = json.dumps(batch["settings"], separators=(',',':'))
@@ -78,6 +105,10 @@ def run_tig_runtime(nonce, batch, so_path, ptx_path, results_dir):
     if ptx_path is not None:
         cmd += [
             "--ptx", ptx_path,
+        ]
+    if index_path is not None:
+        cmd += [
+            "--index", index_path,
         ]
     logger.debug(f"computing nonce: {' '.join(cmd[:4] + [f"'{cmd[4]}'"] + cmd[5:])}")
     process = subprocess.Popen(
@@ -306,15 +337,29 @@ def process_batch(algorithms_dir, results_dir):
         logger.error(f"Error processing batch {batch_id}: Challenge container {batch['challenge']} not found. Did you start it with 'docker-compose up {batch['challenge']}'?")
         return
     
+    so_path, ptx_path = download_library(algorithms_dir, batch)
+
+    index_path = None
+    if needs_index_build(batch):
+        try:
+            index_path = run_build_index(batch, so_path, ptx_path, results_dir)
+        except Exception as e:
+            msg = f"batch {batch_id}, index build error: {e}"
+            logger.error(msg)
+            with open(f"{results_dir}/{batch_id}/result.json", "w") as f:
+                json.dump({"error": msg}, f)
+            READY_BATCH_IDS.add(batch_id)
+            return
+
     q = Queue()
     for n in range(batch["start_nonce"], batch["start_nonce"] + batch["num_nonces"]):
         q.put(n)
-    so_path, ptx_path = download_library(algorithms_dir, batch)
     logger.info(f"batch {batch['id']} started")
     PROCESSING_BATCH_IDS[batch_id] = {
         "batch": batch,
         "so_path": so_path,
         "ptx_path": ptx_path,
+        "index_path": index_path,
         "q": q,
         "finished": set(),
         "start": now(),
@@ -328,6 +373,7 @@ def process_nonces(results_dir):
         batch = job["batch"]
         so_path = job["so_path"]
         ptx_path = job["ptx_path"]
+        index_path = job["index_path"]
         try:
             nonce = q.get_nowait()
             break
@@ -336,10 +382,10 @@ def process_nonces(results_dir):
     else:
         time.sleep(1)
         return
-    
+
     logger.debug(f"batch {batch_id}, nonce {nonce} started")
     try:
-        run_tig_runtime(nonce, batch, so_path, ptx_path, results_dir)
+        run_tig_runtime(nonce, batch, so_path, ptx_path, index_path, results_dir)
         job["finished"].add(nonce)
     except Exception as e:
         msg = f"batch {batch_id}, nonce {nonce}, runtime error: {e}"

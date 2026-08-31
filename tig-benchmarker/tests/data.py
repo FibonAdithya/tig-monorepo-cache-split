@@ -76,5 +76,13 @@ class TestData(unittest.TestCase):
         ])
         self.assertEqual(settings.calc_db_seed(rand_hash), expected)
 
+    def test_build_is_skipped_without_a_build_fuel_budget(self):
+        from common.batch import needs_index_build
+        self.assertFalse(needs_index_build({"challenge": "c001"}))
+        self.assertTrue(needs_index_build({"challenge": "c004", "build_fuel_budget": 1}))
+        # A budget of 0 is a real value, not an absent one: it means "no build
+        # fuel", which is different from "this challenge has no build phase".
+        self.assertTrue(needs_index_build({"challenge": "c004", "build_fuel_budget": 0}))
+
 if __name__ == '__main__':
     unittest.main()
