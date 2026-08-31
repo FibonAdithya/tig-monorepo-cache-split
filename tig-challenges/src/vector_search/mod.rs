@@ -314,7 +314,17 @@ impl Challenge {
 
         // Owned copy, not a borrow: `Challenge`'s layout must stay
         // byte-identical or every existing algorithm .so reads these fields at
-        // the wrong offsets. ~358 MB at T4 bandwidth is ~1.4 ms.
+        // the wrong offsets.
+        //
+        // Cost, measured rather than computed: this alloc + `clone_dtod` is
+        // **<= 3.894 ms** on an RTX 3060
+        // (docs/measurements/2026-08-31-c004-post-split-nonce-time.md 3.4),
+        // against a 22.7 ms marginal nonce. An earlier version of this comment
+        // said "~358 MB at T4 bandwidth is ~1.4 ms"; that figure counted one
+        // direction only, at full advertised bandwidth, and is wrong by
+        // roughly 3x in the optimistic direction. The measured number is an
+        // upper bound (the instrumented build adds a sync, and the phase
+        // includes the allocation), so the true cost lies between.
         let d_database_vectors = stream.clone_dtod(&db.d_database_vectors)?;
         stream.synchronize()?;
 

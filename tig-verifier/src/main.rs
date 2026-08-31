@@ -450,11 +450,18 @@ mod tests {
     }
 
     #[test]
-    fn verifier_seeds_for_agrees_with_the_runtime_derivations() {
-        // Two hand-written constructors, one protocol. This pins the verifier's
-        // to `BenchmarkSettings`' own derivations -- the same pair
-        // `tig-runtime::seeds_for` is pinned to -- so the two cannot drift
-        // apart without one of the four assertions failing.
+    fn verifier_seeds_for_matches_benchmark_settings_across_nonces() {
+        // Renamed: the old name said "agrees with the runtime derivations",
+        // which reads as a comparison against `tig-runtime::seeds_for`. It is
+        // not one -- nothing here imports the runtime, and the runtime is a
+        // binary crate this one cannot depend on. What it actually does is
+        // re-derive the same `BenchmarkSettings` pair across four nonces.
+        //
+        // The drift protection is transitive, not direct: `tig-runtime` has its
+        // own copy of this assertion (`seeds_for_puts_each_derivation_in_the
+        // _right_field`), and both are pinned to `BenchmarkSettings`' own
+        // `calc_seed`/`calc_db_seed`, so the two hand-written constructors
+        // cannot drift apart without one of the two tests failing.
         let settings = seeds_test_settings();
         let rand_hash = "random_hash".to_string();
 
