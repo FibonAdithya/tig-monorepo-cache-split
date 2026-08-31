@@ -616,7 +616,19 @@ pub fn build_index(
             "build exceeded the {}s wall-clock watchdog",
             timeout.as_secs()
         );
-        std::process::exit(85);
+        // `libc::_exit`, not `std::process::exit`. The latter calls libc
+        // `exit()`, which runs atexit handlers and shared-object destructors --
+        // CUDA's among them -- from *this* thread while the main thread is
+        // parked inside `cuStreamSynchronize` (this function calls
+        // `set_blocking_synchronize`, so that park is a real blocking wait
+        // inside libcuda). Measured on tig-gpu with a kernel genuinely in
+        // flight, `std::process::exit(85)` gave 139 (SIGSEGV, core dumped) on
+        // one run and 85 on the very next -- nondeterministic, and a 139 is
+        // indistinguishable from this box's pre-existing teardown crash. It is
+        // exactly the timeout-under-load case the watchdog exists for.
+        // `_exit` skips atexit entirely, and Rust's stderr is unbuffered, so
+        // the message above has already landed.
+        unsafe { libc::_exit(85) };
     });
 
     // No nonce is derived here and none can be passed -- the `build-index`
@@ -778,6 +790,61 @@ pub fn build_index(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The *code* of `build_index`'s body -- comment lines stripped -- bounded
+    /// loudly at both ends.
+    ///
+    /// Three tests below assert on this slice, and each is only as good as the
+    /// bounding: a scan that silently matches nothing, or that matches the test
+    /// file instead of the function, passes for the wrong reason. Comments are
+    /// dropped because the prose in `build_index` names `Database::generate`
+    /// and `build_index_fn` verbatim, and an ordering assertion that can be
+    /// satisfied by a comment is not an ordering assertion.
+    fn build_index_code() -> String {
+        const SRC: &str = include_str!("main.rs");
+        // `concat!` on purpose: as one literal the needle would occur in this
+        // helper's own source and `find` would match here, not at the
+        // definition.
+        const NEEDLE: &str = concat!("pub fn ", "build_index(");
+        assert_eq!(
+            SRC.matches(NEEDLE).count(),
+            1,
+            "expected exactly one `{}` in main.rs; the scan cannot tell which \
+             one to bound",
+            NEEDLE
+        );
+        let rest = &SRC[SRC.find(NEEDLE).unwrap()..];
+        // Inside the function every closing brace is indented; the first brace
+        // alone at column 0 is the function's own.
+        let end = rest.find("\n}\n").expect(
+            "could not find the closing brace of `build_index` -- the source \
+             layout changed and these tests can no longer bound the function",
+        );
+        let body = &rest[..end];
+        assert!(
+            body.len() > 500 && body.contains("index_out"),
+            "sliced {} bytes that do not look like build_index's body",
+            body.len()
+        );
+        body.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// `find` the one occurrence of `needle` in `code`, failing loudly if it is
+    /// not there exactly once.
+    fn offset_of(code: &str, needle: &str) -> usize {
+        assert_eq!(
+            code.matches(needle).count(),
+            1,
+            "expected exactly one `{}` in build_index's code; found {}. A \
+             source scan that matches zero or several places proves nothing",
+            needle,
+            code.matches(needle).count()
+        );
+        code.find(needle).unwrap()
+    }
 
     fn test_settings() -> BenchmarkSettings {
         BenchmarkSettings {
@@ -1043,16 +1110,21 @@ mod tests {
 
     #[test]
     fn the_balloon_absorbs_everything_the_cap_does_not_allow() {
-        // 12 GiB free, 2 GiB cap: the balloon must hold the whole remainder
-        // minus the documented slack, not some fraction of it. A balloon
-        // smaller than this is a looser cap than the caller asked for.
-        let free = 12 * 1024 * 1024 * 1024u64;
+        // `free` deliberately differs from `total`: on a real device the
+        // context, the module and the database are already resident when the
+        // balloon goes up. Sizing from `total` would hand the algorithm
+        // everything they hold *on top of* its cap, and with free == total
+        // that mutation is invisible.
+        let total = 12 * 1024 * 1024 * 1024u64;
+        let free = 11 * 1024 * 1024 * 1024u64;
         let cap = 2 * 1024 * 1024 * 1024u64;
-        let bytes = balloon_size(free, free, cap).unwrap();
-        assert_eq!(bytes, free - cap - BALLOON_SLACK);
-        // Restating the invariant the number exists to enforce, so a changed
-        // slack constant still has to keep the cap honest.
-        assert_eq!(free - bytes, cap + BALLOON_SLACK);
+        // The balloon must hold the whole remainder minus the documented
+        // slack, not some fraction of it: a smaller balloon is a looser cap
+        // than the caller asked for.
+        assert_eq!(
+            balloon_size(free, total, cap).unwrap(),
+            free - cap - BALLOON_SLACK
+        );
     }
 
     #[test]
@@ -1096,26 +1168,41 @@ mod tests {
     }
 
     #[test]
-    fn the_watchdog_exits_with_its_own_code_and_not_the_generic_error_code() {
-        // 85 has to stay distinct from 84 (runtime error) and 87 (out of
-        // fuel), or a caller cannot tell a build that will never finish from
-        // one that failed. The watchdog thread is unreachable from a unit test
-        // without a GPU, so assert on the source of `build_index` itself.
-        let src = include_str!("main.rs");
-        const NEEDLE: &str = concat!("pub fn ", "build_index(");
-        let start = src.find(NEEDLE).expect("build_index must exist");
-        let body = &src[start..];
-        let end = body
-            .find("\n}\n")
-            .expect("could not find the end of build_index");
-        let body = &body[..end];
+    fn the_watchdog_exits_85_and_covers_the_whole_build() {
+        // Two independent properties. (a) 85 must stay distinct from 84
+        // (runtime error) and 87 (out of fuel), or a caller cannot tell a
+        // build that will never finish from one that failed. (b) The watchdog
+        // must be armed before any of the expensive work, or a build that
+        // wedges inside CudaContext::new or Database::generate -- neither of
+        // which is the algorithm's code, and both of which can hang -- runs
+        // forever uncovered. The thread is unreachable from a unit test
+        // without a GPU, so both are asserted on the source.
+        let code = build_index_code();
         assert!(
-            body.contains("std::process::exit(85)"),
+            code.contains(concat!("libc::_", "exit(85)")),
             "build_index must install a watchdog that exits 85"
         );
+        // Not a restatement of the line above: `std::process::exit(85)` also
+        // "exits 85", and it is what was there until a run with a kernel in
+        // flight produced 139 instead. libc `exit()` runs CUDA's atexit
+        // handlers from the watchdog thread while the main thread is inside
+        // cuStreamSynchronize; `_exit` does not.
         assert!(
-            !body.contains("std::process::exit(84)") && !body.contains("std::process::exit(87)"),
-            "the watchdog must not reuse the runtime-error or out-of-fuel exit codes"
+            !code.contains(concat!("std::process::", "exit(")),
+            "the watchdog must not use std::process::exit: it runs atexit \
+             handlers, and under GPU load that was measured crashing to 139 \
+             instead of exiting 85"
+        );
+        let settings = offset_of(&code, concat!("load_", "settings("));
+        let spawn = offset_of(&code, concat!("thread::", "spawn("));
+        let ctx = offset_of(&code, concat!("CudaContext::", "new("));
+        assert!(
+            settings < spawn && spawn < ctx,
+            "the watchdog must be armed after the settings load and before the \
+             CUDA context is created (settings@{} spawn@{} ctx@{})",
+            settings,
+            spawn,
+            ctx
         );
     }
 
@@ -1126,19 +1213,68 @@ mod tests {
         // object, and the caller's `eprintln!` then jumps through a dangling
         // pointer -- measured on tig-gpu as `Runtime Error: ` followed by a
         // SIGSEGV, with the actual allocation-failure message never printed.
-        let src = include_str!("main.rs");
-        let call = src
-            .find("build_index_fn(")
-            .expect("build_index must call the algorithm's build_index");
+        let code = build_index_code();
+        let call = offset_of(&code, concat!("build_index_", "fn("));
         // Bound the window at the `?` that propagates, not at the first `;`:
         // rustfmt splits the call across lines, so a `;`-bounded window can
-        // stop before the `.map_err` it is looking for.
-        let stmt = &src[call..];
+        // stop before the conversion it is looking for.
+        let stmt = &code[call..];
         let end = stmt.find("?;").expect("the call must propagate with `?`");
+        // The needle is the *formatting*, not `.map_err(`. A no-op
+        // `.map_err(|e| e)` restores the segfault exactly while still
+        // containing `.map_err(`, so that token discriminates nothing.
         assert!(
-            stmt[..end].contains(".map_err("),
+            stmt[..end].contains(concat!("anyhow!(\"{", ":#}\"")),
             "the algorithm's error must be rendered to an owned string while the \
-             library is still loaded; a bare `?` here segfaults the error path"
+             library is still loaded; a bare `?`, or a map_err that hands back \
+             the same error object, segfaults the error path"
+        );
+    }
+
+    #[test]
+    fn the_balloon_is_held_and_not_dropped_on_the_spot() {
+        // `let _balloon = ...` binds; `let _ = ...` drops the allocation
+        // immediately. The second frees the surplus the instant it is
+        // reserved, so the cap is silently not in force -- and nothing is
+        // observable at runtime: the build simply succeeds where it should
+        // have failed. This is the single mutation the whole task exists to
+        // prevent, and it is invisible to every other test here.
+        let code = build_index_code();
+        assert!(
+            code.contains(concat!("let _", "balloon = ")),
+            "the balloon must be bound to a live binding that outlives \
+             build_index_fn; `let _ = ...` drops it at once and disables the \
+             cap with no runtime symptom"
+        );
+    }
+
+    #[test]
+    fn the_balloon_is_inflated_between_the_database_and_the_algorithm() {
+        // The ordering is the cap's whole meaning, and both ways of getting it
+        // wrong are silent:
+        //   * above `Database::generate` -- the database and the generator's
+        //     scratch are charged against the algorithm's cap, so the
+        //     algorithm gets less than the cap promises and a build that
+        //     should pass fails;
+        //   * below `build_index_fn` -- the cap is never in force while the
+        //     algorithm runs, so a build that should fail passes.
+        let code = build_index_code();
+        let generate = offset_of(&code, concat!("Database::", "generate("));
+        let balloon = offset_of(&code, concat!("let _", "balloon = "));
+        let call = offset_of(&code, concat!("build_index_", "fn("));
+        assert!(
+            generate < balloon,
+            "the balloon must go up AFTER Database::generate, or the database \
+             is charged against the algorithm's cap (generate@{} balloon@{})",
+            generate,
+            balloon
+        );
+        assert!(
+            balloon < call,
+            "the balloon must go up BEFORE build_index_fn, or the cap is never \
+             in force while the algorithm runs (balloon@{} call@{})",
+            balloon,
+            call
         );
     }
 
