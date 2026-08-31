@@ -881,11 +881,11 @@ extern "C" __global__ void reference_nn_search(
             s: Scenario::SIFT_128,
         };
         let challenge = Challenge::generate_instance(
-            // The two fields must never hold the same bytes. c004 ignores `db`
-            // today, so this changes nothing now -- but Task 3 makes `db` the
-            // database seed, and identical bytes would make a swap inside the
-            // split invisible to all 40 tests here. `x ^ 0xff` flips every bit,
-            // so it differs from `x` in all eight and cannot collide for any
+            // The two fields must never hold the same bytes. `db` seeds the
+            // database and `nonce` seeds the queries, so identical bytes would
+            // make a swap between the two halves of the split invisible to
+            // every test in this module. `x ^ 0xff` flips every bit, so it
+            // differs from `x` in all eight and cannot collide for any
             // `seed_byte`.
             &Seeds {
                 nonce: [seed_byte; 32],
@@ -1729,6 +1729,118 @@ extern "C" __global__ void reference_nn_search(
         assert_eq!(
             got, at_db_size,
             "for_nonce must offset latents by database_size"
+        );
+    }
+
+    #[test]
+    fn the_database_depends_on_the_db_seed() {
+        // Catches a `Database::generate` that ignores `db_seed` entirely -- a
+        // hardcoded constant, say. Its sibling
+        // `the_database_is_identical_across_nonces_and_the_queries_are_not`
+        // hands both instances the *same* `db_seed`, so a seed-ignoring
+        // generator still produces two matching databases and that test stays
+        // green. `BenchmarkSettings::calc_db_seed` mixes in `player_id` and
+        // `algorithm_id`: if the seed did not reach the rows, every player and
+        // every precommit would search one shared database, D1's "not
+        // precomputable offline" property would be gone, and without this test
+        // nothing anywhere would fail.
+        let ptx = Ptx::from_file(test_ptx_path().clone());
+        let ctx = CudaContext::new(0).unwrap();
+        ctx.set_blocking_synchronize().unwrap();
+        let module = ctx.load_module(ptx).unwrap();
+        let stream = ctx.default_stream();
+        let prop = get_device_prop(0).unwrap();
+        let track = Track {
+            s: Scenario::SIFT_128,
+        };
+
+        let a = Database::generate(&[11u8; 32], &track, module.clone(), stream.clone(), &prop)
+            .unwrap();
+        let b = Database::generate(&[12u8; 32], &track, module.clone(), stream.clone(), &prop)
+            .unwrap();
+
+        // Same 4,096-float prefix as the tests above rather than 358 MB twice:
+        // a seed change perturbs every row.
+        let head = |d: &Database| -> Vec<f32> {
+            stream.memcpy_dtov(&d.d_database_vectors.slice(0..4096)).unwrap()
+        };
+
+        assert_ne!(
+            head(&a),
+            head(&b),
+            "the database must depend on its own seed"
+        );
+    }
+
+    #[test]
+    fn database_generate_keeps_the_index_base_at_zero() {
+        // The mirror of `for_nonce_keeps_the_index_base_offset`, on the
+        // database half. It catches `index_base` in `Database::generate`
+        // changed from 0 to any other constant -- a mutation every other test
+        // here misses: `the_database_is_identical_across_nonces_and_the_queries_are_not`
+        // compares two databases that both carry the mutated value,
+        // `for_nonce_keeps_the_index_base_offset` never inspects the database,
+        // and the recall tests only ever measure the database against itself.
+        //
+        // Pinned against `generate_vectors` called directly, for the same
+        // reason its sibling is: comparing against another `Database::generate`
+        // would move both sides of the equality together.
+        let ptx = Ptx::from_file(test_ptx_path().clone());
+        let ctx = CudaContext::new(0).unwrap();
+        ctx.set_blocking_synchronize().unwrap();
+        let module = ctx.load_module(ptx).unwrap();
+        let stream = ctx.default_stream();
+        let prop = get_device_prop(0).unwrap();
+        let track = Track {
+            s: Scenario::SIFT_128,
+        };
+        let seeds = Seeds {
+            nonce: [4u8; 32],
+            db: [5u8; 32],
+        };
+
+        let config = ScenarioConfig::from(track.s);
+        let weights = weights_from(config.weights).unwrap();
+        let layers = &weights.layers;
+        let widest = layers.iter().map(|l| l.out_dim).max().unwrap();
+        let dims = layers.last().unwrap().out_dim;
+        let n = config.database_size as usize;
+
+        let db = Database::generate(&seeds.db, &track, module.clone(), stream.clone(), &prop)
+            .unwrap();
+
+        let direct = |index_base: usize| -> Vec<f32> {
+            let mut dest = stream.alloc_zeros::<f32>(n * dims).unwrap();
+            generate_vectors(
+                &seeds.db,
+                n,
+                index_base,
+                &mut dest,
+                layers,
+                widest,
+                module.clone(),
+                stream.clone(),
+            )
+            .unwrap();
+            stream.synchronize().unwrap();
+            stream.memcpy_dtov(&dest.slice(0..4096)).unwrap()
+        };
+
+        let got = stream
+            .memcpy_dtov(&db.d_database_vectors.slice(0..4096))
+            .unwrap();
+        let at_zero = direct(0);
+        let at_db_size = direct(n);
+
+        // The two offsets must actually differ, or the assertion below is
+        // vacuous and would pass against any implementation.
+        assert_ne!(
+            at_zero, at_db_size,
+            "index_base has no effect on the generator; this test cannot discriminate"
+        );
+        assert_eq!(
+            got, at_zero,
+            "Database::generate must sample latents from index_base 0"
         );
     }
 }
