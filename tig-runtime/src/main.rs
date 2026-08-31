@@ -75,6 +75,13 @@ fn main() {
     }
 }
 
+fn seeds_for(settings: &BenchmarkSettings, rand_hash: &String, nonce: u64) -> Seeds {
+    Seeds {
+        nonce: settings.calc_seed(rand_hash, nonce),
+        db: settings.calc_db_seed(rand_hash),
+    }
+}
+
 pub fn compute_solution(
     settings: String,
     rand_hash: String,
@@ -87,7 +94,8 @@ pub fn compute_solution(
     gpu_device: Option<usize>,
 ) -> Result<()> {
     let settings = load_settings(&settings);
-    let seed = settings.calc_seed(&rand_hash, nonce);
+    let seeds = seeds_for(&settings, &rand_hash, nonce);
+    let seed = seeds.nonce;
 
     let hyperparameters = hyperparameters.map(|x| load_hyperparameters(&x));
 
@@ -211,7 +219,7 @@ pub fn compute_solution(
             let prop = get_device_prop(gpu_device as i32)?;
 
             let challenge = $c::Challenge::generate_instance(
-                &seed,
+                &seeds,
                 &track,
                 module.clone(),
                 stream.clone(),
@@ -391,5 +399,44 @@ pub fn load_module(path: &PathBuf) -> Result<Library> {
     match res {
         Ok(lib_result) => lib_result.map_err(|e| anyhow!(e.to_string())),
         Err(_) => Err(anyhow!("Failed to load module")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_settings() -> BenchmarkSettings {
+        BenchmarkSettings {
+            player_id: "some_player".to_string(),
+            block_id: "some_block".to_string(),
+            challenge_id: "some_challenge".to_string(),
+            algorithm_id: "some_algorithm".to_string(),
+            track_id: "a=1,b=2".to_string(),
+        }
+    }
+
+    #[test]
+    fn seeds_for_puts_each_derivation_in_the_right_field() {
+        // Catches the swap. If `nonce` and `db` are exchanged, the database
+        // becomes per-nonce again and every claim the index-build design makes
+        // is false -- with nothing failing and no message naming the cause.
+        let settings = test_settings();
+        let rand_hash = "random_hash".to_string();
+
+        let seeds = seeds_for(&settings, &rand_hash, 1337);
+        assert_eq!(seeds.nonce, settings.calc_seed(&rand_hash, 1337));
+        assert_eq!(seeds.db, settings.calc_db_seed(&rand_hash));
+    }
+
+    #[test]
+    fn seeds_for_holds_the_database_constant_across_nonces() {
+        let settings = test_settings();
+        let rand_hash = "random_hash".to_string();
+
+        let a = seeds_for(&settings, &rand_hash, 0);
+        let b = seeds_for(&settings, &rand_hash, u64::MAX);
+        assert_eq!(a.db, b.db, "database seed must not vary with the nonce");
+        assert_ne!(a.nonce, b.nonce, "query seed must vary with the nonce");
     }
 }

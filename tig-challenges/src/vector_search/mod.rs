@@ -1,5 +1,6 @@
 use crate::audit_sampling::sample_query_ids;
 use crate::QUALITY_PRECISION;
+use crate::Seeds;
 use anyhow::{anyhow, Result};
 use cudarc::{
     driver::{safe::LaunchConfig, CudaModule, CudaSlice, CudaStream, PushKernelArg},
@@ -77,12 +78,15 @@ const AUDIT_MAX_DIMS: u32 = 128;
 
 impl Challenge {
     pub fn generate_instance(
-        seed: &[u8; 32],
+        seeds: &Seeds,
         track: &Track,
         module: Arc<CudaModule>,
         stream: Arc<CudaStream>,
         _prop: &cudaDeviceProp,
     ) -> Result<Self> {
+        // Signature-only for now: c004 still derives the whole instance from
+        // the per-nonce seed. Task 3 splits the database off onto `seeds.db`.
+        let seed = &seeds.nonce;
         let config = ScenarioConfig::from(track.s);
         let weights = weights_from(config.weights)?;
         let layers = &weights.layers;
@@ -790,7 +794,10 @@ extern "C" __global__ void reference_nn_search(
             s: Scenario::SIFT_128,
         };
         let challenge = Challenge::generate_instance(
-            &[seed_byte; 32],
+            &Seeds {
+                nonce: [seed_byte; 32],
+                db: [seed_byte; 32],
+            },
             &track,
             module.clone(),
             stream.clone(),

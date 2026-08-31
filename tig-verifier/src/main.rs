@@ -148,7 +148,11 @@ pub fn verify_solution(
     verbose: bool,
 ) -> Result<()> {
     let settings = load_settings(&settings);
-    let seed = settings.calc_seed(&rand_hash, nonce);
+    let seeds = Seeds {
+        nonce: settings.calc_seed(&rand_hash, nonce),
+        db: settings.calc_db_seed(&rand_hash),
+    };
+    let seed = seeds.nonce;
 
     // Decoded once, up front, so a malformed salt is a clear error before any
     // GPU work rather than a surprise mid-verification. Only the GPU arm reads
@@ -242,7 +246,7 @@ pub fn verify_solution(
             let prop = get_device_prop(gpu_device as i32).unwrap();
 
             let challenge = $c::Challenge::generate_instance(
-                &seed,
+                &seeds,
                 &track,
                 module.clone(),
                 stream.clone(),

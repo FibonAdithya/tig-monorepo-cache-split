@@ -1,4 +1,5 @@
 use crate::QUALITY_PRECISION;
+use crate::Seeds;
 use anyhow::Result;
 use cudarc::{
     cublas::CudaBlas,
@@ -123,12 +124,15 @@ pub struct Challenge {
 
 impl Challenge {
     pub fn generate_instance(
-        seed: &[u8; 32],
+        seeds: &Seeds,
         track: &Track,
         module: Arc<CudaModule>,
         stream: Arc<CudaStream>,
         _prop: &cudaDeviceProp,
     ) -> Result<Self> {
+        // c005/c006 are not split across a precommit; `seeds.db` is not theirs
+        // to read.
+        let seed = &seeds.nonce;
         const K_RFF: usize = 128;
         const RFF_AMPLITUDE_PER_FUNC: f32 = 1.0;
         const RFF_LENGTHSCALE_PER_INPUT_DIM: f32 = 0.3;

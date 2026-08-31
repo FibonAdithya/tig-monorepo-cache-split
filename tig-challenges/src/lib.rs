@@ -2,6 +2,19 @@ pub const BUILD_TIME_PATH: &str = env!("CARGO_MANIFEST_DIR");
 
 const QUALITY_PRECISION: i32 = 1_000_000;
 
+/// The two seeds a GPU challenge instance is derived from.
+///
+/// `nonce` is the per-nonce seed every challenge has always used. `db` is
+/// derived without the nonce and is therefore constant across a precommit.
+/// Only c004 reads `db`, to generate a database an index can be built over once
+/// and reused by every nonce; c005 and c006 ignore it, exactly as they already
+/// take `_audit_salt` and ignore it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Seeds {
+    pub nonce: [u8; 32],
+    pub db: [u8; 32],
+}
+
 macro_rules! conditional_pub {
     (fn $name:ident $($rest:tt)*) => {
         #[cfg(not(feature = "hide_verification"))]
