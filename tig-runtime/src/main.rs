@@ -183,36 +183,38 @@ fn main() {
         }
     }
 
-    if matches.subcommand_matches("batch").is_some() {
-        // The subcommand's arguments are already parsed and tested; the
-        // batched execution path itself lands in a later task. Exiting
-        // non-zero here is deliberate -- a silent exit 0 would be
-        // indistinguishable from a batch that ran.
-        eprintln!("Runtime Error: the 'batch' subcommand is not implemented yet");
-        std::process::exit(84);
-    }
-
-    // `--index` is declared on the root command but nothing reads it yet, so
-    // without this guard `tig-runtime S H 7 lib.so --index blob` would exit 0
-    // having solved *without* the index and no caller could tell.
-    if matches.value_source("index") == Some(clap::parser::ValueSource::CommandLine) {
-        eprintln!(
-            "Runtime Error: --index is parsed but not loaded yet (Task 6 wires it); \
-             refusing rather than solving without the index"
-        );
-        std::process::exit(84);
-    }
+    // Both forms reach the SAME call below. `batch` is not a second execution
+    // path: the legacy single-nonce form is `start_nonce = NONCE,
+    // num_nonces = 1`. Two paths is exactly where the batched and single-nonce
+    // results would silently diverge, and nothing downstream would notice.
+    //
+    // Reading every remaining argument off `m` rather than off `matches` is
+    // also what wires `--index` in *both* places it is declared -- on the root
+    // command and on `batch`. Reading it from `matches` would leave
+    // `batch --index blob` solving without the index and exiting 0.
+    let (m, start_nonce, num_nonces) = match matches.subcommand_matches("batch") {
+        // The `.unwrap()`s are safe only because `cli()` marks both
+        // `.required(true)`, and `--num-nonces` is range-limited to `1..`.
+        Some(sub) => (
+            sub,
+            *sub.get_one::<u64>("start-nonce").unwrap(),
+            *sub.get_one::<u64>("num-nonces").unwrap(),
+        ),
+        None => (&matches, *matches.get_one::<u64>("NONCE").unwrap(), 1u64),
+    };
 
     if let Err(e) = compute_solution(
-        matches.get_one::<String>("SETTINGS").unwrap().clone(),
-        matches.get_one::<String>("RAND_HASH").unwrap().clone(),
-        *matches.get_one::<u64>("NONCE").unwrap(),
-        matches.get_one::<PathBuf>("BINARY").unwrap().clone(),
-        matches.get_one("hyperparameters").cloned(),
-        matches.get_one::<PathBuf>("ptx").cloned(),
-        *matches.get_one::<u64>("fuel").unwrap(),
-        matches.get_one::<PathBuf>("output").cloned(),
-        matches.get_one::<usize>("gpu").cloned(),
+        m.get_one::<String>("SETTINGS").unwrap().clone(),
+        m.get_one::<String>("RAND_HASH").unwrap().clone(),
+        start_nonce,
+        num_nonces,
+        m.get_one::<PathBuf>("BINARY").unwrap().clone(),
+        m.get_one("hyperparameters").cloned(),
+        m.get_one::<PathBuf>("ptx").cloned(),
+        *m.get_one::<u64>("fuel").unwrap(),
+        m.get_one::<PathBuf>("output").cloned(),
+        m.get_one::<usize>("gpu").cloned(),
+        m.get_one::<PathBuf>("index").cloned(),
     ) {
         eprintln!("Runtime Error: {}", e);
         std::process::exit(84);
@@ -246,82 +248,117 @@ fn seeds_for(settings: &BenchmarkSettings, rand_hash: &String, nonce: u64) -> Se
     }
 }
 
+/// The half-open range of nonces one process covers.
+///
+/// Split out of `compute_solution` so both boundaries are testable without a
+/// GPU. Each is silent if it is wrong: a batch of zero writes no output at all
+/// and exits 0, which is indistinguishable from a batch that worked; and a
+/// plain `start_nonce + num_nonces` wraps in a release build, turning a batch
+/// near `u64::MAX` into an empty range that also exits 0 having done nothing.
+fn nonce_range(start_nonce: u64, num_nonces: u64) -> Result<std::ops::Range<u64>> {
+    if num_nonces == 0 {
+        return Err(anyhow!(
+            "num_nonces must be at least 1; a batch that solves nothing and exits 0 \
+             is indistinguishable from one that worked"
+        ));
+    }
+    let end = start_nonce.checked_add(num_nonces).ok_or_else(|| {
+        anyhow!(
+            "nonce range {}..{}+{} overflows u64",
+            start_nonce,
+            start_nonce,
+            num_nonces
+        )
+    })?;
+    Ok(start_nonce..end)
+}
+
+/// Solve `num_nonces` consecutive nonces, starting at `start_nonce`, in this
+/// one process.
+///
+/// The legacy single-nonce form is `start_nonce = NONCE, num_nonces = 1`, so
+/// there is one loop and not two code paths. Everything that does not depend on
+/// the nonce -- the CUDA context, the module, the c004 `Database` and the index
+/// upload -- is hoisted above the loop and therefore paid once per precommit
+/// instead of once per nonce.
 pub fn compute_solution(
     settings: String,
     rand_hash: String,
-    nonce: u64,
+    start_nonce: u64,
+    num_nonces: u64,
     library_path: PathBuf,
     hyperparameters: Option<String>,
     ptx_path: Option<PathBuf>,
     max_fuel: u64,
     output_folder: Option<PathBuf>,
     gpu_device: Option<usize>,
+    index_path: Option<PathBuf>,
 ) -> Result<()> {
     let settings = load_settings(&settings);
-    let seeds = seeds_for(&settings, &rand_hash, nonce);
-    let seed = seeds.nonce;
+    let nonces = nonce_range(start_nonce, num_nonces)?;
+
+    // Computed once, above the loop: it carries no nonce, so it is constant for
+    // the whole precommit. Only the c004 arm reads it, hence the allow -- a
+    // `--features c001` build compiles no arm that mentions it.
+    #[allow(unused_variables)]
+    let db_seed = settings.calc_db_seed(&rand_hash);
 
     let hyperparameters = hyperparameters.map(|x| load_hyperparameters(&x));
 
     let library = load_module(&library_path)?;
+    // Resolved once, but *written* once per nonce inside the loop. Setting them
+    // here only -- which is what the one-process-per-nonce code did -- would
+    // carry nonce k-1's spend into nonce k, and a bundle would die partway
+    // through with an out-of-fuel exit that names nothing.
     let fuel_remaining_ptr = unsafe { *library.get::<*mut u64>(b"__fuel_remaining")? };
-    unsafe { *fuel_remaining_ptr = max_fuel };
     let runtime_signature_ptr = unsafe { *library.get::<*mut u64>(b"__runtime_signature")? };
-    unsafe { *runtime_signature_ptr = u64::from_be_bytes(seed[0..8].try_into().unwrap()) };
 
-    let output_file = match output_folder {
+    // A directory, not a file. The file name depends on the nonce and is
+    // therefore rebuilt inside the loop; computing it once here would make
+    // every nonce of a bundle overwrite one file.
+    let output_dir = match output_folder {
         Some(folder) => {
             fs::create_dir_all(&folder)?;
-            folder.join(format!("{}.json", nonce))
+            folder
         }
-        None => format!("{}.json", nonce).into(),
+        None => PathBuf::from("."),
     };
 
-    macro_rules! dispatch_challenge {
-        ($c:ident, cpu) => {{
-            let track: $c::Track = parse_track(&settings, stringify!($c))?;
-
-            // library function may exit 87 if it runs out of fuel
-            let solve_challenge_fn = unsafe {
-                library.get::<fn(
-                    &$c::Challenge,
-                    &dyn Fn(&$c::Solution) -> Result<()>,
-                    Option<String>,
-                ) -> Result<()>>(b"entry_point")?
-            };
-
-            let challenge = $c::Challenge::generate_instance(&seed, &track)?;
-
-            let save_solution_fn = |solution: &$c::Solution| -> Result<()> {
-                let fuel_consumed = (max_fuel
-                    - unsafe { **library.get::<*const u64>(b"__fuel_remaining")? })
-                .min(max_fuel + 1);
-                let runtime_signature =
-                    unsafe { **library.get::<*const u64>(b"__runtime_signature")? };
-
-                let solution = serde_json::to_string(&solution)?;
-
-                let output_data = OutputData {
-                    nonce,
-                    runtime_signature,
-                    fuel_consumed,
-                    solution,
-                    #[cfg(target_arch = "x86_64")]
-                    cpu_arch: CPUArchitecture::AMD64,
-                    #[cfg(target_arch = "aarch64")]
-                    cpu_arch: CPUArchitecture::ARM64,
-                };
-                fs::write(&output_file, jsonify(&output_data))?;
-                Ok(())
-            };
-            let result = solve_challenge_fn(&challenge, &save_solution_fn, hyperparameters);
-            if !output_file.exists() {
-                save_solution_fn(&$c::Solution::new())?;
+    /// `--index` only means something for c004: it is the only challenge with a
+    /// `Database` and the only one whose ABI has `load_index`. Refusing loudly
+    /// beats the alternative, which is solving without the index the caller
+    /// asked for and exiting 0.
+    #[allow(unused_macros)]
+    macro_rules! refuse_index {
+        ($c:ident) => {
+            if index_path.is_some() {
+                return Err(anyhow!(
+                    "--index is only supported by c004; {} has no index ABI, and \
+                     solving without the index that was asked for would be a \
+                     silently wrong answer",
+                    stringify!($c)
+                ));
             }
-            result
-        }};
+        };
+    }
 
-        ($c:ident, gpu) => {{
+    /// The GPU solve loop, shared by every GPU challenge.
+    ///
+    /// Exactly two things differ between challenges, and both arrive as
+    /// closures so that the loop, the per-nonce resets and the save-solution
+    /// closure exist in one copy only:
+    ///
+    ///   * `$make_db` runs **once, above the loop**. For c004 it generates the
+    ///     precommit's `Database` and uploads the index into the algorithm;
+    ///     for c005/c006 it returns `()`.
+    ///   * `$mk_challenge` builds one nonce's `Challenge` from that value.
+    ///
+    /// Every reference parameter of both closures is explicitly annotated:
+    /// that is what makes them higher-ranked over lifetimes, so the same
+    /// closure can be called with a fresh `Seeds` borrow on each iteration.
+    #[allow(unused_macros)]
+    macro_rules! gpu_common {
+        ($c:ident, $make_db:expr, $mk_challenge:expr) => {{
             let track: $c::Track = parse_track(&settings, stringify!($c))?;
 
             if ptx_path.is_none() {
@@ -350,7 +387,9 @@ pub fn compute_solution(
             if num_gpus == 0 {
                 panic!("No CUDA devices found");
             }
-            let gpu_device = gpu_device.unwrap_or((nonce % num_gpus as u64) as usize);
+            // `start_nonce`, not the loop's nonce: the context is created once,
+            // above the loop, so there is no per-nonce device left to pick.
+            let gpu_device = gpu_device.unwrap_or((start_nonce % num_gpus as u64) as usize);
             let ptx = Ptx::from_src(modified_ptx);
             let ctx = CudaContext::new(gpu_device)?;
             ctx.set_blocking_synchronize()?;
@@ -358,91 +397,265 @@ pub fn compute_solution(
             let stream = ctx.fuel_check_stream();
             let prop = get_device_prop(gpu_device as i32)?;
 
-            let challenge = $c::Challenge::generate_instance(
-                &seeds,
-                &track,
-                module.clone(),
-                stream.clone(),
-                &prop,
-            )?;
-
-            let initialize_kernel = module.load_function("initialize_kernel")?;
-
             let cfg = LaunchConfig {
                 grid_dim: (1, 1, 1),
                 block_dim: (1, 1, 1),
                 shared_mem_bytes: 0,
             };
+            let initialize_kernel = module.load_function("initialize_kernel")?;
 
-            unsafe {
-                stream
-                    .launch_builder(&initialize_kernel)
-                    .arg(&(u64::from_be_bytes(seed[8..16].try_into().unwrap())))
-                    .launch(cfg)?;
-            }
+            // Above the loop, and this placement is the entire point of the
+            // mode: the database generation and the index upload are paid once
+            // per precommit rather than once per nonce.
+            //
+            // Note for the spec: `load_index` runs BEFORE the first
+            // `initialize_kernel`, so like `generate_instance` it is outside the
+            // fuel meter. That is deliberate and not exploitable -- it receives
+            // only the `Database` and the blob, never a query -- but it is a
+            // second free phase the enforcement table does not yet mention.
+            let db = $make_db(&track, module.clone(), stream.clone(), &prop)?;
 
-            let save_solution_fn = |solution: &$c::Solution| -> Result<()> {
-                stream.synchronize()?;
-                ctx.synchronize()?;
+            for nonce in nonces {
+                let seeds = seeds_for(&settings, &rand_hash, nonce);
 
-                let mut fuel_usage = stream.alloc_zeros::<u64>(1)?;
-                let mut signature = stream.alloc_zeros::<u64>(1)?;
-                let mut error_stat = stream.alloc_zeros::<u64>(1)?;
-
-                let finalize_kernel = module.load_function("finalize_kernel")?;
-
-                let cfg = LaunchConfig {
-                    grid_dim: (1, 1, 1),
-                    block_dim: (1, 1, 1),
-                    shared_mem_bytes: 0,
+                // Both CPU counters, reset per nonce. See the comment where
+                // the pointers are resolved.
+                unsafe { *fuel_remaining_ptr = max_fuel };
+                unsafe {
+                    *runtime_signature_ptr =
+                        u64::from_be_bytes(seeds.nonce[0..8].try_into().unwrap())
                 };
 
+                let challenge =
+                    $mk_challenge(&db, &seeds, &track, module.clone(), stream.clone(), &prop)?;
+
+                // The device-side counterpart of the two resets above:
+                // `initialize_kernel` zeroes gbl_FUELUSAGE and gbl_ERRORSTAT
+                // and sets gbl_SIGNATURE. Hoisting it out of the loop would
+                // leave the device's fuel accumulating across the bundle while
+                // the CPU's did not -- a half-reset that still dies out of fuel
+                // partway through, just later.
                 unsafe {
                     stream
-                        .launch_builder(&finalize_kernel)
-                        .arg(&mut fuel_usage)
-                        .arg(&mut signature)
-                        .arg(&mut error_stat)
+                        .launch_builder(&initialize_kernel)
+                        .arg(&(u64::from_be_bytes(seeds.nonce[8..16].try_into().unwrap())))
                         .launch(cfg)?;
                 }
 
-                let gpu_fuel_consumed = stream.memcpy_dtov(&fuel_usage)?[0] / gpu_fuel_scale;
-                let cpu_fuel_consumed =
-                    max_fuel - unsafe { **library.get::<*const u64>(b"__fuel_remaining")? };
-                let fuel_consumed = (gpu_fuel_consumed + cpu_fuel_consumed).min(max_fuel + 1);
+                // Both of these are rebuilt per nonce, and both must resolve to
+                // *this* nonce. A stale `output_file` makes every nonce
+                // overwrite one file; a stale `nonce` field stamps every file
+                // in the bundle with the batch's first nonce. Neither fails:
+                // the files are well-formed, the verifier is never asked about
+                // the mismatch, and the slave's Merkle root is silently wrong.
+                let output_file = output_dir.join(format!("{}.json", nonce));
+                let save_solution_fn = |solution: &$c::Solution| -> Result<()> {
+                    stream.synchronize()?;
+                    ctx.synchronize()?;
 
-                let gpu_runtime_signature = stream.memcpy_dtov(&signature)?[0];
-                let cpu_runtime_signature =
-                    unsafe { **library.get::<*const u64>(b"__runtime_signature")? };
-                let runtime_signature = gpu_runtime_signature ^ cpu_runtime_signature;
+                    let mut fuel_usage = stream.alloc_zeros::<u64>(1)?;
+                    let mut signature = stream.alloc_zeros::<u64>(1)?;
+                    let mut error_stat = stream.alloc_zeros::<u64>(1)?;
 
-                let solution = serde_json::to_string(&solution)?;
+                    let finalize_kernel = module.load_function("finalize_kernel")?;
 
-                let output_data = OutputData {
-                    nonce,
-                    runtime_signature,
-                    fuel_consumed,
-                    solution,
-                    #[cfg(target_arch = "x86_64")]
-                    cpu_arch: CPUArchitecture::AMD64,
-                    #[cfg(target_arch = "aarch64")]
-                    cpu_arch: CPUArchitecture::ARM64,
+                    let cfg = LaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (1, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+
+                    unsafe {
+                        stream
+                            .launch_builder(&finalize_kernel)
+                            .arg(&mut fuel_usage)
+                            .arg(&mut signature)
+                            .arg(&mut error_stat)
+                            .launch(cfg)?;
+                    }
+
+                    let gpu_fuel_consumed = stream.memcpy_dtov(&fuel_usage)?[0] / gpu_fuel_scale;
+                    let cpu_fuel_consumed =
+                        max_fuel - unsafe { **library.get::<*const u64>(b"__fuel_remaining")? };
+                    let fuel_consumed = (gpu_fuel_consumed + cpu_fuel_consumed).min(max_fuel + 1);
+
+                    let gpu_runtime_signature = stream.memcpy_dtov(&signature)?[0];
+                    let cpu_runtime_signature =
+                        unsafe { **library.get::<*const u64>(b"__runtime_signature")? };
+                    let runtime_signature = gpu_runtime_signature ^ cpu_runtime_signature;
+
+                    let solution = serde_json::to_string(&solution)?;
+
+                    let output_data = OutputData {
+                        nonce,
+                        runtime_signature,
+                        fuel_consumed,
+                        solution,
+                        #[cfg(target_arch = "x86_64")]
+                        cpu_arch: CPUArchitecture::AMD64,
+                        #[cfg(target_arch = "aarch64")]
+                        cpu_arch: CPUArchitecture::ARM64,
+                    };
+                    fs::write(&output_file, jsonify(&output_data))?;
+                    Ok(())
                 };
-                fs::write(&output_file, jsonify(&output_data))?;
-                Ok(())
-            };
-            let result = solve_challenge_fn(
-                &challenge,
-                &save_solution_fn,
-                hyperparameters,
-                module.clone(),
-                stream.clone(),
-                &prop,
-            );
-            if !output_file.exists() {
-                save_solution_fn(&$c::Solution::new())?;
+                let result = solve_challenge_fn(
+                    &challenge,
+                    &save_solution_fn,
+                    hyperparameters.clone(),
+                    module.clone(),
+                    stream.clone(),
+                    &prop,
+                );
+                if !output_file.exists() {
+                    save_solution_fn(&$c::Solution::new())?;
+                }
+                result?;
             }
-            result
+            Ok(())
+        }};
+    }
+
+    macro_rules! dispatch_challenge {
+        ($c:ident, cpu) => {{
+            refuse_index!($c);
+            let track: $c::Track = parse_track(&settings, stringify!($c))?;
+
+            // library function may exit 87 if it runs out of fuel
+            let solve_challenge_fn = unsafe {
+                library.get::<fn(
+                    &$c::Challenge,
+                    &dyn Fn(&$c::Solution) -> Result<()>,
+                    Option<String>,
+                ) -> Result<()>>(b"entry_point")?
+            };
+
+            for nonce in nonces {
+                let seeds = seeds_for(&settings, &rand_hash, nonce);
+                let seed = seeds.nonce;
+
+                // Reset per nonce, exactly as in the GPU loop.
+                unsafe { *fuel_remaining_ptr = max_fuel };
+                unsafe {
+                    *runtime_signature_ptr = u64::from_be_bytes(seed[0..8].try_into().unwrap())
+                };
+
+                let challenge = $c::Challenge::generate_instance(&seed, &track)?;
+
+                let output_file = output_dir.join(format!("{}.json", nonce));
+                let save_solution_fn = |solution: &$c::Solution| -> Result<()> {
+                    let fuel_consumed = (max_fuel
+                        - unsafe { **library.get::<*const u64>(b"__fuel_remaining")? })
+                    .min(max_fuel + 1);
+                    let runtime_signature =
+                        unsafe { **library.get::<*const u64>(b"__runtime_signature")? };
+
+                    let solution = serde_json::to_string(&solution)?;
+
+                    let output_data = OutputData {
+                        nonce,
+                        runtime_signature,
+                        fuel_consumed,
+                        solution,
+                        #[cfg(target_arch = "x86_64")]
+                        cpu_arch: CPUArchitecture::AMD64,
+                        #[cfg(target_arch = "aarch64")]
+                        cpu_arch: CPUArchitecture::ARM64,
+                    };
+                    fs::write(&output_file, jsonify(&output_data))?;
+                    Ok(())
+                };
+                let result =
+                    solve_challenge_fn(&challenge, &save_solution_fn, hyperparameters.clone());
+                if !output_file.exists() {
+                    save_solution_fn(&$c::Solution::new())?;
+                }
+                result?;
+            }
+            Ok(())
+        }};
+
+        // c005 and c006: no `Database`, no index ABI. They run the same loop,
+        // so `batch` works for them too; there is simply nothing to hoist.
+        ($c:ident, gpu) => {{
+            refuse_index!($c);
+            gpu_common!(
+                $c,
+                |_track: &$c::Track,
+                 _module: Arc<CudaModule>,
+                 _stream: Arc<CudaStream>,
+                 _prop: &cudaDeviceProp|
+                 -> Result<()> { Ok(()) },
+                |_db: &(),
+                 seeds: &Seeds,
+                 track: &$c::Track,
+                 module: Arc<CudaModule>,
+                 stream: Arc<CudaStream>,
+                 prop: &cudaDeviceProp|
+                 -> Result<$c::Challenge> {
+                    $c::Challenge::generate_instance(seeds, track, module, stream, prop)
+                }
+            )
+        }};
+
+        // c004: the database is nonce-free, so it and the index are built once
+        // above the loop and every nonce of the bundle reuses them.
+        ($c:ident, gpu_db) => {{
+            gpu_common!(
+                $c,
+                |track: &$c::Track,
+                 module: Arc<CudaModule>,
+                 stream: Arc<CudaStream>,
+                 prop: &cudaDeviceProp|
+                 -> Result<$c::Database> {
+                    let database = $c::Database::generate(
+                        &db_seed,
+                        track,
+                        module.clone(),
+                        stream.clone(),
+                        prop,
+                    )?;
+
+                    if let Some(index_path) = index_path.as_ref() {
+                        let blob = fs::read(index_path)?;
+                        let load_index_fn = unsafe {
+                            library.get::<fn(
+                                &$c::Database,
+                                &[u8],
+                                Arc<CudaModule>,
+                                Arc<CudaStream>,
+                                &cudaDeviceProp,
+                            ) -> Result<()>>(b"load_index")
+                        }
+                        .map_err(|_| {
+                            anyhow!(
+                                "--index was given but the algorithm does not export \
+                                 `load_index`"
+                            )
+                        })?;
+                        // `map_err` before `?`, not a bare `?`: the algorithm's
+                        // `anyhow::Error` owns a vtable that lives inside the
+                        // `.so`. Propagating it drops `library`, `dlclose`s the
+                        // object, and the caller's `eprintln!` then jumps
+                        // through a dangling pointer -- measured on tig-gpu as
+                        // `Runtime Error: ` followed by a SIGSEGV. Rendering it
+                        // here, while the library is still loaded, hands back a
+                        // plain runtime-owned string.
+                        load_index_fn(&database, &blob, module, stream, prop)
+                            .map_err(|e| anyhow!("{:#}", e))?;
+                    }
+                    Ok(database)
+                },
+                |db: &$c::Database,
+                 seeds: &Seeds,
+                 track: &$c::Track,
+                 module: Arc<CudaModule>,
+                 stream: Arc<CudaStream>,
+                 prop: &cudaDeviceProp|
+                 -> Result<$c::Challenge> {
+                    $c::Challenge::for_nonce(db, seeds, track, module, stream, prop)
+                }
+            )
         }};
     }
 
@@ -469,7 +682,7 @@ pub fn compute_solution(
             #[cfg(not(feature = "c004"))]
             panic!("tig-runtime was not compiled with '--features c004'");
             #[cfg(feature = "c004")]
-            dispatch_challenge!(c004, gpu)
+            dispatch_challenge!(c004, gpu_db)
         }
         "c005" => {
             #[cfg(not(feature = "c005"))]
@@ -1289,10 +1502,286 @@ mod tests {
             "the unwired-flag guard for --memory-cap / --build-timeout is still \
              present; every capped build would exit 84 instead of running"
         );
-        // `--index` is Task 6's and must still be guarded.
+    }
+
+    /// The code of the `gpu_common!` macro -- comment lines stripped -- bounded
+    /// at both ends by the two macro definitions that surround it.
+    ///
+    /// Four tests below assert on offsets inside this slice, and every one of
+    /// them is only as good as the bounding, so a slice that silently matched
+    /// nothing (or matched this helper's own source) would be worse than no
+    /// test. Comments are stripped because the prose inside `gpu_common!`
+    /// names `fuel_remaining_ptr`, `initialize_kernel` and `output_file`
+    /// verbatim, and an ordering assertion a comment can satisfy is not an
+    /// ordering assertion.
+    fn gpu_common_code() -> String {
+        const SRC: &str = include_str!("main.rs");
+        // `concat!` throughout: written as one literal, each needle would occur
+        // in this helper's own source and `find` would match here rather than
+        // at the definition.
+        const OPEN: &str = concat!("macro_rules! gpu", "_common {");
+        const CLOSE: &str = concat!("macro_rules! dispatch", "_challenge {");
+        for needle in [OPEN, CLOSE] {
+            assert_eq!(
+                SRC.matches(needle).count(),
+                1,
+                "expected exactly one `{}` in main.rs; the scan cannot tell which \
+                 one to bound",
+                needle
+            );
+        }
+        let start = SRC.find(OPEN).unwrap();
+        let end = SRC.find(CLOSE).unwrap();
         assert!(
-            src.contains("parsed but not loaded yet"),
-            "the --index guard belongs to Task 6 and must not be removed here"
+            start < end,
+            "gpu_common! must be defined before dispatch_challenge! or the slice \
+             runs backwards"
         );
+        let body = &SRC[start..end];
+        assert!(
+            body.len() > 2000 && body.contains("solve_challenge_fn"),
+            "sliced {} bytes that do not look like gpu_common!'s body",
+            body.len()
+        );
+        body.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn batch_and_index_are_no_longer_guarded_as_unwired() {
+        // Task 4 refused `batch` outright and Task 5 kept the `--index` guard,
+        // precisely so neither flag could lie about what it does. Task 6 wires
+        // both; leaving either guard in place makes every batched or indexed
+        // run exit 84 instead of running.
+        let src = include_str!("main.rs");
+        assert!(
+            !src.contains(concat!("not implemented", " yet")),
+            "the batch subcommand's unwired guard is still present; every \
+             batched run would exit 84 instead of running"
+        );
+        assert!(
+            !src.contains(concat!("parsed but not ", "loaded yet")),
+            "the --index guard is still present; every indexed run would exit 84"
+        );
+        // The positive half. Deleting the guard without wiring the flag is the
+        // dangerous outcome, not a loud one: `--index blob` would then solve
+        // *without* the index and exit 0.
+        assert!(
+            src.contains(concat!("load_index", "_fn(&database, &blob")),
+            "--index is unguarded but nothing calls `load_index` on the query \
+             side; the flag would be silently ignored and the run would solve \
+             without the index it was given"
+        );
+    }
+
+    #[test]
+    fn both_forms_reach_one_dispatch_that_reads_index_from_the_subcommand() {
+        // `--index` is declared in TWO places -- on the root command and on
+        // `batch`. Reading arguments off `matches` rather than off the matched
+        // subcommand leaves `batch --index blob` solving without the index and
+        // exiting 0, which is the exact silent-wrong-answer the guard existed
+        // to prevent. And a second, batch-only call site is where the batched
+        // and single-nonce paths would quietly drift apart.
+        const SRC: &str = include_str!("main.rs");
+        const CALL: &str = concat!("= compute_", "solution(");
+        assert_eq!(
+            SRC.matches(CALL).count(),
+            1,
+            "expected exactly one call site for compute_solution; two means the \
+             legacy and batch forms are separate code paths"
+        );
+        let start = SRC.find(CALL).unwrap();
+        let end = start
+            + SRC[start..]
+                .find(") {")
+                .expect("the call must be the scrutinee of an `if let Err`");
+        let args = &SRC[start..end];
+        assert!(
+            args.contains(concat!("m.get_one::<PathBuf>(\"", "index\")")),
+            "the index path must be read off the matched form `m`, not off the \
+             root `matches`; got: {}",
+            args
+        );
+        assert!(
+            args.contains("start_nonce") && args.contains("num_nonces"),
+            "the single call site must be given the range, got: {}",
+            args
+        );
+    }
+
+    #[test]
+    fn a_batch_of_one_is_the_legacy_form() {
+        // The plan's "one code path, not two" rests on this: the legacy form is
+        // start_nonce = NONCE, num_nonces = 1.
+        assert_eq!(nonce_range(7, 1).unwrap(), 7..8);
+        assert_eq!(nonce_range(3, 5).unwrap(), 3..8);
+        assert_eq!(nonce_range(0, 5).unwrap().collect::<Vec<_>>(), vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn a_nonce_range_that_would_wrap_is_refused_not_silently_emptied() {
+        // With a plain `start + num` in a release build this wraps: the range
+        // becomes empty (or absurd), the process writes nothing and exits 0,
+        // and the caller cannot tell it from a batch that worked.
+        assert!(nonce_range(u64::MAX, 2).is_err());
+        assert!(nonce_range(u64::MAX - 1, 3).is_err());
+        // The boundary on the other side: exactly reaching u64::MAX is fine.
+        assert_eq!(nonce_range(u64::MAX - 1, 1).unwrap(), (u64::MAX - 1)..u64::MAX);
+        // Zero is rejected here too, not only by clap's range parser: a caller
+        // that constructs the arguments itself must not get an empty batch.
+        assert!(nonce_range(0, 0).is_err());
+        assert!(nonce_range(5, 0).is_err());
+    }
+
+    #[test]
+    fn every_per_nonce_step_lives_inside_the_loop() {
+        // The single highest-value structural property in this task, and every
+        // way of getting it wrong is silent:
+        //
+        //   * a CPU fuel/signature reset hoisted above the loop carries nonce
+        //     k-1's spend into nonce k, and the bundle dies partway through
+        //     with an out-of-fuel exit that names nothing;
+        //   * `initialize_kernel` hoisted above the loop does the same to the
+        //     device's gbl_FUELUSAGE;
+        //   * `output_file` hoisted above the loop makes every nonce overwrite
+        //     one file -- five nonces, one result, exit 0;
+        //   * the save closure hoisted above the loop stamps every file in the
+        //     bundle with the batch's first nonce. The files are well formed,
+        //     the verifier is never asked about the mismatch, and the slave's
+        //     Merkle root is silently wrong.
+        //
+        // The GPU test for the first two lives on tig-gpu and cannot run here.
+        let code = gpu_common_code();
+        let loop_start = offset_of(&code, concat!("for nonce in ", "nonces {"));
+        for needle in [
+            concat!("*fuel_remaining", "_ptr = max_fuel"),
+            concat!("*runtime_signature", "_ptr ="),
+            concat!("launch_builder(&initialize", "_kernel)"),
+            concat!("output_dir.join(format!(\"{}", ".json\", nonce))"),
+            concat!("let save_solution", "_fn = |solution:"),
+        ] {
+            let at = offset_of(&code, needle);
+            assert!(
+                at > loop_start,
+                "`{}` must be inside the per-nonce loop (loop@{} found@{})",
+                needle,
+                loop_start,
+                at
+            );
+        }
+    }
+
+    #[test]
+    fn the_database_and_the_index_are_paid_once_above_the_loop() {
+        // The whole point of the mode. If `$make_db` -- which generates the
+        // database and uploads the index -- ends up inside the loop, the batch
+        // still produces correct output and still exits 0; it is simply as slow
+        // as one process per nonce, and the task has bought nothing.
+        let code = gpu_common_code();
+        let loop_start = offset_of(&code, concat!("for nonce in ", "nonces {"));
+        let make_db = offset_of(&code, concat!("$make", "_db(&track,"));
+        assert!(
+            make_db < loop_start,
+            "the database and the index upload must happen ONCE, above the loop \
+             (make_db@{} loop@{})",
+            make_db,
+            loop_start
+        );
+    }
+
+    #[test]
+    fn the_gpu_device_is_picked_from_the_start_nonce() {
+        // The context is created once, above the loop, so there is no per-nonce
+        // device left to pick. `nonce % num_gpus` inside the loop would not
+        // even compile against a context that already exists -- but written
+        // above the loop with a stale outer `nonce` it compiles fine and
+        // silently pins the whole bundle by the wrong index.
+        let code = gpu_common_code();
+        assert!(
+            code.contains(concat!("start_nonce % num", "_gpus")),
+            "the device must be chosen from start_nonce"
+        );
+        assert!(
+            !code.contains(concat!("(nonce % num", "_gpus")),
+            "the device must not be chosen from a per-nonce value"
+        );
+    }
+
+    #[test]
+    fn the_index_load_error_is_rendered_before_the_library_is_unloaded() {
+        // Same dlclose/vtable trap as `build_index`: the algorithm's
+        // `anyhow::Error` owns a vtable inside the `.so`, and a bare `?` drops
+        // `library` while the error is still alive. Measured on tig-gpu as
+        // `Runtime Error: ` followed by a SIGSEGV with rc 139.
+        const SRC: &str = include_str!("main.rs");
+        const CALL: &str = concat!("load_index", "_fn(&database,");
+        assert_eq!(
+            SRC.matches(CALL).count(),
+            1,
+            "expected exactly one call to load_index_fn"
+        );
+        let start = SRC.find(CALL).unwrap();
+        let stmt = &SRC[start..];
+        let end = stmt.find("?;").expect("the call must propagate with `?`");
+        // The needle is the *formatting*, not `.map_err(`: a no-op
+        // `.map_err(|e| e)` restores the segfault exactly while still
+        // containing `.map_err(`, so that token discriminates nothing.
+        assert!(
+            stmt[..end].contains(concat!("anyhow!(\"{", ":#}\"")),
+            "the algorithm's load_index error must be rendered to an owned string \
+             while the library is still loaded"
+        );
+    }
+
+    #[test]
+    fn index_parses_on_both_the_legacy_form_and_the_batch_subcommand() {
+        // `--index` is declared twice. A test that only exercises one of them
+        // passes while the other is silently dropped.
+        let m = cli()
+            .try_get_matches_from(vec![
+                "tig-runtime",
+                "{}",
+                "hash",
+                "7",
+                "lib.so",
+                "--index",
+                "/tmp/idx.blob",
+            ])
+            .expect("the legacy form must accept --index");
+        assert_eq!(
+            m.get_one::<PathBuf>("index"),
+            Some(&PathBuf::from("/tmp/idx.blob"))
+        );
+
+        let m = cli()
+            .try_get_matches_from(vec![
+                "tig-runtime",
+                "batch",
+                "{}",
+                "hash",
+                "lib.so",
+                "--start-nonce",
+                "3",
+                "--num-nonces",
+                "5",
+                "--index",
+                "/tmp/idx.blob",
+                "--output",
+                "/tmp/out",
+            ])
+            .expect("batch must accept --index");
+        let sub = m.subcommand_matches("batch").unwrap();
+        assert_eq!(
+            sub.get_one::<PathBuf>("index"),
+            Some(&PathBuf::from("/tmp/idx.blob"))
+        );
+        assert_eq!(
+            sub.get_one::<PathBuf>("output"),
+            Some(&PathBuf::from("/tmp/out"))
+        );
+        assert_eq!(*sub.get_one::<u64>("start-nonce").unwrap(), 3);
+        assert_eq!(*sub.get_one::<u64>("num-nonces").unwrap(), 5);
     }
 }
