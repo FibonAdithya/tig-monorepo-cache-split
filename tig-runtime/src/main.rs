@@ -2,6 +2,8 @@ use anyhow::{anyhow, Result};
 use clap::{arg, Command};
 use libloading::Library;
 use serde_json::{Map, Value};
+#[cfg(feature = "c004")]
+use std::time::Duration;
 use std::{fs, panic, path::PathBuf};
 use tig_challenges::*;
 use tig_structs::core::{BenchmarkSettings, CPUArchitecture, OutputData};
@@ -142,21 +144,9 @@ fn main() {
     let matches = cli().get_matches();
 
     if let Some(sub) = matches.subcommand_matches("build-index") {
-        // Same reasoning as the `batch` guard below: an argument that parses
-        // and is then ignored is the silent-wrong-answer class. Both of these
-        // have a `default_value`, so "supplied" has to mean *explicitly passed
-        // on the command line* -- `get_one` cannot tell the difference and
-        // would reject every invocation.
-        for flag in ["memory-cap", "build-timeout"] {
-            if sub.value_source(flag) == Some(clap::parser::ValueSource::CommandLine) {
-                eprintln!(
-                    "Runtime Error: --{} is parsed but not enforced yet (Task 5 wires it); \
-                     refusing rather than silently ignoring it",
-                    flag
-                );
-                std::process::exit(84);
-            }
-        }
+        // `--memory-cap` and `--build-timeout` were guarded here while they
+        // parsed but did nothing. Task 5 wires both -- the balloon and the
+        // watchdog inside `build_index` -- so the guards are gone.
 
         // Must exit non-zero, not fall through: a `--features c005` build has
         // `cuda` but no `c004`, and a bare `return` here would exit 0 having
@@ -564,6 +554,39 @@ fn index_tmp_path(index_out: &std::path::Path) -> PathBuf {
     PathBuf::from(tmp)
 }
 
+/// No allocator hands out 100% of reported free memory -- fragmentation and
+/// per-allocation bookkeeping always leave a sliver unreachable -- so a balloon
+/// of exactly `free - cap` fails on a healthy device and every build errors
+/// out. Reserve a fixed, documented sliver instead, and treat the effective cap
+/// as `memory_cap_bytes + BALLOON_SLACK`.
+#[cfg(any(feature = "c004", test))]
+const BALLOON_SLACK: u64 = 64 * 1024 * 1024;
+
+/// How many bytes the balloon must hold so that only `memory_cap_bytes`
+/// (+ [`BALLOON_SLACK`]) of device memory is reachable by the algorithm.
+///
+/// Split out of `build_index` so the arithmetic is testable without a GPU: the
+/// refusal is the load-bearing half of the cap, and a cap that silently sizes
+/// itself to zero is worse than no build at all.
+#[cfg(any(feature = "c004", test))]
+fn balloon_size(free: u64, total: u64, memory_cap_bytes: u64) -> Result<u64> {
+    // `saturating_add`, not `+`: a nonsense `--memory-cap u64::MAX` would
+    // otherwise wrap to a tiny number, pass the check, and hand back a balloon
+    // sized from a wrapped subtraction.
+    let required = memory_cap_bytes.saturating_add(BALLOON_SLACK);
+    if free < required {
+        return Err(anyhow!(
+            "device has {} bytes free of {} but the memory cap is {} (+{} slack); \
+             refusing to run with a cap that would not be enforced",
+            free,
+            total,
+            memory_cap_bytes,
+            BALLOON_SLACK
+        ));
+    }
+    Ok(free - required)
+}
+
 #[cfg(feature = "c004")]
 pub fn build_index(
     settings: String,
@@ -572,12 +595,30 @@ pub fn build_index(
     hyperparameters: Option<String>,
     ptx_path: PathBuf,
     build_fuel: u64,
-    _memory_cap_bytes: u64,
-    _timeout_secs: u64,
+    memory_cap_bytes: u64,
+    timeout_secs: u64,
     index_out: PathBuf,
     gpu_device: Option<usize>,
 ) -> Result<()> {
     let settings = load_settings(&settings);
+
+    // A flat ceiling that kills a runaway build. It is not the budget -- the
+    // budget is `--build-fuel`, which is deterministic and hardware
+    // independent. This only catches a build that will never finish.
+    //
+    // The thread is deliberately detached and never cancelled: it dies with the
+    // process. Exit 85 is distinct from 84 (runtime error) and 87 (out of
+    // fuel), so a caller can tell a timeout from a failure.
+    let timeout = Duration::from_secs(timeout_secs);
+    std::thread::spawn(move || {
+        std::thread::sleep(timeout);
+        eprintln!(
+            "build exceeded the {}s wall-clock watchdog",
+            timeout.as_secs()
+        );
+        std::process::exit(85);
+    });
+
     // No nonce is derived here and none can be passed -- the `build-index`
     // subcommand has no nonce argument at all. This is the property the design
     // rests on: a build process cannot compute any query set because the
@@ -638,6 +679,30 @@ pub fn build_index(
     let database =
         c004::Database::generate(&db_seed, &track, module.clone(), stream.clone(), &prop)?;
 
+    // Inflated *after* `Database::generate` and *before* `build_index_fn`, so
+    // the database and the generator's scratch sit outside the algorithm's cap
+    // rather than being charged against it.
+    //
+    // A hard cap, not a sampled one. Polling `mem_get_info` from the watchdog
+    // would miss a spike between samples; holding the surplus makes any
+    // allocation past the cap fail as an ordinary cudaMalloc error inside the
+    // algorithm.
+    let (free, total) = cudarc::driver::result::mem_get_info()?;
+    let balloon_bytes = balloon_size(free as u64, total as u64, memory_cap_bytes)?;
+    // Deliberately NOT retried at a smaller size on failure: a smaller balloon
+    // is a *looser* cap, so a shrink loop silently converts "cannot enforce the
+    // cap" into "ran without one".
+    let _balloon = stream
+        .alloc_zeros::<u8>(balloon_bytes as usize)
+        .map_err(|e| {
+            anyhow!(
+                "could not inflate the {}-byte memory balloon ({}); the cap would be \
+             unenforced, so the build is refused rather than run uncapped",
+                balloon_bytes,
+                e
+            )
+        })?;
+
     let cfg = LaunchConfig {
         grid_dim: (1, 1, 1),
         block_dim: (1, 1, 1),
@@ -651,7 +716,21 @@ pub fn build_index(
             .launch(cfg)?;
     }
 
-    let blob = build_index_fn(&database, hyperparameters, module.clone(), stream.clone(), &prop)?;
+    // `map_err` before `?`, not a bare `?`: the `anyhow::Error` the algorithm
+    // returns owns a vtable that lives inside the `.so`. Propagating it out of
+    // this function drops `library`, `dlclose`s the object, and the caller's
+    // `eprintln!("Runtime Error: {}", e)` then jumps through a dangling
+    // pointer -- observed as a SIGSEGV that printed `Runtime Error: ` and
+    // nothing else. Rendering the message here, while the library is still
+    // loaded, hands the caller a plain runtime-owned string instead.
+    let blob = build_index_fn(
+        &database,
+        hyperparameters,
+        module.clone(),
+        stream.clone(),
+        &prop,
+    )
+    .map_err(|e| anyhow!("{:#}", e))?;
 
     // A GPU fuel trap is asynchronous: `build_index_fn` can return Ok while the
     // device has already trapped and set gbl_ERRORSTAT. Without this, a build
@@ -850,7 +929,13 @@ mod tests {
                 "1",
             ])
             .expect("a batch of one nonce must parse");
-        assert_eq!(*m.subcommand_matches("batch").unwrap().get_one::<u64>("num-nonces").unwrap(), 1);
+        assert_eq!(
+            *m.subcommand_matches("batch")
+                .unwrap()
+                .get_one::<u64>("num-nonces")
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -954,5 +1039,124 @@ mod tests {
         // Same directory, or the rename is neither atomic nor guaranteed
         // same-filesystem.
         assert_eq!(a.parent(), std::path::Path::new("/x/idx.blob").parent());
+    }
+
+    #[test]
+    fn the_balloon_absorbs_everything_the_cap_does_not_allow() {
+        // 12 GiB free, 2 GiB cap: the balloon must hold the whole remainder
+        // minus the documented slack, not some fraction of it. A balloon
+        // smaller than this is a looser cap than the caller asked for.
+        let free = 12 * 1024 * 1024 * 1024u64;
+        let cap = 2 * 1024 * 1024 * 1024u64;
+        let bytes = balloon_size(free, free, cap).unwrap();
+        assert_eq!(bytes, free - cap - BALLOON_SLACK);
+        // Restating the invariant the number exists to enforce, so a changed
+        // slack constant still has to keep the cap honest.
+        assert_eq!(free - bytes, cap + BALLOON_SLACK);
+    }
+
+    #[test]
+    fn a_cap_larger_than_free_memory_is_refused_not_silently_shrunk() {
+        // 32 GiB cap on a 12 GiB card. The dangerous outcome is a zero-sized
+        // (or wrapped) balloon and a build that runs completely uncapped, so
+        // this must be an error, never an `Ok(0)`.
+        let free = 12 * 1024 * 1024 * 1024u64;
+        let err = balloon_size(free, free, 32 * 1024 * 1024 * 1024)
+            .expect_err("a cap above free memory must be refused, not honoured with no balloon");
+        assert!(
+            err.to_string().contains("would not be enforced"),
+            "the refusal must say the cap is unenforceable, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn the_cap_is_refused_when_only_the_slack_is_missing() {
+        // The boundary, both sides of it. `free == cap + slack` is exactly
+        // enough (a zero-byte balloon is correct there -- nothing is
+        // reachable beyond the cap); one byte less is not, and an off-by-one
+        // in the comparison would let a build run a byte over its ceiling.
+        let cap = 2 * 1024 * 1024 * 1024u64;
+        assert_eq!(
+            balloon_size(cap + BALLOON_SLACK, cap + BALLOON_SLACK, cap).unwrap(),
+            0
+        );
+        assert!(balloon_size(cap + BALLOON_SLACK - 1, cap + BALLOON_SLACK - 1, cap).is_err());
+    }
+
+    #[test]
+    fn an_absurd_cap_cannot_wrap_into_a_tiny_balloon() {
+        // `cap + BALLOON_SLACK` overflows u64 here. With a plain `+` in a
+        // release build this wraps to a small number, passes the `free <`
+        // check, and `free - required` then hands back a nearly-free-sized
+        // balloon while claiming to enforce a 16-exabyte cap.
+        let free = 12 * 1024 * 1024 * 1024u64;
+        assert!(balloon_size(free, free, u64::MAX).is_err());
+        assert!(balloon_size(free, free, u64::MAX - BALLOON_SLACK + 1).is_err());
+    }
+
+    #[test]
+    fn the_watchdog_exits_with_its_own_code_and_not_the_generic_error_code() {
+        // 85 has to stay distinct from 84 (runtime error) and 87 (out of
+        // fuel), or a caller cannot tell a build that will never finish from
+        // one that failed. The watchdog thread is unreachable from a unit test
+        // without a GPU, so assert on the source of `build_index` itself.
+        let src = include_str!("main.rs");
+        const NEEDLE: &str = concat!("pub fn ", "build_index(");
+        let start = src.find(NEEDLE).expect("build_index must exist");
+        let body = &src[start..];
+        let end = body
+            .find("\n}\n")
+            .expect("could not find the end of build_index");
+        let body = &body[..end];
+        assert!(
+            body.contains("std::process::exit(85)"),
+            "build_index must install a watchdog that exits 85"
+        );
+        assert!(
+            !body.contains("std::process::exit(84)") && !body.contains("std::process::exit(87)"),
+            "the watchdog must not reuse the runtime-error or out-of-fuel exit codes"
+        );
+    }
+
+    #[test]
+    fn the_algorithms_error_is_rendered_before_the_library_is_unloaded() {
+        // The algorithm's `anyhow::Error` carries a vtable that lives in the
+        // `.so`. Propagating it with a bare `?` drops `library`, dlclose()s the
+        // object, and the caller's `eprintln!` then jumps through a dangling
+        // pointer -- measured on tig-gpu as `Runtime Error: ` followed by a
+        // SIGSEGV, with the actual allocation-failure message never printed.
+        let src = include_str!("main.rs");
+        let call = src
+            .find("build_index_fn(")
+            .expect("build_index must call the algorithm's build_index");
+        // Bound the window at the `?` that propagates, not at the first `;`:
+        // rustfmt splits the call across lines, so a `;`-bounded window can
+        // stop before the `.map_err` it is looking for.
+        let stmt = &src[call..];
+        let end = stmt.find("?;").expect("the call must propagate with `?`");
+        assert!(
+            stmt[..end].contains(".map_err("),
+            "the algorithm's error must be rendered to an owned string while the \
+             library is still loaded; a bare `?` here segfaults the error path"
+        );
+    }
+
+    #[test]
+    fn the_build_index_flags_are_no_longer_guarded_as_unwired() {
+        // Task 4 rejected explicit `--memory-cap` / `--build-timeout` so the
+        // flags could not lie about being enforced. Task 5 enforces them, so
+        // the guards must be gone -- otherwise every capped build exits 84.
+        let src = include_str!("main.rs");
+        assert!(
+            !src.contains(concat!("parsed but not ", "enforced yet")),
+            "the unwired-flag guard for --memory-cap / --build-timeout is still \
+             present; every capped build would exit 84 instead of running"
+        );
+        // `--index` is Task 6's and must still be guarded.
+        assert!(
+            src.contains("parsed but not loaded yet"),
+            "the --index guard belongs to Task 6 and must not be removed here"
+        );
     }
 }
