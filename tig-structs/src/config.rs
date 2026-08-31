@@ -4,6 +4,19 @@ use std::collections::HashMap;
 pub use tig_utils::Frontier;
 use tig_utils::PreciseNumber;
 
+/// The factor the runtime multiplies a fuel budget by before patching it into
+/// the PTX, so GPU fuel units line up loosely with CPU fuel units.
+///
+/// It lives here, in `tig-structs`, because two crates that cannot see each
+/// other both need the same number: `tig-runtime` patches the PTX with it (the
+/// shared GPU solve loop and `build_index`), and `tig-protocol` rejects a
+/// `max_build_fuel_budget` that would overflow `u64` once scaled by it
+/// (`contracts/benchmarks.rs`). `tig-protocol` has no dependency on
+/// `tig-runtime` and must not gain one, and both already depend on
+/// `tig-structs`. Changing the value here changes every site at once; a
+/// second literal `20` anywhere in either crate is a bug.
+pub const GPU_FUEL_SCALE: u64 = 20;
+
 serializable_struct_with_getters! {
     ProtocolConfig {
         advances: AdvancesConfig,

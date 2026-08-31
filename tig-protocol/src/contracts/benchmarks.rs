@@ -126,7 +126,7 @@ pub async fn submit_precommit<T: Context>(
     // on the Option; never `if let Some(x) = .. if x > 0`, and never a falsy
     // check on the u64.
     if let Some(max_build_fuel_budget) = challenge_config.max_build_fuel_budget {
-        if max_build_fuel_budget.checked_mul(20).is_none() {
+        if max_build_fuel_budget.checked_mul(GPU_FUEL_SCALE).is_none() {
             return Err(anyhow!(
                 "max_build_fuel_budget {} overflows when scaled by the GPU fuel scale",
                 max_build_fuel_budget
@@ -441,7 +441,7 @@ mod tests {
 
     #[test]
     fn build_fuel_budget_does_not_overflow_at_the_protocol_maximum() {
-        // The runtime later multiplies this by gpu_fuel_scale = 20. The
+        // The runtime later multiplies this by `GPU_FUEL_SCALE`. The
         // mutation this catches is doing the product in u64: 0.25 * 1e6 nonces
         // * 5e12 fuel is 1.25e18, and 1.25e18 * 20 exceeds u64, which would
         // wrap to a tiny patched fuel limit and make every build trap
@@ -449,6 +449,9 @@ mod tests {
         let cap = 100_000_000_000_000u64;
         let got = calc_build_fuel_budget(0.25, 1_000_000, 5_000_000_000_000, cap);
         assert_eq!(got, cap);
-        assert!(got.checked_mul(20).is_some(), "scaled build fuel must fit in u64");
+        assert!(
+            got.checked_mul(GPU_FUEL_SCALE).is_some(),
+            "scaled build fuel must fit in u64"
+        );
     }
 }
