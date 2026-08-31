@@ -99,9 +99,10 @@ of 358 MB costs ~1.4 ms at T4 bandwidth (~3% of an estimated 50 ms nonce) and
 > below). The layout claim survives; the reason for making it does not.**
 >
 > "All 105 c004 algorithms rebuilt and resubmitted" was the cost this copy was
-> bought to avoid. Part 1 of the Validation *measured* that all 105 must be
-> rebuilt anyway, because the GAN `kernels.cu` rewrite already on this branch
-> changed the kernel names the generation path calls. So the unbroken ABI is
+> bought to avoid. Part 1 of the Validation *measured* that they must be rebuilt
+> anyway - directly for all 88 of the 105 that have a runnable mainnet binary -
+> because the GAN `kernels.cu` rewrite already on this branch changed the kernel
+> names the generation path calls. So the unbroken ABI is
 > unbroken only for algorithms **already rebuilt against this branch**, and this
 > spec's own Blast radius section records that there are currently **zero** of
 > those. The copy is being paid to preserve compatibility with a population that
@@ -112,11 +113,25 @@ of 358 MB costs ~1.4 ms at T4 bandwidth (~3% of an estimated 50 ms nonce) and
 > the database rather than copying it - would need a lifetime parameter on
 > `Challenge` (`Challenge<'a>` holding `&'a CudaSlice<f32>`), which is itself a
 > further ABI change on top of the one the GAN work already forces. Set against
-> that: ~358 MB of device memory per nonce and ~1.4 ms of copy, on a card where
-> the 12 GB budget is already the binding constraint. Since every algorithm has
-> to be rebuilt regardless, making both ABI changes in one rebuild is strictly
-> cheaper than making them in two - but only if the decision is taken *before*
-> the rebuild happens.
+> that: ~358 MB of device memory per nonce and ~1.4 ms of copy.
+>
+> **Sized against the deployment target, not the test rig.** The target is the
+> weakest listed `ComputeType` - `AWS_G4dn`, a T4 with **16 GB** - as the
+> Enforcement section sizes it, where the query process must hold the database,
+> its per-nonce copy, the index and the queries together. 358 MB is ~2.2% of
+> that 16 GB, against ~0.94 GB of fixed costs. So **memory pressure is a weak
+> argument for revisiting this decision, and it should not be leaned on**: the
+> real cost of the copy is the ABI commitment it locks in, not the bytes. (An
+> earlier draft of this note priced the copy against "a card where the 12 GB
+> budget is already the binding constraint". That was the RTX 3060 the Validation
+> below was measured on, not the deployment target, and 12 GB appears nowhere
+> else in this document. Corrected.)
+>
+> Since every algorithm has to be rebuilt regardless, there is an argument that
+> making both ABI changes in one rebuild is cheaper than making them in two - but
+> only if the decision is taken *before* the rebuild happens. That is offered as
+> a reason to look at the question now, not as a costed claim; nothing here
+> measures the cost of a second resubmission round.
 >
 > Nothing downstream is blocked by this and no code was changed on account of
 > it: the implementation is correct and reviewed, and D5's layout claim is
@@ -394,9 +409,9 @@ statement is two-part:
   a changed database instance. What was measured is narrower than "no blast
   radius": it is that **no algorithm has to be rebuilt on account of this
   design.**
-- **But the GAN `kernels.cu` rewrite already on this branch requires all 105
-  mainnet c004 algorithms to be rebuilt and resubmitted, and that cost was
-  already owed before this design existed.** Mainnet PTX exports
+- **But the GAN `kernels.cu` rewrite already on this branch requires every
+  mainnet c004 algorithm (105 listed) to be rebuilt and resubmitted, and that
+  cost was already owed before this design existed.** Mainnet PTX exports
   `generate_clusters` / `generate_vectors`; this branch's generation path calls
   `gan_sample_latents`, `gan_linear` and `recall_audit`. Measured across every
   mainnet c004 binary that exists (88 of the 105 listed algorithms have a
@@ -470,10 +485,22 @@ belong here.
    confirmation and the first nonce?** The build cannot start until `rand_hash`
    is known, so it is serial latency ahead of every precommit.
 3. ~~**Verify the no-rebuild claim** by running an unmodified c004 algorithm
-   against the split runtime.~~ **ANSWERED 2026-08-31 — see Validation.** The
-   split adds no blast radius of its own and D5 is measured to hold, but the GAN
-   `kernels.cu` rewrite already on this branch does require all 105 mainnet c004
-   algorithms to be rebuilt and resubmitted. Blast radius above is corrected.
+   against the split runtime.~~ **ANSWERED 2026-08-31 — see Blast radius and
+   Validation above, both corrected in place; read them rather than this
+   summary.** Three things, and the scoping on the first is load-bearing:
+   (a) the split adds no ***algorithm-rebuild*** blast radius of its own — it
+   does have blast radius of other kinds, every item in Blast radius' "What does
+   change" list, so this is not "no blast radius";
+   (b) D5's `Challenge` layout claim is measured to hold, but its *rationale* is
+   voided — see the note under D5, since what it protects is a population of
+   zero;
+   (c) the GAN `kernels.cu` rewrite already on this branch does require the
+   mainnet c004 algorithms to be rebuilt and resubmitted (measured: 88 of the
+   105 listed algorithms have a runnable binary; 88/88 export the pre-GAN
+   kernels, 0/88 export any GAN kernel), and that cost was already owed before
+   this design existed.
+   **Not closed by this:** the branch-level blocker in Validation — no
+   competitive algorithm has been shown to clear the 0.95 recall bar.
 4. **Throughput knock-on.** If per-nonce time falls ~50-100x, a benchmarker's
    nonce rate rises correspondingly. `per_nonce_fee`, `max_qualifiers_per_track`
    (100) and the qualifier dynamics were calibrated against today's rate and may
@@ -868,7 +895,7 @@ cleared by an approximate method' is judgement, not measurement". The only end-t
 anywhere in this validation is `quality: 72174`, and that is from a **pre-GAN** runtime on the
 retired mean-distance map; it says nothing about recall. Whoever ships this branch owes a
 measurement of a real ANN algorithm against the 950000 bar before the rebuild-and-resubmit is asked
-of 105 algorithm authors.
+of the c004 algorithm authors.
 
 ### What else remains unestablished
 
