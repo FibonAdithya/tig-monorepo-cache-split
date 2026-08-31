@@ -342,15 +342,29 @@ find one; the honest fix for that is verified re-execution, which D2 defers.
 
 ## Blast radius
 
-Because the split is host-side and `kernels.cu` is untouched, existing PTX
-already exports `gan_sample_latents` and `gan_linear` with the signatures the new
-generation path calls. Combined with D5's unchanged `Challenge` layout, **no
-existing algorithm needs rebuilding**: old algorithms keep running index-free,
-new ones opt in by exporting the two symbols. Trap #1 from the migration notes
-(`build_ptx` baking the challenge's `.cu` into every algorithm's PTX) bites only
-on kernel changes. *This is an inference from the code and must be verified by
-running an unmodified algorithm against the split runtime before it is relied
-on.*
+**Corrected 2026-08-31 by measurement — see Validation below. The original wording
+("no existing algorithm needs rebuilding") was false as written.** The accurate
+statement is two-part:
+
+- **The split adds no blast radius of its own.** It is host-side, `kernels.cu` is
+  byte-identical across `dbb30e99..be650a7c`, and D5's `Challenge` layout is
+  unchanged. Both halves are now measured: an algorithm binary built before the
+  split runs unmodified against the split runtime and reads every `Challenge`
+  field correctly.
+- **But the GAN `kernels.cu` rewrite already on this branch requires all 105
+  mainnet c004 algorithms to be rebuilt and resubmitted, and that cost was
+  already owed before this design existed.** Mainnet PTX exports
+  `generate_clusters` / `generate_vectors`; this branch's generation path calls
+  `gan_sample_latents`, `gan_linear` and `recall_audit`, which no mainnet PTX
+  contains. A mainnet algorithm dies `CUDA_ERROR_NOT_FOUND "named symbol not
+  found"` against this branch — and dies identically against the commit
+  immediately *before* this design's first commit.
+
+So "old algorithms keep running index-free, new ones opt in by exporting
+`build_index`/`load_index`" holds only among algorithms already rebuilt against
+the GAN branch. Trap #1 from the migration notes (`build_ptx` baking the
+challenge's `.cu` into every algorithm's PTX) bites only on kernel changes — the
+split makes none, the GAN work made many.
 
 What does change:
 
@@ -404,8 +418,11 @@ belong here.
 2. **Does `lifespan_period` tolerate a build inserted between precommit
    confirmation and the first nonce?** The build cannot start until `rand_hash`
    is known, so it is serial latency ahead of every precommit.
-3. **Verify the no-rebuild claim** by running an unmodified c004 algorithm
-   against the split runtime.
+3. ~~**Verify the no-rebuild claim** by running an unmodified c004 algorithm
+   against the split runtime.~~ **ANSWERED 2026-08-31 — see Validation.** The
+   split adds no blast radius of its own and D5 is measured to hold, but the GAN
+   `kernels.cu` rewrite already on this branch does require all 105 mainnet c004
+   algorithms to be rebuilt and resubmitted. Blast radius above is corrected.
 4. **Throughput knock-on.** If per-nonce time falls ~50-100x, a benchmarker's
    nonce rate rises correspondingly. `per_nonce_fee`, `max_qualifiers_per_track`
    (100) and the qualifier dynamics were calibrated against today's rate and may
@@ -420,11 +437,20 @@ Measured 2026-08-31 on `tig-gpu` (RTX 3060, sm_86, CUDA 12.6.3) against branch H
 
 ### The claim under test
 
-The Blast radius section above asserts that "existing PTX already exports
+The Blast radius section above asserted that "existing PTX already exports
 `gan_sample_latents` and `gan_linear`" and therefore **no existing algorithm needs
-rebuilding**, flagged there as an inference to be verified. It has now been run.
+rebuilding**, flagged there as an inference to be verified. It has two halves, and both have now
+been run:
 
-### Result: the sentence is false for mainnet, and the split is not what makes it false
+- **Part 1 — the PTX half.** Does an unmodified mainnet algorithm's PTX carry the kernels the
+  generation path calls? **Measured, and refuted for mainnet — but the split is not what refutes
+  it.**
+- **Part 2 — the D5 half.** Does an algorithm binary built before the split read `Challenge`'s
+  fields at the right offsets under the split runtime? **Measured, and it holds.** This is the half
+  that justifies `Challenge::for_nonce` taking an owned 358 MB device-to-device copy instead of a
+  borrow.
+
+### Part 1 result: the sentence is false for mainnet, and the split is not what makes it false
 
 `there_v10` (`c004_a100`, merged @ round 124) was downloaded prebuilt via
 `scripts/download_algorithm` and never rebuilt. Its PTX exports the *pre-GAN* kernel set:
@@ -480,7 +506,7 @@ to the 950000 recall bar, which exists only on this branch. There is no quality 
 split runtime, because no run against it produced a solution. `min_recall` was confirmed at the
 shipped 0.95 in every tree used.
 
-### What this establishes
+### What Part 1 establishes
 
 1. An unmodified mainnet c004 algorithm **cannot** run against the split runtime. All 105 mainnet
    algorithms export `generate_clusters`/`generate_vectors` and none export `gan_sample_latents`,
@@ -500,18 +526,81 @@ scoped to *an algorithm already rebuilt against the GAN branch* — of which the
 anywhere. Reworded honestly: **the split imposes no rebuild beyond the one the GAN work already
 imposes.**
 
-### What this does NOT establish — D5 is still unverified
-
-Execution died inside `Database::generate` → `generate_vectors` →
+Part 1 did **not** touch D5. Execution died inside `Database::generate` → `generate_vectors` →
 `module.load_function("gan_sample_latents")`, which the runtime reaches **before** it ever calls the
-algorithm's `entry_point` with a `&Challenge` (see the `gpu_db` dispatch arm, `tig-runtime/src/main.rs`).
-So only the PTX half of the claim was exercised. **D5's unchanged-`Challenge`-layout half was never
-executed.** It holds statically — the struct is field-for-field identical between `dbb30e99` and
-`be650a7c` — but that is an argument from reading the code, exactly what this validation existed to
-replace.
+algorithm's `entry_point` with a `&Challenge` (see the `gpu_db` dispatch arm,
+`tig-runtime/src/main.rs`). So Part 2 was run as a separate experiment.
 
-The measurement that would close it: build a c004 algorithm at `dbb30e99`, then run that unmodified
-binary against the `be650a7c` runtime. It was not performed, because no suitable algorithm exists —
-`tig-algorithms/src/vector_search/` holds only placeholder `mod.rs` and a no-op `template.rs`, and
-writing one would defeat the point of testing an *unmodified* binary. Open question 3 above is
-therefore **partially answered**, not closed.
+### Part 2 result: D5 holds — measured, not inferred
+
+**Why this needed measuring at all.** D5 is what makes `Challenge::for_nonce` take an owned
+device-to-device copy of ~358 MB rather than a cheap borrow, and the sole justification for that
+cost is "the layout must not change or every existing algorithm reads its fields at the wrong
+offsets." If D5 were wrong the plan would have bought an expensive copy for nothing *and* broken
+the network.
+
+`kernels.cu` is **byte-identical** across `dbb30e99..be650a7c`
+(`git diff dbb30e99 be650a7c -- tig-challenges/src/vector_search/kernels.cu` outputs nothing), so
+PTX compatibility is not a variable here and **the `Challenge` layout is the only thing under
+test.**
+
+**The probe.** `d5probe`, a purpose-built algorithm compiled **at `dbb30e99`** — post-GAN,
+pre-split, the commit immediately before this design's first commit — with `build_ptx` +
+`build_so` in the container. It exports `entry_point` and `help` only; it deliberately has no
+`build_index`/`load_index`, so it is exactly the shape of a pre-split algorithm. Its
+`solve_challenge` reads **every** field of `Challenge`, prints each one, does a real
+device-to-host copy of both trailing `CudaSlice` fields, and encodes the scalars into the saved
+`Solution`. A stub that merely exits 0 would prove nothing; this one cannot pass without actually
+dereferencing the struct.
+
+That unmodified `.so`/`.ptx` (sha256 `68b643ce…` / `98936af1…`) was then run against **two**
+runtimes with identical settings, `rand_hash` and nonce — the `dbb30e99` runtime, where the
+probe's `tig-challenges` and the runtime's are the same copy and the offsets are correct by
+construction, and the `be650a7c` split runtime, which is the test:
+
+| Field read across the FFI boundary | `dbb30e99` runtime (`216af0f9…`) | `be650a7c` split runtime (`2180fe7f…`) | |
+|---|---|---|---|
+| `scenario` | `sift_128` | `sift_128` | = |
+| `num_queries` | `7000` | `7000` | = |
+| `vector_dims` | `128` | `128` | = |
+| `database_size` | `700000` | `700000` | = |
+| `seed` | `a22085613ccf2c029517e8b68f3d008f77acd3cc0f4df4995e11366da94f7e27` | identical | = |
+| `d_query_vectors.len()` | `896000` | `896000` | = |
+| `d_database_vectors.len()` | `89600000` | `89600000` | = |
+| query vectors `[0..8]`, raw f32 bits | `3f112c3e,3d5c1f3c,3db7c65e,3dc85ebe,bb6a20c8,3c02a7aa,3b683b16,3efeb50c` | identical | = |
+| query vectors, last 4, raw bits | `3e5db0cc,3cd5715d,3cb0a28d,3d46c139` | identical | = |
+| database vectors `[0..8]`, raw bits | `3d5a85a9,3cb7af31,3cb01224,bbb21b4b,…` | `3c1ee431,3def408d,3d726fb3,3b1d4856,…` | **differs — by design** |
+
+Both runs exited **0** in ~3.9 s, both wrote a solution, and both produced byte-identical output
+files (`fuel_consumed: 3315`, the same `runtime_signature`, the same solution blob). The solution
+decodes to `indexes = [7000, 128, 700000, 896000, 89600000]`, which matches
+`ScenarioConfig::from(Scenario::SIFT_128)` at `be650a7c` (`n_queries: 7_000`, `vector_dims: 128`,
+`database_size: 700_000`) exactly. The scalars are three *distinct* values, so any shift in field
+order would have shown up rather than aliasing to the same number.
+
+**The one difference is the load-bearing part of this result.** The database vectors differ, and
+that is precisely what D1/D3 intend: post-split the database is generated from the nonce-free
+`db_seed` while queries still come from `calc_seed`, which is unchanged. Everything the split
+promises to preserve is bit-identical, and the single thing it promises to change is the single
+thing that changed. **This is what makes the experiment non-vacuous:** a probe reading at wrong
+offsets, or reading stale or cached values, could not produce "every field identical except exactly
+the one field the design says should differ."
+
+**Verdict: D5 holds.** An algorithm binary built before the split reads `Challenge`'s fields
+correctly under the split runtime, including dereferencing both `CudaSlice` fields. The owned
+358 MB copy in `for_nonce` is doing the job it was added for. Open question 3 above is **closed**.
+
+### What remains unestablished
+
+- **No mainnet algorithm has been run end-to-end against the split runtime, and none can be** until
+  it is rebuilt against the GAN branch. There is therefore still no measured `quality` figure for a
+  *real* c004 algorithm on this branch, and in particular the ≥ 950000 recall bar has not been
+  demonstrated as reachable by any competitive algorithm. That is a gap in the GAN work, not in
+  this design, but it is unmeasured either way.
+- D5 was verified on **one** algorithm shape (`entry_point` only, no index). An algorithm that also
+  exports `build_index`/`load_index` crosses the boundary with `&Database` as well as `&Challenge`;
+  `Database` is new in this design, so no pre-split binary can exercise it, and Task 4's stub work
+  is the only coverage there.
+- The measurement was taken on one card (RTX 3060, sm_86). Struct layout is ABI-determined and
+  architecture-independent for this target, so this is noted for completeness rather than as a real
+  doubt.
