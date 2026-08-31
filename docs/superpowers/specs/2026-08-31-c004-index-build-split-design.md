@@ -411,3 +411,107 @@ belong here.
    (100) and the qualifier dynamics were calibrated against today's rate and may
    need revisiting. Out of scope here, but it is a consequence of this change
    and should not surprise anyone later.
+
+## Validation
+
+Measured 2026-08-31 on `tig-gpu` (RTX 3060, sm_86, CUDA 12.6.3) against branch HEAD
+`be650a7cc528655e19e576eeb089d0850ca6d328`. Full raw logs and provenance:
+`.superpowers/sdd/2026-08-31-c004-index-build-split-monorepo/task-7-report.md`.
+
+### The claim under test
+
+The Blast radius section above asserts that "existing PTX already exports
+`gan_sample_latents` and `gan_linear`" and therefore **no existing algorithm needs
+rebuilding**, flagged there as an inference to be verified. It has now been run.
+
+### Result: the sentence is false for mainnet, and the split is not what makes it false
+
+`there_v10` (`c004_a100`, merged @ round 124) was downloaded prebuilt via
+`scripts/download_algorithm` and never rebuilt. Its PTX exports the *pre-GAN* kernel set:
+
+```
+$ grep -oE '\.visible \.entry [A-Za-z0-9_]+' there_v10.ptx | sed 's/.* //' | sort -u
+evaluate_total_distance   finalize_kernel   generate_clusters   generate_vectors
+initialize_kernel   there_v10_reduce_gemm_tile_f32_full_first   ... (algorithm-private kernels)
+$ grep -c "gan_sample_latents\|gan_linear" there_v10.ptx
+0
+```
+
+Three runs, each inside the `tig-dev-vector_search` container under a `gpu-claim`, each against a
+runtime built *in that container* (never the image's stale baked `/usr/local/bin/tig-runtime`,
+sha256 `79d6d510…`, which was captured for contrast and never invoked). Every run script printed the
+sha256 of the binary it was about to execute.
+
+| # | Runtime tree | Commit | `tig-runtime` sha256 | `track_id` | Result | Exit |
+|---|---|---|---|---|---|---|
+| A | post-split (this design) | `be650a7c` | `2180fe7f…` | `s=sift_128` | `DriverError(CUDA_ERROR_NOT_FOUND, "named symbol not found")`, no output file | 84 |
+| B | **pre-split**, post-GAN | `dbb30e99` | `216af0f9…` | `s=sift_128` | `DriverError(CUDA_ERROR_NOT_FOUND, "named symbol not found")`, no output file | 84 |
+| C | **pre-GAN** | `3efbdec9` | `7dabf8f7…` | `n_queries=7000` | solution written in 3.8 s; `quality: 72174` | 0 |
+
+Commands (settings passed as a **file** — the inline-JSON form in the task brief loses its inner
+quotes to `bash -c` and dies `Failed to parse settings`):
+
+```bash
+# built in-container, in an isolated /tmp clone, not /workspace/tig-bench:
+cargo build -r -p tig-runtime -p tig-verifier --features vector_search
+
+# A (and B, C, with the tree and settings file swapped):
+docker run --rm --gpus all -v /tmp/task7/head:/app -v /tmp/task7/algo:/algo \
+  -v /tmp/task7/out-head:/out -w /app -e CHALLENGE=vector_search \
+  -e RUSTUP_TOOLCHAIN=nightly-2025-02-10 -e CUDA_VISIBLE_DEVICES=0 \
+  tig-dev-vector_search bash -c '
+    sha256sum /app/target/release/tig-runtime
+    /app/target/release/tig-runtime /algo/settings.json norebuildcheck 0 \
+      /algo/there_v10.so --ptx /algo/there_v10.ptx --fuel 5000000000000 --output /out'
+
+# C only, after the solution was written:
+/app/target/release/tig-verifier /algo/settings-pregan.json norebuildcheck 0 /out/0.json \
+  --ptx /algo/there_v10.ptx
+quality: 72174
+```
+
+Reading the exit codes: **84 in A and B is the PTX trap, not a reap and not the teardown crash.**
+Both failed in about a second (nowhere near the ~60 s reaper window, `gpu-claim --status` clean),
+and both left `/out` **empty** — whereas the teardown crash exits 137/139 *after* writing the
+output. No 137 or 139 occurred anywhere in this validation; C exited 0.
+
+`quality: 72174` in C is on the **retired pre-GAN mean-distance quality map** and is not comparable
+to the 950000 recall bar, which exists only on this branch. There is no quality figure for the
+split runtime, because no run against it produced a solution. `min_recall` was confirmed at the
+shipped 0.95 in every tree used.
+
+### What this establishes
+
+1. An unmodified mainnet c004 algorithm **cannot** run against the split runtime. All 105 mainnet
+   algorithms export `generate_clusters`/`generate_vectors` and none export `gan_sample_latents`,
+   `gan_linear` or `recall_audit`.
+2. It cannot run against the **pre-split** runtime either — run B is bit-for-bit the same failure at
+   the commit immediately before this design's first commit (`43ed7cd0`). **The index-build split
+   adds no blast radius over the branch it sits on.** The mainnet rebuild-and-resubmit cost is real
+   and already owed, but it is owed by the GAN instance-generation feature that rewrote
+   `kernels.cu` (`git diff --stat main HEAD -- .../kernels.cu` → 423 insertions, 122 deletions),
+   not by this plan.
+3. Run C is the positive control: the same `.so`/`.ptx`, the same harness, container, claim and
+   settings shape, exits 0 against a pre-GAN runtime. The failure in A and B is specific to the
+   changed kernel set.
+
+The Blast radius section's "no existing algorithm needs rebuilding" must therefore be read as
+scoped to *an algorithm already rebuilt against the GAN branch* — of which there are currently zero
+anywhere. Reworded honestly: **the split imposes no rebuild beyond the one the GAN work already
+imposes.**
+
+### What this does NOT establish — D5 is still unverified
+
+Execution died inside `Database::generate` → `generate_vectors` →
+`module.load_function("gan_sample_latents")`, which the runtime reaches **before** it ever calls the
+algorithm's `entry_point` with a `&Challenge` (see the `gpu_db` dispatch arm, `tig-runtime/src/main.rs`).
+So only the PTX half of the claim was exercised. **D5's unchanged-`Challenge`-layout half was never
+executed.** It holds statically — the struct is field-for-field identical between `dbb30e99` and
+`be650a7c` — but that is an argument from reading the code, exactly what this validation existed to
+replace.
+
+The measurement that would close it: build a c004 algorithm at `dbb30e99`, then run that unmodified
+binary against the `be650a7c` runtime. It was not performed, because no suitable algorithm exists —
+`tig-algorithms/src/vector_search/` holds only placeholder `mod.rs` and a no-op `template.rs`, and
+writing one would defeat the point of testing an *unmodified* binary. Open question 3 above is
+therefore **partially answered**, not closed.
