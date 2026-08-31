@@ -794,9 +794,15 @@ extern "C" __global__ void reference_nn_search(
             s: Scenario::SIFT_128,
         };
         let challenge = Challenge::generate_instance(
+            // The two fields must never hold the same bytes. c004 ignores `db`
+            // today, so this changes nothing now -- but Task 3 makes `db` the
+            // database seed, and identical bytes would make a swap inside the
+            // split invisible to all 40 tests here. `x ^ 0xff` flips every bit,
+            // so it differs from `x` in all eight and cannot collide for any
+            // `seed_byte`.
             &Seeds {
                 nonce: [seed_byte; 32],
-                db: [seed_byte; 32],
+                db: [seed_byte ^ 0xff; 32],
             },
             &track,
             module.clone(),

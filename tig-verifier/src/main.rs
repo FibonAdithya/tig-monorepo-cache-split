@@ -137,6 +137,20 @@ fn predictable_salt_warning(challenge_id: &str, salt: &[u8; 32]) -> Option<Strin
     )
 }
 
+/// The verifier's own copy of `tig-runtime`'s `seeds_for`.
+///
+/// Deliberately duplicated rather than hoisted: `Seeds` lives in
+/// `tig-challenges`, which `tig-structs` does not depend on, so a shared
+/// `BenchmarkSettings::seeds()` would need a new dependency edge. Both copies
+/// are pinned by tests to `BenchmarkSettings`' derivations, which is what stops
+/// them drifting.
+fn seeds_for(settings: &BenchmarkSettings, rand_hash: &String, nonce: u64) -> Seeds {
+    Seeds {
+        nonce: settings.calc_seed(rand_hash, nonce),
+        db: settings.calc_db_seed(rand_hash),
+    }
+}
+
 pub fn verify_solution(
     settings: String,
     rand_hash: String,
@@ -148,10 +162,7 @@ pub fn verify_solution(
     verbose: bool,
 ) -> Result<()> {
     let settings = load_settings(&settings);
-    let seeds = Seeds {
-        nonce: settings.calc_seed(&rand_hash, nonce),
-        db: settings.calc_db_seed(&rand_hash),
-    };
+    let seeds = seeds_for(&settings, &rand_hash, nonce);
     let seed = seeds.nonce;
 
     // Decoded once, up front, so a malformed salt is a clear error before any
@@ -401,6 +412,58 @@ fn load_solution(solution: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn seeds_test_settings() -> BenchmarkSettings {
+        BenchmarkSettings {
+            player_id: "some_player".to_string(),
+            block_id: "some_block".to_string(),
+            challenge_id: "some_challenge".to_string(),
+            algorithm_id: "some_algorithm".to_string(),
+            track_id: "a=1,b=2".to_string(),
+        }
+    }
+
+    #[test]
+    fn verifier_seeds_for_puts_each_derivation_in_the_right_field() {
+        // The runtime has the same assertion over its own `seeds_for`. Both
+        // exist because the two binaries construct `Seeds` independently: a
+        // verifier that swapped the fields would regenerate a different
+        // instance from the one the benchmarker solved and reject every honest
+        // solution, with no message naming the cause.
+        let settings = seeds_test_settings();
+        let rand_hash = "random_hash".to_string();
+
+        let seeds = seeds_for(&settings, &rand_hash, 1337);
+        assert_eq!(seeds.nonce, settings.calc_seed(&rand_hash, 1337));
+        assert_eq!(seeds.db, settings.calc_db_seed(&rand_hash));
+    }
+
+    #[test]
+    fn verifier_seeds_for_holds_the_database_constant_across_nonces() {
+        let settings = seeds_test_settings();
+        let rand_hash = "random_hash".to_string();
+
+        let a = seeds_for(&settings, &rand_hash, 0);
+        let b = seeds_for(&settings, &rand_hash, u64::MAX);
+        assert_eq!(a.db, b.db, "database seed must not vary with the nonce");
+        assert_ne!(a.nonce, b.nonce, "query seed must vary with the nonce");
+    }
+
+    #[test]
+    fn verifier_seeds_for_agrees_with_the_runtime_derivations() {
+        // Two hand-written constructors, one protocol. This pins the verifier's
+        // to `BenchmarkSettings`' own derivations -- the same pair
+        // `tig-runtime::seeds_for` is pinned to -- so the two cannot drift
+        // apart without one of the four assertions failing.
+        let settings = seeds_test_settings();
+        let rand_hash = "random_hash".to_string();
+
+        for nonce in [0u64, 1, 1337, u64::MAX] {
+            let seeds = seeds_for(&settings, &rand_hash, nonce);
+            assert_eq!(seeds.nonce, settings.calc_seed(&rand_hash, nonce));
+            assert_eq!(seeds.db, settings.calc_db_seed(&rand_hash));
+        }
+    }
 
     /// argv[0] plus the four required positionals every invocation needs, so
     /// the tests below isolate the behaviour of `--audit-salt` and nothing else.
