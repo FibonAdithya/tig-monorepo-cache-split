@@ -1,3 +1,4 @@
+use tig_structs::config::ChallengeConfig;
 use tig_structs::core::{BenchmarkSettings, CPUArchitecture, OutputData};
 use tig_utils::{jsonify, u8s_from_str, MerkleHash};
 
@@ -103,4 +104,37 @@ fn test_db_seed_carries_its_domain_tag() {
         untagged,
         "calc_db_seed lost its `_db` domain tag"
     );
+}
+
+#[test]
+fn challenge_config_deserializes_without_the_build_fuel_fields() {
+    // `build_fuel_alpha` and `max_build_fuel_budget` are `Option<...>` precisely so that
+    // existing `ChallengeConfig` JSON -- including the live mainnet-api `get-block`
+    // payload, minted before these fields existed -- keeps deserializing. This is only
+    // true because `serializable_struct_with_getters!` emits `#[serde(default)]` on the
+    // `Option<$type>` arm; a bare field would make the key serde-required and this
+    // literal (which omits both keys) would fail to parse. The mutations this test
+    // catches: either field regressing to a bare type, or the macro's `Option` arm
+    // losing its `#[serde(default)]`.
+    let json = r#"{
+        "name": "vector_search",
+        "type": "gpu",
+        "quality_type": "continuous",
+        "submission_delay_multiplier": 1.0,
+        "num_samples_gte_average": 1,
+        "num_samples_lt_average": 1,
+        "lifespan_period": 100,
+        "per_nonce_fee": "0",
+        "base_fee": "0",
+        "active_tracks": {},
+        "max_fuel_budget": 1000,
+        "max_qualifiers_per_track": 1,
+        "legacy_multiplier_span": 1.0,
+        "min_num_bundles": 1
+    }"#;
+
+    let config: ChallengeConfig =
+        serde_json::from_str(json).expect("ChallengeConfig JSON without the new keys must still deserialize");
+    assert_eq!(config.build_fuel_alpha, None);
+    assert_eq!(config.max_build_fuel_budget, None);
 }
