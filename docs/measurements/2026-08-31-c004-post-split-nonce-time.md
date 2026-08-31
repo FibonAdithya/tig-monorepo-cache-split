@@ -548,12 +548,13 @@ the database half amortise — a batched verifier at `batch_size` 8 would cost
 
 — a **derivation from measured parts, not a measurement of a batched verifier,
 which does not exist.** At that value the row-2 bound falls from 0.01516 to
-**0.00342** (`R_measured`) or **0.00251** (`R_low`).
+**0.00341** (`R_measured`) or **0.00251** (`R_low`).
 
 **So: `alpha` must be recut if the verifier is ever batched.** The recommended
 0.003 survives that change at `R_measured` (88 % of the bound) and exceeds it at
 `R_low` (119 % of it). The overshoot is soft: it means the build would be 54 %
-rather than under 50 % of query+verify work, on a rate that is itself a hedge
+rather than under 50 % of **total** work (build + query + verify) — equivalently
+119 % of query+verify rather than under 100 % — on a rate that is itself a hedge
 against a verifier that does not exist. The net-win bound (row 1), which is the primary constraint, is
 unaffected by verifier batching in either case, and 0.003 clears it by 4x.
 
@@ -596,19 +597,20 @@ Behaviour at `alpha` = 0.003, `F` = 5e12, `max_build_fuel_budget` = 7.0e12
 (§5.5), 600 s watchdog, `batch_size` 8 — **this table applies all three limits,
 which is what makes it usable for Task 9**:
 
-| N | `alpha*N*F` | after the fuel cap | build s @`R_measured` | build s @`R_low` | what binds | saving | build as % of query+verify |
+| N | `alpha*N*F` | after the fuel cap | build s @`R_measured` | build s @`R_low` | what binds | saving | build as % of query+verify (`R_measured` / `R_low`) |
 |---|---|---|---|---|---|---|---|
-| 80 (floor) | 1.20e12 | 1.20e12 | 57.5 | 78.1 | `alpha` | 228.9 s | 19.8 % |
-| 200 | 3.00e12 | 3.00e12 | 143.7 | 195.3 | `alpha` | 572.1 s | 19.8 % |
-| 466 | 6.99e12 | 6.99e12 | 334.9 | 455.1 | `alpha` | 1,333.1 s | 19.8 % |
-| 500 | 7.50e12 | **7.00e12** | 335.3 | 455.7 | **fuel cap** | 1,430.3 s | 18.5 % |
-| 2,000 | 3.00e13 | **7.00e12** | 335.3 | 455.7 | **fuel cap** | 5,721.4 s | 4.6 % |
-| 10,000 | 1.50e14 | **7.00e12** | 335.3 | 455.7 | **fuel cap** | 28,606.8 s | 0.9 % |
-| 100,000 | 1.50e15 | **7.00e12** | 335.3 | 455.7 | **fuel cap** | 286,067.6 s | 0.1 % |
+| 80 (floor) | 1.20e12 | 1.20e12 | 57.5 | 78.1 | `alpha` | 228.9 s | 19.8 % / 26.9 % |
+| 200 | 3.00e12 | 3.00e12 | 143.7 | 195.3 | `alpha` | 572.1 s | 19.8 % / 26.9 % |
+| 466 | 6.99e12 | 6.99e12 | 334.9 | 455.1 | `alpha` | 1,333.1 s | 19.8 % / 26.9 % |
+| 500 | 7.50e12 | **7.00e12** | 335.3 | 455.7 | **fuel cap** | 1,430.3 s | 18.5 % / 25.1 % |
+| 2,000 | 3.00e13 | **7.00e12** | 335.3 | 455.7 | **fuel cap** | 5,721.4 s | 4.6 % / 6.3 % |
+| 10,000 | 1.50e14 | **7.00e12** | 335.3 | 455.7 | **fuel cap** | 28,606.8 s | 0.9 % / 1.3 % |
+| 100,000 | 1.50e15 | **7.00e12** | 335.3 | 455.7 | **fuel cap** | 286,067.6 s | 0.1 % / 0.1 % |
 
 Both constraints hold at every size, including the 80-nonce floor: the build
 costs 57.5–78.1 s and saves 228.9 s, a 2.9–4.0x net win, and is 19.8 % of the
-benchmarker's per-nonce work (16.5 % of the total including the build itself).
+benchmarker's per-nonce work at `R_measured` or 26.9 % at `R_low` (16.5 % and
+21.2 % respectively of the total including the build itself).
 **The break-even footgun of §4.3 disappears entirely** — it exists only because a
 *flat* 600 s build is charged to an 80-nonce precommit, which `alpha` at this
 value never authorises. Note also that **the 600 s watchdog never fires in this
@@ -890,6 +892,14 @@ built, §5.3 says what happens to `alpha`.
   exited 0 and wrote its expected files; the two reaped runs are recorded here
   and excluded. This is why no single run exceeds ~55 s, and why `refsearch` has
   only one clean marginal-interval sample.
+- **The raw inputs are not independently reconstructible from this document.**
+  Every measured figure quoted here — 2005.0 ms, 765.6 ms, 22.711 ms, 3252.4 ms,
+  the fuel counts — was derived from run logs that exist only at
+  `/tmp/task8/logs/` on `tig-gpu` (23 files, 168 KB, verified present
+  2026-08-31 17:23 UTC). That is a disposable path on a rented KVM instance and
+  it will not survive a teardown or reboot. Nothing in this repository lets a
+  reader recompute a mean from its samples or check a discarded run; the numbers
+  must be taken as reported, or re-measured from scratch with the method in §1.3.
 
 ---
 
@@ -924,11 +934,11 @@ worth another round. Recorded so they are not rediscovered as new findings.
 
 | # | Item | Direction and size |
 |---|---|---|
-| 1 | `t_old` is a shell-observed wall while `t_new` is built from in-process phases, so the two are not on the same measurement plane. Fully consistent accounting gives `delta` = 2.8703 s. | This note's 2.8607 s is **0.3 % conservative**; no constant moves. |
-| 2 | `docker exec` client overhead appears as 392 ms (§2.1 shell minus in-process) and 493.7 ms (§2.4). Unreconciled. | Both are excluded from `delta`; excluding a real per-nonce pre-split cost is conservative. |
+| 1 | `t_old` is a shell-observed wall while `t_new` is built from in-process phases, so the two are not on the same measurement plane. The plane-consistent value depends on which basis is used: **2.8117 s** on §2.1's own basis (392 ms overhead) and 2.8703 s on §2.4's production shape (493.7 ms overhead). | On the document's own §2.1 basis this note's 2.8607 s is therefore **1.7 % optimistic**, not conservative; only on §2.4's basis is it 0.3 % conservative. State the unfavourable one. `alpha` is 3.455e-3 at 2.8117 s and 3.515e-3 at 2.8607 s — 0.003 either way. |
+| 2 | `docker exec` client overhead appears as 392 ms (§2.1 shell minus in-process) and 493.7 ms (§2.4). Unreconciled. | The 392 ms is **inside** `t_old` (3,238.8 - 2,846.8 = 392.0 exactly) but its post-split counterpart, 392/8 = 49 ms, is **not** inside `t_new`. Counting it on one side only **inflates `delta` by ~1.7 %** — the optimistic direction, not the conservative one. |
 | 3 | The verifier's `generate_instance` implies ~2.7 ms for 7,000 queries, while §3.4 measures 20–27 ms for the same 7,000 queries in the runtime. A 7x gap; one of the two attributions is wrong. | Using the smaller figure in §5.3/§8 makes the batched verifier look *cheaper*, i.e. makes the `alpha` bound *tighter*. Benign direction. |
-| 4 | §5.4's "% of query+verify" column and §7's headline 348 s use `R_measured`, in a document that otherwise sizes constants on `R_low`. | Both now show the `R_low` figure alongside; the mixed basis is flagged in place rather than removed. |
-| 5 | §2.1's n=20 baseline set includes what looks like one cold run (max 3,646 ms against a 3,239 ms mean). Excluding it raises `delta` and gives `alpha` = 3.49e-3. | Still rounds down to 0.003. Keeping the run is conservative. |
+| 4 | §5.4's "% of query+verify" column and §7's headline 348 s used `R_measured` only, in a document that otherwise sizes constants on `R_low`. | Both now show the `R_low` figure alongside (§5.4's column as `R_measured` / `R_low`, §7 as its own row); the mixed basis is flagged in place rather than removed. |
+| 5 | §2.1's n=20 baseline set includes what looks like one cold run (max 3,646 ms against a 3,239 ms mean). Excluding it gives a mean of 3,217.4 ms, `delta` = 2.8392 s and `alpha` = 3.489e-3, against 3.515e-3 with it kept. | Excluding it **lowers** both, so **keeping** the run is the **optimistic** choice, by 0.8 %. Both still round down to 0.003. |
 | 6 | §2.5's `s` = 2,497 ms row double-counts the 4.7 ms of warm JIT that the 479 ms cold-JIT figure replaces. | 4.7 ms on a 2,497 ms row. |
 | 7 | §2.4 differences an n=11 mean against an n=10 mean to get the `docker exec` overhead. | See #2; the quantity is not used in any constant. |
 
