@@ -23,6 +23,10 @@ sed -i "s/{CHALLENGE}/$CHALLENGE/g" tig-binary/src/entry_point.rs
 sed -i "s/{ALGORITHM}/$ALGORITHM/g" tig-binary/src/entry_point.rs
 
 FEATURES="entry_point $CHALLENGE"
+# Opt-in: only algorithms that actually define build_index/load_index can
+# compile the forwarding shims in entry_point_template.rs. Unset or empty
+# means off, which is what every pre-split algorithm needs.
+if [ -n "$INDEX_BUILD" ]; then FEATURES="$FEATURES index_build"; fi
 
 ARCH=$(uname -m)
 RUST_TARGET=$(if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
@@ -222,6 +226,8 @@ cat > export_symbols.map << 'EOF'
   global:
     help;
     entry_point;
+    build_index;
+    load_index;
     __fuel_remaining;
     __runtime_signature;
     __curr_memory_usage;

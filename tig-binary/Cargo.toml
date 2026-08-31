@@ -24,6 +24,10 @@ tig-algorithms = { path = "../tig-algorithms" }
 [features]
 entry_point = []
 cuda = ["cudarc"]
+# Compiles the optional build_index/load_index forwarding shims in
+# entry_point_template.rs. Off by default: an algorithm that does not define
+# both functions will not compile with this on.
+index_build = []
 c001 = ["tig-algorithms/c001", "tig-challenges/c001"]
 satisfiability = ["c001"]
 c002 = ["tig-algorithms/c002", "tig-challenges/c002"]
