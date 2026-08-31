@@ -82,10 +82,21 @@ fn cli() -> Command {
                         .required(true)
                         .value_parser(clap::value_parser!(PathBuf)),
                 )
+                // 2 GiB, not the 8 GiB the spec provisionally named. The
+                // cap is what the *algorithm* may allocate on top of the
+                // context and the database, and the balloon refuses to run at
+                // all when `free < cap + 64 MiB` -- so an 8 GiB default makes
+                // the build refuse itself on any card that is not close to
+                // empty, and the slave never passes `--memory-cap`. Measured
+                // build-phase peak is 1,010 MiB whole-card
+                // (docs/measurements/2026-08-31-c004-post-split-nonce-time.md
+                // §6.2), so 2 GiB is ~2x the measured peak and still leaves the
+                // cap enforceable on a 12 GB card while `num_workers` solve
+                // threads hold device memory.
                 .arg(
-                    arg!(--"memory-cap" [BYTES] "Device memory the build may use")
+                    arg!(--"memory-cap" [BYTES] "Device memory the build's algorithm may allocate on top of the context and database (default 2 GiB: 2x the 1,010 MiB measured build peak)")
                         .value_parser(clap::value_parser!(u64))
-                        .default_value("8589934592"),
+                        .default_value("2147483648"),
                 )
                 .arg(
                     arg!(--"build-timeout" [SECS] "Wall-clock watchdog for the build")
@@ -312,6 +323,16 @@ pub fn compute_solution(
     // through with an out-of-fuel exit that names nothing.
     let fuel_remaining_ptr = unsafe { *library.get::<*mut u64>(b"__fuel_remaining")? };
     let runtime_signature_ptr = unsafe { *library.get::<*mut u64>(b"__runtime_signature")? };
+    // Primed once, here, *before* `$make_db` runs -- and then reset per nonce
+    // inside the loop. `$make_db` calls the algorithm's `load_index`, which is
+    // instrumented CPU code drawing on this meter; leaving it at the `.so`'s
+    // static initialiser means `load_index` decrements a meter nobody set, and
+    // a zero initialiser exits 87 on the first instrumented instruction.
+    // `build_index` already sets the meter before any algorithm code runs, so
+    // this is the two modes agreeing rather than a new rule. The device
+    // counter needs no equivalent: `initialize_kernel` zeroes it, and it runs
+    // inside the loop.
+    unsafe { *fuel_remaining_ptr = max_fuel };
 
     // A directory, not a file. The file name depends on the nonce and is
     // therefore rebuilt inside the loop; computing it once here would make
@@ -377,7 +398,10 @@ pub fn compute_solution(
                 ) -> Result<()>>(b"entry_point")?
             };
 
-            let gpu_fuel_scale = 20; // scale fuel to loosely align with CPU
+            // One definition, shared with `build_index` below and with
+            // `tig-protocol`'s overflow check, which is the only other place
+            // that has to know the same number.
+            let gpu_fuel_scale = tig_structs::config::GPU_FUEL_SCALE;
             let ptx_content = std::fs::read_to_string(&ptx_path)
                 .map_err(|e| anyhow!("Failed to read PTX file: {}", e))?;
             let max_fuel_hex = format!("0x{:016x}", max_fuel * gpu_fuel_scale);
@@ -510,7 +534,13 @@ pub fn compute_solution(
                 if !output_file.exists() {
                     save_solution_fn(&$c::Solution::new())?;
                 }
-                result?;
+                // The same dlclose/vtable trap as `build_index_fn` and
+                // `load_index_fn`: the algorithm's `anyhow::Error` owns a
+                // vtable inside the `.so`, so a bare `result?` drops `library`,
+                // `dlclose`s the object, and `main`'s `eprintln!` then jumps
+                // through a dangling pointer. This site predates the split and
+                // is on the shipped c001-c003 path today.
+                result.map_err(|e| anyhow!("{:#}", e))?;
             }
             Ok(())
         }};
@@ -570,7 +600,13 @@ pub fn compute_solution(
                 if !output_file.exists() {
                     save_solution_fn(&$c::Solution::new())?;
                 }
-                result?;
+                // The same dlclose/vtable trap as `build_index_fn` and
+                // `load_index_fn`: the algorithm's `anyhow::Error` owns a
+                // vtable inside the `.so`, so a bare `result?` drops `library`,
+                // `dlclose`s the object, and `main`'s `eprintln!` then jumps
+                // through a dangling pointer. This site predates the split and
+                // is on the shipped c001-c003 path today.
+                result.map_err(|e| anyhow!("{:#}", e))?;
             }
             Ok(())
         }};
@@ -855,7 +891,7 @@ pub fn build_index(
     let fuel_remaining_ptr = unsafe { *library.get::<*mut u64>(b"__fuel_remaining")? };
     unsafe { *fuel_remaining_ptr = build_fuel };
 
-    let gpu_fuel_scale = 20u64;
+    let gpu_fuel_scale = tig_structs::config::GPU_FUEL_SCALE;
     let ptx_content = std::fs::read_to_string(&ptx_path)
         .map_err(|e| anyhow!("Failed to read PTX file: {}", e))?;
     let scaled = build_fuel.checked_mul(gpu_fuel_scale).ok_or_else(|| {
@@ -977,10 +1013,22 @@ pub fn build_index(
     }
     let error_stat = stream.memcpy_dtov(&error_stat)?[0];
     let gpu_fuel_used = stream.memcpy_dtov(&fuel_usage)?[0] / gpu_fuel_scale;
+    // Both meters, because `build_fuel` is enforced against each of them
+    // *independently*: the PTX is patched with `build_fuel * gpu_fuel_scale`
+    // and `__fuel_remaining` is set to `build_fuel`, so a build that spent its
+    // whole CPU budget and no device fuel is at its limit while the GPU counter
+    // still reads 0. Reporting the GPU number alone as "fuel used" invites the
+    // reader to treat it as total spend, which it is not.
+    // `saturating_sub`: the instrumented counter is decremented by the `.so`
+    // and a run that overshot into a wrap would otherwise print a nonsense
+    // 1.8e19.
+    let cpu_fuel_used = build_fuel.saturating_sub(unsafe { *fuel_remaining_ptr });
     if error_stat != 0 {
         return Err(anyhow!(
-            "build failed on the device (error_stat {}, gpu fuel used {} of {}); no index written",
+            "build failed on the device (error_stat {}; cpu fuel used {}, gpu fuel used {}, \
+             each against an independent budget of {}); no index written",
             error_stat,
+            cpu_fuel_used,
             gpu_fuel_used,
             build_fuel
         ));
@@ -992,8 +1040,10 @@ pub fn build_index(
     fs::write(&tmp, &blob)?;
     fs::rename(&tmp, &index_out)?;
     eprintln!(
-        "index written: {} bytes, gpu fuel used {} of {}",
+        "index written: {} bytes; cpu fuel used {}, gpu fuel used {} -- each \
+         against an independent budget of {}, not a shared total",
         blob.len(),
+        cpu_fuel_used,
         gpu_fuel_used,
         build_fuel
     );
@@ -1947,6 +1997,90 @@ mod tests {
         assert!(
             db.contains(concat!("b\"load_", "index\"")),
             "the c004 arm must resolve `load_index` from the algorithm"
+        );
+    }
+
+    #[test]
+    fn the_cpu_fuel_meter_is_primed_before_the_database_and_index_phase() {
+        // `$make_db` runs `Database::generate` AND the algorithm's
+        // `load_index`, and `load_index` is instrumented CPU code that
+        // decrements `__fuel_remaining`. Resolving the pointer is not the same
+        // as writing it: the per-nonce resets live inside the loop, *below*
+        // `$make_db`, so without a prime above it `load_index` draws on a meter
+        // nobody set -- and a `.so` whose static starts at 0 exits 87 on its
+        // first instrumented instruction, with nothing naming the cause.
+        // `build_index` already sets the meter before any algorithm code runs;
+        // this is what makes the two modes agree.
+        const SRC: &str = include_str!("main.rs");
+        // Four-space indent on purpose: that is `compute_solution`'s own
+        // statement level. The two sixteen-space writes are the per-nonce
+        // resets inside the loops and are a different assertion
+        // (`every_per_nonce_step_lives_inside_the_loop`).
+        const PRIME: &str = concat!("\n    unsafe { *fuel_remaining", "_ptr = max_fuel };");
+        assert_eq!(
+            SRC.matches(PRIME).count(),
+            1,
+            "expected exactly one function-level prime of the CPU fuel meter in \
+             `compute_solution`; without it `load_index` runs on an unset meter"
+        );
+        const MAKE_DB: &str = concat!("let db = $make", "_db(&track,");
+        assert_eq!(
+            SRC.matches(MAKE_DB).count(),
+            1,
+            "expected exactly one `$make_db` call site; the scan cannot tell \
+             which one to order against"
+        );
+        assert!(
+            SRC.find(PRIME).unwrap() < SRC.find(MAKE_DB).unwrap(),
+            "the CPU fuel meter must be primed BEFORE $make_db, which runs the \
+             algorithm's load_index (prime@{} make_db@{})",
+            SRC.find(PRIME).unwrap(),
+            SRC.find(MAKE_DB).unwrap()
+        );
+    }
+
+    #[test]
+    fn the_solve_error_is_rendered_before_the_library_is_unloaded() {
+        // The third algorithm-owned `anyhow::Error` that crosses `?` in this
+        // file, alongside `build_index_fn` and `load_index_fn`: the error's
+        // vtable lives in the `.so`, so propagating it drops `library`,
+        // `dlclose`s the object, and `main`'s `eprintln!("Runtime Error: {}")`
+        // then jumps through a dangling pointer. Unlike the other two this site
+        // predates the split and is on the shipped c001-c003 path.
+        const SRC: &str = include_str!("main.rs");
+        // The propagation statement in each per-nonce loop, at the loops' own
+        // sixteen-space indent. There are two copies of the loop: `gpu_common!`
+        // and the `cpu` arm.
+        const PROP: &str = concat!("\n                result", ".");
+        let sites: Vec<usize> = SRC.match_indices(PROP).map(|(i, _)| i).collect();
+        assert_eq!(
+            sites.len(),
+            2,
+            "expected exactly two solve-error propagations (gpu_common! and the \
+             cpu arm); found {}",
+            sites.len()
+        );
+        for site in sites {
+            let stmt = &SRC[site..];
+            let end = stmt
+                .find("?;")
+                .expect("the solve result must propagate with `?`");
+            // The needle is the `{:#}` *formatting*, not `.map_err(`: a no-op
+            // `.map_err(|e| e)` hands back the same algorithm-owned error and
+            // restores the segfault exactly, while still containing
+            // `.map_err(`, so that token discriminates nothing.
+            assert!(
+                stmt[..end].contains(concat!("anyhow!(\"{", ":#}\"")),
+                "the algorithm's solve error must be rendered to an owned string \
+                 while the library is still loaded; found: {}",
+                &stmt[..end]
+            );
+        }
+        // The bare form is the mutation, and it is what shipped before this
+        // change; assert it is gone rather than only that a good form exists.
+        assert!(
+            !SRC.contains(concat!("\n                result", "?;")),
+            "a bare `result?;` propagates the algorithm's error across dlclose"
         );
     }
 }
