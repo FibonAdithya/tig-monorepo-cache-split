@@ -54,10 +54,137 @@ fn cli() -> Command {
             arg!(--gpu [GPU] "Which GPU device to use")
                 .value_parser(clap::value_parser!(usize)),
         )
+        .arg(
+            arg!(--index [PATH] "Index blob to load before solving")
+                .value_parser(clap::value_parser!(PathBuf)),
+        )
+        // The legacy four-positional form must keep parsing exactly as before,
+        // so the subcommands negate the root's required positionals rather than
+        // replacing them.
+        .subcommand_negates_reqs(true)
+        .args_conflicts_with_subcommands(true)
+        .subcommand(
+            Command::new("build-index")
+                .about("Build an index over the precommit's database and exit. Takes no nonce.")
+                .args(shared_args())
+                // `.required(true)` is load-bearing: `arg!(--"build-fuel" <FUEL>)`
+                // alone makes only the *value* mandatory, leaving the flag
+                // optional and `get_one(..).unwrap()` a panic when it is omitted.
+                .arg(
+                    arg!(--"build-fuel" <FUEL> "Fuel budget for the build phase")
+                        .required(true)
+                        .value_parser(clap::value_parser!(u64)),
+                )
+                .arg(
+                    arg!(--"index-out" <PATH> "Where to write the index blob")
+                        .required(true)
+                        .value_parser(clap::value_parser!(PathBuf)),
+                )
+                .arg(
+                    arg!(--"memory-cap" [BYTES] "Device memory the build may use")
+                        .value_parser(clap::value_parser!(u64))
+                        .default_value("8589934592"),
+                )
+                .arg(
+                    arg!(--"build-timeout" [SECS] "Wall-clock watchdog for the build")
+                        .value_parser(clap::value_parser!(u64))
+                        .default_value("600"),
+                ),
+        )
+        .subcommand(
+            Command::new("batch")
+                .about("Solve a contiguous run of nonces in one process")
+                .args(shared_args())
+                .arg(
+                    arg!(--"start-nonce" <N> "First nonce of a batch")
+                        .required(true)
+                        .value_parser(clap::value_parser!(u64)),
+                )
+                .arg(
+                    arg!(--"num-nonces" <N> "How many nonces to solve")
+                        .required(true)
+                        .value_parser(clap::value_parser!(u64).range(1..)),
+                )
+                .arg(
+                    arg!(--fuel [FUEL] "Optional maximum fuel parameter")
+                        .default_value("2000000000")
+                        .value_parser(clap::value_parser!(u64)),
+                )
+                .arg(
+                    arg!(--index [PATH] "Index blob to load before solving")
+                        .value_parser(clap::value_parser!(PathBuf)),
+                )
+                .arg(
+                    arg!(--output [OUTPUT_FOLDER] "Folder for the per-nonce output files")
+                        .value_parser(clap::value_parser!(PathBuf)),
+                ),
+        )
+}
+
+/// The arguments both new subcommands share with the legacy form. Deliberately
+/// does NOT include a nonce: `build-index` must have no way to receive one.
+fn shared_args() -> Vec<clap::Arg> {
+    vec![
+        arg!(<SETTINGS> "Settings json string or path to json file")
+            .value_parser(clap::value_parser!(String)),
+        arg!(<RAND_HASH> "A string used in seed generation")
+            .value_parser(clap::value_parser!(String)),
+        arg!(<BINARY> "Path to a shared object (*.so) file")
+            .value_parser(clap::value_parser!(PathBuf)),
+        arg!(--hyperparameters [HYPERPARAMETERS] "Hyperparameters json string or path to json file")
+            .value_parser(clap::value_parser!(String)),
+        arg!(--ptx [PTX] "Path to a CUDA ptx file").value_parser(clap::value_parser!(PathBuf)),
+        arg!(--gpu [GPU] "Which GPU device to use").value_parser(clap::value_parser!(usize)),
+    ]
 }
 
 fn main() {
     let matches = cli().get_matches();
+
+    if let Some(sub) = matches.subcommand_matches("build-index") {
+        // Must exit non-zero, not fall through: a `--features c005` build has
+        // `cuda` but no `c004`, and a bare `return` here would exit 0 having
+        // built nothing.
+        #[cfg(not(feature = "c004"))]
+        {
+            let _ = sub;
+            eprintln!("Runtime Error: build-index requires a build with '--features c004'");
+            std::process::exit(84);
+        }
+        #[cfg(feature = "c004")]
+        {
+            // The `.unwrap()`s below are safe only because `cli()` marks
+            // --build-fuel and --index-out `.required(true)`.
+            if let Err(e) = build_index(
+                sub.get_one::<String>("SETTINGS").unwrap().clone(),
+                sub.get_one::<String>("RAND_HASH").unwrap().clone(),
+                sub.get_one::<PathBuf>("BINARY").unwrap().clone(),
+                sub.get_one("hyperparameters").cloned(),
+                sub.get_one::<PathBuf>("ptx").cloned().unwrap_or_else(|| {
+                    eprintln!("Runtime Error: --ptx is required for build-index");
+                    std::process::exit(84);
+                }),
+                *sub.get_one::<u64>("build-fuel").unwrap(),
+                *sub.get_one::<u64>("memory-cap").unwrap(),
+                *sub.get_one::<u64>("build-timeout").unwrap(),
+                sub.get_one::<PathBuf>("index-out").unwrap().clone(),
+                sub.get_one::<usize>("gpu").cloned(),
+            ) {
+                eprintln!("Runtime Error: {}", e);
+                std::process::exit(84);
+            }
+            return;
+        }
+    }
+
+    if matches.subcommand_matches("batch").is_some() {
+        // The subcommand's arguments are already parsed and tested; the
+        // batched execution path itself lands in a later task. Exiting
+        // non-zero here is deliberate -- a silent exit 0 would be
+        // indistinguishable from a batch that ran.
+        eprintln!("Runtime Error: the 'batch' subcommand is not implemented yet");
+        std::process::exit(84);
+    }
 
     if let Err(e) = compute_solution(
         matches.get_one::<String>("SETTINGS").unwrap().clone(),
@@ -73,6 +200,26 @@ fn main() {
         eprintln!("Runtime Error: {}", e);
         std::process::exit(84);
     }
+}
+
+/// The `track_id` -> `Track` parse that every dispatch arm needs. `challenge`
+/// is only used to name the challenge in the error message.
+fn parse_track<T: serde::de::DeserializeOwned>(
+    settings: &BenchmarkSettings,
+    challenge: &str,
+) -> Result<T> {
+    let track_id = if settings.track_id.starts_with('"') && settings.track_id.ends_with('"') {
+        settings.track_id.clone()
+    } else {
+        format!(r#""{}""#, settings.track_id)
+    };
+    serde_json::from_str(&track_id).map_err(|_| {
+        anyhow!(
+            "Failed to parse track_id '{}' as {}::Track",
+            settings.track_id,
+            challenge
+        )
+    })
 }
 
 fn seeds_for(settings: &BenchmarkSettings, rand_hash: &String, nonce: u64) -> Seeds {
@@ -115,19 +262,7 @@ pub fn compute_solution(
 
     macro_rules! dispatch_challenge {
         ($c:ident, cpu) => {{
-            let track_id = if settings.track_id.starts_with('"') && settings.track_id.ends_with('"')
-            {
-                settings.track_id.clone()
-            } else {
-                format!(r#""{}""#, settings.track_id)
-            };
-            let track = serde_json::from_str(&track_id).map_err(|_| {
-                anyhow::anyhow!(
-                    "Failed to parse track_id '{}' as {}::Track",
-                    settings.track_id,
-                    stringify!($c)
-                )
-            })?;
+            let track: $c::Track = parse_track(&settings, stringify!($c))?;
 
             // library function may exit 87 if it runs out of fuel
             let solve_challenge_fn = unsafe {
@@ -170,19 +305,7 @@ pub fn compute_solution(
         }};
 
         ($c:ident, gpu) => {{
-            let track_id = if settings.track_id.starts_with('"') && settings.track_id.ends_with('"')
-            {
-                settings.track_id.clone()
-            } else {
-                format!(r#""{}""#, settings.track_id)
-            };
-            let track = serde_json::from_str(&track_id).map_err(|_| {
-                anyhow::anyhow!(
-                    "Failed to parse track_id '{}' as {}::Track",
-                    settings.track_id,
-                    stringify!($c)
-                )
-            })?;
+            let track: $c::Track = parse_track(&settings, stringify!($c))?;
 
             if ptx_path.is_none() {
                 panic!("PTX file is required for GPU challenges.");
@@ -402,6 +525,138 @@ pub fn load_module(path: &PathBuf) -> Result<Library> {
     }
 }
 
+#[cfg(feature = "c004")]
+pub fn build_index(
+    settings: String,
+    rand_hash: String,
+    library_path: PathBuf,
+    hyperparameters: Option<String>,
+    ptx_path: PathBuf,
+    build_fuel: u64,
+    _memory_cap_bytes: u64,
+    _timeout_secs: u64,
+    index_out: PathBuf,
+    gpu_device: Option<usize>,
+) -> Result<()> {
+    let settings = load_settings(&settings);
+    // No nonce is derived here and none can be passed -- the `build-index`
+    // subcommand has no nonce argument at all. This is the property the design
+    // rests on: a build process cannot compute any query set because the
+    // material to derive one is not present.
+    let db_seed = settings.calc_db_seed(&rand_hash);
+    let hyperparameters = hyperparameters.map(|x| load_hyperparameters(&x));
+
+    let library = load_module(&library_path)?;
+    let fuel_remaining_ptr = unsafe { *library.get::<*mut u64>(b"__fuel_remaining")? };
+    unsafe { *fuel_remaining_ptr = build_fuel };
+
+    let gpu_fuel_scale = 20u64;
+    let ptx_content = std::fs::read_to_string(&ptx_path)
+        .map_err(|e| anyhow!("Failed to read PTX file: {}", e))?;
+    let scaled = build_fuel.checked_mul(gpu_fuel_scale).ok_or_else(|| {
+        anyhow!(
+            "build fuel {} overflows when scaled by {}",
+            build_fuel,
+            gpu_fuel_scale
+        )
+    })?;
+    let modified_ptx = ptx_content.replace("0xdeadbeefdeadbeef", &format!("0x{:016x}", scaled));
+
+    let gpu_device = gpu_device.unwrap_or(0);
+    let ctx = CudaContext::new(gpu_device)?;
+    ctx.set_blocking_synchronize()?;
+    let module = ctx.load_module(Ptx::from_src(modified_ptx))?;
+    let stream = ctx.fuel_check_stream();
+    let prop = get_device_prop(gpu_device as i32)?;
+
+    let build_index_fn = unsafe {
+        library.get::<fn(
+            &c004::Database,
+            Option<String>,
+            Arc<CudaModule>,
+            Arc<CudaStream>,
+            &cudaDeviceProp,
+        ) -> Result<Vec<u8>>>(b"build_index")
+    }
+    .map_err(|_| {
+        anyhow!("algorithm does not export `build_index`; it does not support index building")
+    })?;
+
+    // Checked before the build, not after: discovering the mismatch after
+    // paying for a ten-minute build is a waste with no upside.
+    unsafe {
+        library.get::<fn(
+            &c004::Database,
+            &[u8],
+            Arc<CudaModule>,
+            Arc<CudaStream>,
+            &cudaDeviceProp,
+        ) -> Result<()>>(b"load_index")
+    }
+    .map_err(|_| anyhow!("algorithm exports `build_index` but not `load_index`"))?;
+
+    let track: c004::Track = parse_track(&settings, "c004")?;
+    let database =
+        c004::Database::generate(&db_seed, &track, module.clone(), stream.clone(), &prop)?;
+
+    let cfg = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (1, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let initialize_kernel = module.load_function("initialize_kernel")?;
+    unsafe {
+        stream
+            .launch_builder(&initialize_kernel)
+            .arg(&u64::from_be_bytes(db_seed[8..16].try_into().unwrap()))
+            .launch(cfg)?;
+    }
+
+    let blob = build_index_fn(&database, hyperparameters, module.clone(), stream.clone(), &prop)?;
+
+    // A GPU fuel trap is asynchronous: `build_index_fn` can return Ok while the
+    // device has already trapped and set gbl_ERRORSTAT. Without this, a build
+    // that blew its fuel budget writes an index and exits 0, and the spec's
+    // "build-fuel exhaustion leaves no index file" is simply false.
+    stream.synchronize()?;
+    ctx.synchronize()?;
+    let mut fuel_usage = stream.alloc_zeros::<u64>(1)?;
+    let mut signature = stream.alloc_zeros::<u64>(1)?;
+    let mut error_stat = stream.alloc_zeros::<u64>(1)?;
+    let finalize_kernel = module.load_function("finalize_kernel")?;
+    unsafe {
+        stream
+            .launch_builder(&finalize_kernel)
+            .arg(&mut fuel_usage)
+            .arg(&mut signature)
+            .arg(&mut error_stat)
+            .launch(cfg)?;
+    }
+    let error_stat = stream.memcpy_dtov(&error_stat)?[0];
+    let gpu_fuel_used = stream.memcpy_dtov(&fuel_usage)?[0] / gpu_fuel_scale;
+    if error_stat != 0 {
+        return Err(anyhow!(
+            "build failed on the device (error_stat {}, gpu fuel used {} of {}); no index written",
+            error_stat,
+            gpu_fuel_used,
+            build_fuel
+        ));
+    }
+
+    // Atomic: a watchdog kill must never leave a partial blob for the query
+    // process to load.
+    let tmp = index_out.with_extension("tmp");
+    fs::write(&tmp, &blob)?;
+    fs::rename(&tmp, &index_out)?;
+    eprintln!(
+        "index written: {} bytes, gpu fuel used {} of {}",
+        blob.len(),
+        gpu_fuel_used,
+        build_fuel
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -438,5 +693,117 @@ mod tests {
         let b = seeds_for(&settings, &rand_hash, u64::MAX);
         assert_eq!(a.db, b.db, "database seed must not vary with the nonce");
         assert_ne!(a.nonce, b.nonce, "query seed must vary with the nonce");
+    }
+
+    #[test]
+    fn build_index_mode_has_no_nonce_argument() {
+        // The anti-gaming property of D3 is that the build process has no nonce
+        // in scope. `build-index` must reject a nonce in every form it could
+        // arrive in: as a positional, or as a batch flag.
+        for extra in [
+            vec!["7"],                  // a positional nonce
+            vec!["--start-nonce", "0"], // the batch flag
+            vec!["--num-nonces", "5"],
+        ] {
+            let mut args = vec![
+                "tig-runtime",
+                "build-index",
+                "{}",
+                "hash",
+                "lib.so",
+                "--build-fuel",
+                "1000",
+                "--index-out",
+                "/tmp/i",
+            ];
+            args.extend(extra.iter().copied());
+            let err = cli().try_get_matches_from(&args).unwrap_err();
+            assert!(
+                err.to_string().contains("unexpected argument"),
+                "build-index must reject {:?}, got: {}",
+                extra,
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn build_index_requires_its_outputs() {
+        // Without `.required(true)` these parse fine and the mode then panics
+        // on `.unwrap()` deep inside build_index, after the process has already
+        // opened a CUDA context.
+        let base = [
+            "tig-runtime",
+            "build-index",
+            "{}",
+            "hash",
+            "lib.so",
+            "--build-fuel",
+            "1000",
+            "--index-out",
+            "/tmp/i",
+        ];
+        for missing in ["--build-fuel", "--index-out"] {
+            let mut kept = Vec::new();
+            let mut skip = false;
+            for a in base {
+                if skip {
+                    skip = false;
+                    continue;
+                } // drop the flag's value too
+                if a == missing {
+                    skip = true;
+                    continue;
+                }
+                kept.push(a);
+            }
+            let err = cli().try_get_matches_from(&kept).unwrap_err();
+            assert!(
+                err.to_string().contains(missing),
+                "missing {} must be an error naming it, got: {}",
+                missing,
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn batched_mode_refuses_zero_nonces() {
+        // A batch that produces nothing and exits 0 is indistinguishable from a
+        // batch that worked.
+        let err = cli()
+            .try_get_matches_from(vec![
+                "tig-runtime",
+                "batch",
+                "{}",
+                "hash",
+                "lib.so",
+                "--start-nonce",
+                "0",
+                "--num-nonces",
+                "0",
+            ])
+            .unwrap_err();
+        assert!(err.to_string().contains("num-nonces"), "got: {}", err);
+    }
+
+    #[test]
+    fn the_legacy_single_nonce_form_still_parses() {
+        // Every existing caller -- tig-verifier's sibling CLI, the slave, and
+        // scripts/test_algorithm -- uses this form. Adding subcommands must not
+        // move it.
+        let m = cli()
+            .try_get_matches_from(vec![
+                "tig-runtime",
+                "{}",
+                "hash",
+                "7",
+                "lib.so",
+                "--ptx",
+                "p.ptx",
+            ])
+            .unwrap();
+        assert_eq!(m.subcommand_name(), None);
+        assert_eq!(*m.get_one::<u64>("NONCE").unwrap(), 7);
     }
 }
