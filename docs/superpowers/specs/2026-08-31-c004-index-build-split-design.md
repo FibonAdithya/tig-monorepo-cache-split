@@ -1,8 +1,14 @@
 # c004: Splitting Index Building from Query Search
 
 **Date:** 2026-08-31
-**Status:** Design approved in chat; not implemented.
+**Status:** Implemented on `vector_search/gan_instance_gen`, with one gap.
 **Branch:** `vector_search/gan_instance_gen`
+
+> **Before configuring this: `tig-runtime batch` has zero callers.** The
+> reference slave still runs one process per nonce, and every constant in the
+> measurement note assumes it does not. See
+> "The slave does not use `batch`, and the calibration assumes it does" below.
+> `build_fuel_alpha` must not be set in protocol config until that is resolved.
 
 ## Problem
 
@@ -92,8 +98,16 @@ cannot coexist in one loaded module.
 device-to-device copy of the database.** A borrowed `&CudaSlice` would change
 the struct layout, and every existing `.so` reads those fields by offset - which
 means all 105 c004 algorithms rebuilt and resubmitted. A device-to-device copy
-of 358 MB costs ~1.4 ms at T4 bandwidth (~3% of an estimated 50 ms nonce) and
-358 MB of extra device memory, and buys a completely unbroken ABI.
+of 358 MB costs **<= 3.894 ms measured** (alloc + `clone_dtod`, on an RTX 3060,
+against a 22.7 ms marginal nonce - so <= ~17 % of a nonce, itself an upper
+bound) and 358 MB of extra device memory, and buys a completely unbroken ABI.
+
+> **Corrected 2026-08-31.** This decision originally priced the copy at "~1.4 ms
+> at T4 bandwidth (~3% of an estimated 50 ms nonce)". Both halves were wrong in
+> the same, optimistic direction: 1.4 ms counts one direction only at full
+> advertised bandwidth, and the 50 ms nonce was an estimate that measurement
+> replaced with 22.7 ms. See
+> `docs/measurements/2026-08-31-c004-post-split-nonce-time.md` 3.4.
 
 > **The justification above is VOIDED by measurement (2026-08-31, Validation
 > below). The layout claim survives; the reason for making it does not.**
@@ -113,7 +127,9 @@ of 358 MB costs ~1.4 ms at T4 bandwidth (~3% of an estimated 50 ms nonce) and
 > the database rather than copying it - would need a lifetime parameter on
 > `Challenge` (`Challenge<'a>` holding `&'a CudaSlice<f32>`), which is itself a
 > further ABI change on top of the one the GAN work already forces. Set against
-> that: ~358 MB of device memory per nonce and ~1.4 ms of copy.
+> that: ~358 MB of device memory per nonce and <= 3.894 ms of copy (measured;
+> the "~1.4 ms" this sentence used to quote was a bandwidth calculation, not a
+> measurement).
 >
 > **Sized against the deployment target, not the test rig.** The target is the
 > weakest listed `ComputeType` - `AWS_G4dn`, a T4 with **16 GB** - as the
@@ -209,7 +225,7 @@ that kills a runaway build, not the budget itself.
         algorithm::load_index(&blob)               one upload, held in the .so's static
                           |
          for nonce in A..A+M:
-             d2d copy database into Challenge       ~1.4 ms
+             d2d copy database into Challenge       <= 3.894 ms (measured)
              generate_queries(H(settings, rand_hash, nonce))
              initialize_kernel(sig)                <- fuel meter zeroed HERE
              entry_point(&challenge, save_solution, ..)
@@ -343,9 +359,14 @@ re-verify path depend on it.
 tig-runtime --build-index <SETTINGS> <RAND_HASH> <BINARY> --ptx P \
             --build-fuel N --memory-cap BYTES --build-timeout SECS --index-out F
 tig-runtime <SETTINGS> <RAND_HASH> <NONCE> <BINARY> [--index F]              # unchanged
-tig-runtime <SETTINGS> <RAND_HASH> --start-nonce A --num-nonces M <BINARY> \
-            [--index F] --output D
+tig-runtime batch <SETTINGS> <RAND_HASH> <BINARY> --ptx P \
+            --start-nonce A --num-nonces M [--index F] --output D
 ```
+
+(As implemented, the batched form is a `batch` **subcommand**, not bare flags on
+the root command; an earlier draft of this synopsis showed the latter. The
+legacy four-positional form is unchanged, which is what
+`subcommand_negates_reqs` preserves.)
 
 - `--build-index` with `--start-nonce`, `--num-nonces` or a positional `NONCE`
   is rejected at argument parsing. The build process must not be able to learn a
@@ -360,7 +381,8 @@ tig-runtime <SETTINGS> <RAND_HASH> --start-nonce A --num-nonces M <BINARY> \
 |---|---|---|
 | Build fuel | PTX patched with `build_fuel_budget * 20`; `trap` sets `gbl_ERRORSTAT` | non-zero exit, no index written |
 | Wall-clock (watchdog, 600 s) | watchdog thread kills the process | non-zero exit, no index written |
-| Device memory (8 GB provisional) | balloon: after generating the database, allocate `free - cap` and hold it | `cudaMalloc` fails inside `build_index`, which returns `Err` |
+| Device memory (**2 GiB**, was "8 GB provisional") | balloon: after generating the database, allocate `free - (cap + 64 MiB)` and hold it | `cudaMalloc` fails inside `build_index`, which returns `Err` |
+| CPU fuel during `load_index` | none - see the note under this table | n/a |
 
 The balloon is chosen over polling `cudaMemGetInfo` because polling samples, and
 a transient spike between samples goes unseen. With the balloon held, the
@@ -373,9 +395,85 @@ Sizing on the weakest listed `ComputeType` (`AWS_G4dn`, T4, 16 GB): fixed costs
 are ~0.94 GB, measured by parsing `weights/v1_sift.bin` (layers
 128->512->1024->1024->128, so `widest` is 1024): 358.4 MB database, 536.9 MB for
 the two `FORWARD_CHUNK * widest` scratch buffers, 33.6 MB of latents, ~7 MB of
-weights, plus context overhead. An 8 GB cap therefore leaves comfortable
-headroom, and the query process holds database +
-its per-nonce copy + index + queries inside the same 16 GB.
+weights, plus context overhead. The query process holds database + its per-nonce
+copy + index + queries inside the same 16 GB.
+
+**The cap is 2 GiB, not the 8 GB this section provisionally named.** Three
+things forced the change, and only the first is about headroom:
+
+1. **8 GiB makes the build refuse itself.** `balloon_size` errors out when
+   `free < cap + 64 MiB` - deliberately, because a cap that cannot be enforced
+   is worse than no build. The reference slave never passes `--memory-cap`, and
+   `process_batch` runs concurrently with `num_workers` solve threads that are
+   already holding device memory. On a 12 GB card under load, `free` after
+   `Database::generate` is routinely below 8.06 GiB, so the default itself is
+   the failure.
+2. **The measured build-phase peak is 1,010 MiB**, whole-card, including the
+   CUDA context and the 352 MiB database
+   (`docs/measurements/2026-08-31-c004-post-split-nonce-time.md` 6.2). 2 GiB is
+   ~2x that, and the cap is what the *algorithm* may allocate **on top of** the
+   context and database, because the balloon is sized from `free` measured
+   after `Database::generate`.
+3. 8 GiB was never derived from anything. It was a provisional number in this
+   document; 2 GiB is derived from a measurement, which is the only change in
+   kind.
+
+What 2 GiB does **not** settle: `nullstub`'s `build_index` allocates nothing, so
+what a real 700,000-vector ANN index costs to build is still unmeasured, and no
+such algorithm exists on this branch to measure. If one turns out to need more,
+the number to raise is this default, and the flag exists precisely so an
+operator can. There is also a tension the balloon design does not resolve: a
+*lower* cap means a *larger* balloon, so the build phase holds more of the card
+away from any concurrent solve thread. Lowering the cap converts "the build
+refuses to start" into "the build starves its neighbours", which is a better
+failure but not a good one.
+
+### `load_index` and the fuel meters
+
+`load_index` runs above the nonce loop, before the loop's first
+`initialize_kernel`. So:
+
+- **Device fuel: free.** `initialize_kernel` is what zeroes `gbl_FUELUSAGE`, and
+  it has not run yet. This is the same free phase `generate_instance` already
+  occupies - see "A free phase before the meter already exists" above.
+- **CPU fuel: metered, but charged to nothing scored.** `compute_solution`
+  primes `__fuel_remaining` to `max_fuel` before `$make_db` runs, and then
+  *resets* it to `max_fuel` at the top of every nonce. So instrumented CPU code
+  inside `load_index` decrements a real meter and will exit 87 if it exhausts
+  `max_fuel`, but whatever it spends is discarded before nonce 0 is solved.
+  Priming it is not optional: without it `load_index` decrements whatever the
+  `.so`'s static initialiser left, and a zero exits 87 on the first
+  instrumented instruction with nothing naming the cause.
+
+Neither is exploitable - `load_index` receives only the `Database` and the blob,
+never a query - but both are stated because the table above previously said
+nothing about either.
+
+### Per-nonce fuel independence is a property of the runtime's counters only
+
+The Testing table's row "nonce *k*'s `fuel_consumed` is independent of nonce
+*k-1* in batched mode" is true, and the code enforces it: `initialize_kernel`
+zeroes the device counter and `__fuel_remaining` is reset, both at the top of
+every nonce. But it is a statement about **the runtime's counters**, not about
+**the algorithm's state**.
+
+In `batch` mode the algorithm's `static`s persist across the whole bundle - by
+design; that is where D6 puts the index handle. Nothing stops an algorithm from
+spending nonce 0's entire `max_fuel` building state that nonces 1..N then read
+for free. At the recommended constants that back door is **~40x more generous
+than the build budget it routes around**: nonce 0's `max_fuel` is
+`fuel_budget` (up to 5e12), while `alpha * N * fuel_budget` capped at
+`max_build_fuel_budget` = 7.0e12 is what a legitimate build gets for the whole
+precommit.
+
+This is **inside** the stated model, not a hole in it: D2 makes fuel a spend
+limit rather than a score term, and "these caps are not security controls"
+already says nothing in consensus re-runs the build. It is recorded because the
+per-nonce-independence row reads, on its own, like a stronger guarantee than it
+is. A benchmarker using this back door pays for it in nonce 0's wall-clock and
+gets no protocol credit for the build; the only thing it defeats is the *shape*
+of D7's proportional rule, and it defeats it by ignoring the build phase
+entirely rather than by exceeding it.
 
 Every failure path lands in the same place: no index, no nonces computed, a
 wasted precommit. That is entirely the benchmarker's loss - nothing is
@@ -390,6 +488,58 @@ caps exist to keep submitted algorithms runnable on standard benchmarker
 hardware and to keep algorithm ranking comparable across operators. Anyone
 reading this spec looking for a guarantee that the build was bounded will not
 find one; the honest fix for that is verified re-execution, which D2 defers.
+
+## The slave does not use `batch`, and the calibration assumes it does
+
+**Read this before setting `build_fuel_alpha` in any config.**
+
+`tig-runtime batch` is implemented, tested, and has **zero callers**.
+`tig-benchmarker/slave/main.py` wires the build (`run_build_index`, once per
+batch) and passes `--index` to each nonce, but `process_nonces` still pulls one
+nonce off a queue and calls `run_tig_runtime`, which spawns one
+`docker exec ... tig-runtime <settings> <rand_hash> <nonce> <so>` process **per
+nonce** - the legacy form. `NUM_WORKERS` of those run concurrently. Nothing in
+this repository, outside `tig-runtime`'s own tests, passes `--start-nonce`.
+
+That is deliberate and it is a gap in the *plan*, not a defect in the
+implementation: Task 10's brief asked only for the build call plus "pass
+`--index` to each `run_tig_runtime` call". Rewiring the slave's solve path is a
+behaviour change to **every** challenge, not just c004, and it needs integration
+testing that the session which found this could not do. It is left undone on
+purpose.
+
+**What it costs.** Every constant in §5 of
+`docs/measurements/2026-08-31-c004-post-split-nonce-time.md` is derived from
+`t_new` = 0.378 s/nonce, which amortises per-process startup (2.078 s, of which
+2.005 s is `CudaContext::new`) plus `Database::generate` (0.766 s) over
+`batch_size` = 8 nonces **in one process**. Under the slave as shipped, the
+applicable row of that same table is `batch_size` = 1:
+
+| | `batch_size` 8 (what the constants assume) | `batch_size` 1 (what the slave does) |
+|---|---|---|
+| `t_new` | 0.378 s/nonce | **2.866 s/nonce** |
+| `delta` = `t_old` - `t_new` | 2.861 s/nonce | **0.373 s/nonce** - **7.7x smaller** |
+| break-even for a flat 600 s build | 210 nonces | **~1,610 nonces** |
+| net-win bound `alpha <= delta * R / F` (`R_low`) | 8.79e-3 | **1.145e-3** |
+| recommended `alpha` (bound / 2 / 1.25 T4) | 3.52e-3 -> **0.003** | 4.58e-4 -> **0.0004** |
+
+So **`alpha` = 0.003 is ~2.6x above the bare net-win bound at `batch_size` = 1**
+(2.0x at `R_measured`). Concretely, at the 80-nonce protocol floor it authorises
+1.2e12 build fuel = 78 s of build against 30 s of saving - a net **loss** of
+48 s. The proportional rule only turns positive once
+`max_build_fuel_budget` = 7.0e12 has clamped it, at roughly 1,200 nonces
+(`R_low`) or 900 (`R_measured`).
+
+**The rule this section exists to state: `build_fuel_alpha` must not be set in
+protocol config until either the slave is wired to `batch`, or the value is
+re-derived for `batch_size` = 1.** Today the key is inert - `ChallengeConfig`
+parses and validates it, but `calc_build_fuel_budget` is explicitly dead code
+with no caller, and the slave receives `build_fuel_budget` from the master
+rather than computing it. The moment the master is wired, a `build_fuel_alpha`
+of 0.003 against a per-nonce slave makes the split **net-negative** at every
+precommit size below ~1,000 nonces, and nothing anywhere reports that. Wiring
+the slave to `batch` is the better of the two fixes, because it is also what
+makes the rest of this document's cost model true.
 
 ## Blast radius
 
@@ -434,8 +584,25 @@ What does change:
   drift risk is Rust-vs-Python only, not three-way.
 - `tig-runtime`: `--build-index` mode, batched mode, watchdog, balloon.
 - `tig-benchmarker/slave/main.py`: one build invocation before the nonce loop.
+  **Shipped state: the build invocation and `--index` are wired; the batched
+  query process is NOT.** See "The slave does not use `batch`" below - this is
+  the one place where the implementation and this document's cost model do not
+  meet.
 - `tig-protocol`: `build_fuel_budget` validation beside the existing
   `fuel_budget` check; `alpha` and `max_build_fuel_budget` in `ChallengeConfig`.
+- **Operational, and it is atomic: `tig-runtime` and `tig-verifier` must be
+  upgraded together.** They are two halves of one instance derivation. An old
+  verifier paired with a new runtime regenerates the *pre-split* database - one
+  derived from the per-nonce seed rather than from `calc_db_seed` - and
+  therefore rejects **every honest c004 solution** the new runtime produces. The
+  reverse pairing fails the same way for the same reason. Neither failure names
+  its cause: the verifier reports an invalid solution, which is
+  indistinguishable from a genuinely wrong answer, and the operator sees a
+  benchmarker that has silently stopped earning. Deploy both binaries in one
+  step, or take c004 out of the selection while they are mismatched. This is not
+  a c004-only concern for a mixed fleet: a slave running the old pair and a
+  slave running the new pair are computing different instances for the same
+  precommit.
 - **Cross-repo:** `pentest-harness` (tig-pentesting) has a path dependency on
   `tig-challenges` and calls `generate_instance` and `evaluate_solution`
   directly. The `Seeds` change breaks it the same way the `evaluate_solution`

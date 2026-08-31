@@ -11,6 +11,47 @@ This note replaces the design's **estimate** of 0.05 s/nonce, and the 1.2 s/nonc
 figure it is measured against, with measurements. It also revises `alpha` and
 reports what the memory and lifespan measurements can and cannot settle.
 
+> ## The constants below assume a batched query process the reference slave does not use
+>
+> **Added 2026-08-31, after the whole-branch review. Read this before using any
+> number in 5 or 10.**
+>
+> `tig-runtime batch` is implemented and tested but has **zero callers**.
+> `tig-benchmarker/slave/main.py` builds the index once per batch and passes
+> `--index` to every nonce, but `process_nonces` still spawns one
+> `docker exec ... tig-runtime <settings> <rand_hash> <nonce> <so>` process
+> **per nonce**. So the shipped configuration is `batch_size` = 1 in the sense
+> that matters here - one CUDA context and one `Database::generate` per nonce -
+> even though the master's `batch_size` knob still reads 8 and still sizes the
+> Merkle tree.
+>
+> This note uses `batch_size` = 8 throughout (3.3), which is the row of the
+> amortisation curve where the *runtime* batches 8 nonces in one process. The
+> row that describes the slave as shipped is the one this note labels
+> "degenerate":
+>
+> | | 3.3's `batch_size` 8 | the slave as shipped (`batch_size` 1) |
+> |---|---|---|
+> | `t_new` | 0.3781 s | **2.8660 s** |
+> | `delta` | 2.8607 s | **0.3728 s** - 7.7x smaller |
+> | break-even, flat 600 s build (4.2) | 210 nonces | **~1,610 nonces** |
+> | net-win bound `delta * R_low / F` | 8.79e-3 | **1.145e-3** |
+> | recommended `alpha` (5.4's chain) | 3.52e-3 -> **0.003** | 4.58e-4 -> **0.0004** |
+>
+> **`alpha` = 0.003 is ~2.6x above the bare net-win bound at `batch_size` = 1**
+> (~2.0x at `R_measured`), i.e. under the slave as shipped the build would cost
+> more wall-clock than the split saves at every precommit size up to roughly
+> 1,000 nonces, where `max_build_fuel_budget` = 7.0e12 has clamped it. At the
+> 80-nonce protocol floor: 78 s of build against 30 s of saving.
+>
+> **Operational rule: `build_fuel_alpha` must NOT be set in protocol config
+> until either the slave is wired to `batch`, or the constant is re-derived for
+> `batch_size` = 1.** The key is inert today - `ChallengeConfig` parses and
+> validates it, `calc_build_fuel_budget` has no caller, and the slave takes
+> `build_fuel_budget` from the master - so nothing breaks now and nothing warns
+> later. Section 10's table is unchanged below, and is correct **for the
+> batched runtime it assumes**; this box is what makes that assumption visible.
+
 ---
 
 ## 0. Summary
@@ -346,7 +387,7 @@ t_new(batch_size) = 2.8433 / batch_size + 0.022711
 
 | `batch_size` | `t_new` | `delta` = `t_old` - `t_new` | |
 |---|---|---|---|
-| 1 | 2.8660 s | 0.3728 s | degenerate — no batching at all |
+| **1** | **2.8660 s** | **0.3728 s** | **what the reference slave actually does** — `tig-runtime batch` has zero callers; see the box at the top |
 | 2 | 1.4444 s | 1.7944 s | |
 | 4 | 0.7335 s | 2.5053 s | |
 | **8** | **0.3781 s** | **2.8607 s** | **shipped default (`init.sql`)** |
@@ -357,8 +398,17 @@ t_new(batch_size) = 2.8433 / batch_size + 0.022711
 | ∞ | 0.0227 s | 3.2161 s | the marginal cost of §3.1 |
 
 **This note uses `batch_size` = 8 throughout**, because it is what the reference
-benchmarker ships and because it is the conservative choice among realistic
-values (smallest `delta`, smallest `alpha`). **`t_new` = 0.378 s/nonce.**
+benchmarker ships *as a configuration value* and because it is the conservative
+choice among realistic values (smallest `delta`, smallest `alpha`).
+**`t_new` = 0.378 s/nonce.**
+
+**Corrected 2026-08-31:** "what the reference benchmarker ships" is true of the
+`batch_size` column in `init.sql`, which sizes the master's batches and the
+Merkle tree — but **not** of the runtime process. The slave never invokes
+`tig-runtime batch`; it runs one process per nonce, so the startup and
+`Database::generate` terms amortise over exactly one nonce. The row that
+describes the shipped slave is `batch_size` = 1, and the difference is 7.7x in
+`delta`. See the box at the top of this note.
 
 `delta` — which is what break-even and `alpha` actually depend on — moves only
 12 % across `batch_size` 8 → 512, and only 7 % from 8 → 20, so the constants in
@@ -584,7 +634,10 @@ alpha = delta * R_low / (2 * F) / 1.25
 > margins, alongside the /2.
 
 **Recommended `alpha` = 0.003 (3e-3)**, against the provisional 0.25 — 83x
-smaller. Each digit of that reduction is traceable: 0.01194 is the bare net-win
+smaller. **Conditional on a batched query process: at `batch_size` = 1, which is
+what the slave does today, the same chain gives 0.0004. Do not set
+`build_fuel_alpha` until that is resolved — see the box at the top of this
+note.** Each digit of that reduction is traceable: 0.01194 is the bare net-win
 bound at `R_measured`; halving it for margin gives 0.00597; derating for a T4
 gives 0.00478; taking the older `R_low` datum instead gives 0.00352; rounding
 down to a clean value gives 0.003. A reader who rejects the `R_low` datum (§5.1)
@@ -709,7 +762,19 @@ of allocations plus ~190 MiB the driver holds outside the reported free pool.
 The transient generator scratch (`FORWARD_CHUNK` ping-pong buffers) therefore
 never exceeds the post-copy steady state.
 
-### 6.3 What this says about the 8 GiB cap
+### 6.3 What this says about the cap
+
+> **The default was changed to 2 GiB on 2026-08-31**, after the whole-branch
+> review, for a reason this section did not consider: enforceability under the
+> slave's own concurrency, not headroom. `balloon_size` refuses to run when
+> `free < cap + 64 MiB`; the slave never passes `--memory-cap`; and
+> `process_batch` runs while `num_workers` solve threads hold device memory. On
+> a 12 GB card under load an 8 GiB default makes the build refuse **itself**.
+> The measurements below are unchanged and still say what they said — they were
+> the input to the new number (2 GiB is ~2x the 1,010 MiB peak), not evidence
+> against the old one.
+
+Against the 8 GiB value this section was written to assess:
 
 - **The runtime's own build-phase footprint is 1,010 MiB** with an index that
   allocates nothing: CUDA context, the chunked generator's scratch, and the
@@ -907,9 +972,9 @@ built, §5.3 says what happens to `alpha`.
 
 | constant | value | derivation |
 |---|---|---|
-| `build_fuel_alpha` | **0.003** | `delta * R_low / (2 * max_fuel_budget) / 1.25` = `2.8607 * 1.5360e10 / 1e13 / 1.25` = 3.52e-3, rounded down |
+| `build_fuel_alpha` | **0.003** — **do not set in config yet** | `delta * R_low / (2 * max_fuel_budget) / 1.25` = `2.8607 * 1.5360e10 / 1e13 / 1.25` = 3.52e-3, rounded down. **Assumes `batch_size` = 8 in one runtime process; the slave uses one process per nonce, where the same chain gives 4.58e-4 -> 0.0004.** See the box at the top. |
 | `max_build_fuel_budget` | **7.0e12** | `600 s * R_low / 1.25` = 7.37e12, rounded down so the fuel cap binds before the watchdog |
-| memory cap | **8 GiB** unchanged | not contradicted (1,010 MiB measured floor); not confirmed for a real index |
+| memory cap | **2 GiB** (revised from 8 GiB, 2026-08-31) | 2x the 1,010 MiB measured build peak (6.2). 8 GiB was never derived from anything and made the build refuse itself: `balloon_size` errors when `free < cap + 64 MiB`, the slave never passes `--memory-cap`, and the build runs alongside `num_workers` solve threads holding device memory. Still not confirmed for a real index — `nullstub` allocates nothing. |
 | build watchdog | **600 s** unchanged | safety net; never the binding limit at these constants |
 
 `build_fuel_alpha * num_nonces * fuel_budget` must still be computed in `u128` or
@@ -973,6 +1038,25 @@ worth another round. Recorded so they are not rediscovered as new findings.
 - Corrected: 6.53 -> 3.46 s became 6.49 -> 3.63 s (`batch_size` 8, and the
   verifier value from the larger sample); "34.7 % of total work" was
   build/(query+verify), now given as both.
+
+**2026-08-31, whole-branch review fix wave (no new measurement).** Two things
+this note could not have known when it was written, both stated rather than
+folded in silently:
+
+- **A box at the top**, and matching notes in 3.3, 5.4 and 10: `tig-runtime
+  batch` has zero callers, so the slave runs one process per nonce and the
+  applicable row of 3.3's curve is `batch_size` = 1, not 8. `delta` is 7.7x
+  smaller there (0.373 s against 2.861 s), break-even is ~1,610 nonces rather
+  than 210, and the chain in 5.4 gives `alpha` = 0.0004 rather than 0.003. The
+  operational consequence — `build_fuel_alpha` must not be set in config until
+  the slave is wired to `batch` or the constant is re-derived — is stated in all
+  four places. No number in this note is retracted; what changes is which row of
+  the curve applies.
+- **The memory cap default moved 8 GiB -> 2 GiB** (6.3, 10). Not because the
+  measurements said 8 GiB was too large — they explicitly could not settle that
+  — but because `balloon_size` refuses to run when `free < cap + 64 MiB`, the
+  slave never passes `--memory-cap`, and the build shares the card with
+  `num_workers` solve threads. 2 GiB is 2x the 1,010 MiB measured peak.
 
 **2026-08-31, fix round 2 (arithmetic and prose only; no new measurement).**
 Six errors introduced by fix round 1, four of them optimistic:
