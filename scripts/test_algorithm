@@ -6,6 +6,7 @@ import os
 import platform
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -193,7 +194,30 @@ f"""Library not found at {so_path}:
             # assume `load_index` already ran. Solving without one would either
             # crash or quietly produce a worse answer, and the run would report
             # that as the algorithm's real score.
-            print(f"build-index failed (exit {build_ret.returncode}) after {build_ms}ms")
+            rc = build_ret.returncode
+            hint = ""
+            if rc < 0:
+                # subprocess encodes death by signal as a NEGATIVE returncode.
+                # Printed raw it reads as an ordinary non-zero exit, and a
+                # killed child writes no stderr -- so the reader gets
+                # "exit -9" and an empty message and debugs the algorithm.
+                # Measured 2026-09-01: that is exactly what happened, twice,
+                # and the agent rewrote a correct IVF in response.
+                try:
+                    why = f"killed by signal {-rc} ({signal.Signals(-rc).name})"
+                except ValueError:
+                    # A number this platform does not name. Still say the
+                    # number: raising here would replace a diagnosable
+                    # failure with a traceback.
+                    why = f"killed by signal {-rc}"
+                # Say where to look, since there is no stderr to read.
+                hint = ("  (a killed build produces no stderr; if this box runs "
+                        "the gpuq runner, check its orphan sweep in the runner log)")
+            else:
+                why = f"exit {rc}"
+            print(f"build-index failed ({why}) after {build_ms}ms")
+            if hint:
+                print(hint)
             print(build_ret.stderr.strip())
             sys.exit(1)
         print(f"index built in {build_ms}ms, {os.path.getsize(index_path)} bytes "
