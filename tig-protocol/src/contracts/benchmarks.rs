@@ -15,8 +15,7 @@ use tig_structs::{config::*, core::*};
 ///
 /// No caller yet: wiring `build_fuel_budget` into a precommit's per-batch payload
 /// needs a `tig-benchmarker/master` DB migration plus a second, Python-side
-/// reimplementation of this arithmetic, which is out of scope for this plan (see
-/// the Step 3b decision in `.superpowers/sdd/2026-08-31-c004-index-build-split-monorepo/task-9-report.md`).
+/// reimplementation of this arithmetic, which was out of scope when this landed.
 /// This is deliberately dead code, not an oversight -- do not delete it as unused.
 #[allow(dead_code)]
 pub fn calc_build_fuel_budget(
