@@ -22,14 +22,29 @@ pub struct ScenarioConfig {
     pub weights: &'static [u8],
     /// Recall@1 a solution must declare to qualify. Per scenario because the
     /// achievable recall/speed frontier depends on the corpus.
-    /// 0.95, chosen in `docs/measurements/2026-08-27-c004-d2-over-d1.md`
-    /// (tig-pentesting repo): measured floors for a viable `r` are far below
-    /// it (0.281 measured on an oracle worst-case seed; 0.79 under an
-    /// unmeasured near-tie hypothesis), so 0.95 clears both with margin. The
-    /// upper end is not measured — no ANN method was run — so "0.95 is not
-    /// trivially cleared by an approximate method" is judgement, not
-    /// measurement; a cheap ANN clearing it later is grounds to raise `r`,
-    /// not to reconsider the design.
+    /// Currently 0.9, and deliberately NOT the 0.95 this shipped with.
+    ///
+    /// The floors, from `docs/measurements/2026-08-27-c004-d2-over-d1.md`
+    /// (tig-pentesting repo): 0.281 measured on an oracle worst-case seed, and
+    /// 0.79 under an unmeasured near-tie hypothesis. 0.9 clears both — with the
+    /// audit's one-sided 3-sigma tolerance at m=1,000 samples it has a
+    /// worst-case pass point of 0.8715, still above the unmeasured 0.79 — so
+    /// dropping to it does not reach either floor.
+    ///
+    /// It MUST stay equal to `_MIN_RECALL_BY_TRACK` in the tig-pentesting
+    /// repo's `challenges/vector_search.py`. The two live in different repos
+    /// with no test that can see both, and they disagreed for a while: this
+    /// said 0.95 while the plugin said 0.9. That is worse than either value on
+    /// its own, because `build_goal_prompt` PREFERS the bar `vs-generate`
+    /// reports from here, while PentestMemory qualifies rounds against the
+    /// plugin constant — so the agent aims at one bar and the harness scores
+    /// against another, and every round between the two counts as qualifying
+    /// here and would be rejected by the network.
+    ///
+    /// The upper end is still not measured — no ANN method has been run
+    /// against it — so "this bar is not trivially cleared by an approximate
+    /// method" remains judgement, not measurement. A cheap ANN clearing it is
+    /// grounds to raise `r`, not to reconsider the design.
     pub min_recall: f32,
     /// A returned vector counts as a hit when its distance is within this
     /// relative tolerance of the true minimum. Absorbs cross-architecture float
@@ -52,7 +67,7 @@ impl From<Scenario> for ScenarioConfig {
                 // it can embed the 7 MB blob twice -- in every algorithm .so,
                 // since they all link tig-challenges.
                 weights: super::generator::V1_BLOB,
-                min_recall: 0.95,
+                min_recall: 0.9,
                 recall_tolerance: 1e-6,
                 audit_samples: 1_000,
             },
@@ -128,7 +143,7 @@ mod tests {
         let c = ScenarioConfig::from(Scenario::SIFT_128);
         // Asserted against the value, not `is_finite()` — a bar that silently
         // defaulted to 0.0 would qualify every solution including all-zeros.
-        assert_eq!(c.min_recall, 0.95);
+        assert_eq!(c.min_recall, 0.9);
         assert_eq!(c.audit_samples, 1_000);
         assert_eq!(c.recall_tolerance, 1e-6);
     }
