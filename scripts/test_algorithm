@@ -6,6 +6,7 @@ import os
 import platform
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -43,8 +44,39 @@ if CHALLENGE is None:
     print("CHALLENGE environment variable must be set!")
     sys.exit(1)
 
+# Fraction of --fuel handed to the index build when the algorithm builds one.
+# Provisional: Task 8 of docs/superpowers/plans/2026-08-31-c004-index-build-split-monorepo.md
+# measures the real value. It is a separate budget, not a slice taken out of
+# --fuel: the query phase still gets the whole of --fuel.
+BUILD_FUEL_ALPHA = 0.25
+
+
 def now():
     return int(time.time() * 1000)
+
+
+def exports_index_abi(so_path):
+    """True when the algorithm exports both halves of the index-build ABI.
+
+    Read out of the binary rather than taken from a flag, because the ~90
+    existing c004 algorithms export neither symbol and `tig-runtime build-index`
+    errors out on them. Detecting it here keeps every one of those algorithms on
+    exactly the command line it has today.
+
+    Both symbols are required, not either: `load_index` alone cannot produce an
+    index, and tig-runtime refuses a `build_index` that has no `load_index` to
+    read the blob back.
+    """
+    try:
+        out = subprocess.check_output(
+            ["nm", "-D", "--defined-only", so_path], text=True, stderr=subprocess.DEVNULL
+        )
+    except Exception:
+        # No nm, or an unreadable .so. Treat as "no index ABI" so the algorithm
+        # runs the way it does today rather than failing on a detection problem.
+        return False
+    symbols = {line.split()[-1] for line in out.splitlines() if line.strip()}
+    return "build_index" in symbols and "load_index" in symbols
 
 
 if __name__ == "__main__":
@@ -64,6 +96,10 @@ if __name__ == "__main__":
     parser.add_argument("--workers", type=int, default=1, help="Number of worker threads (default: 1)")
     parser.add_argument("--audit-salt", type=str, default=None, help="32-byte audit salt as 64 hex chars, passed to tig-verifier (default: all-zeros)")
     parser.add_argument("--ignore-invalid", action='store_true', help="Continue testing even if invalid solutions are encountered")
+    parser.add_argument("--build-fuel", type=int, default=None, help=f"Fuel budget for the index build phase (default: {BUILD_FUEL_ALPHA} x --fuel)")
+    parser.add_argument("--build-timeout", type=int, default=None, help="Wall-clock watchdog for the index build, in seconds (default: tig-runtime's own)")
+    parser.add_argument("--memory-cap", type=int, default=None, help="Device memory the index build may use, in bytes (default: tig-runtime's own)")
+    parser.add_argument("--no-index-build", action='store_true', help="Never build an index, even if the algorithm exports the index ABI")
     parser.add_argument("--verbose", action='store_true', help="Print debug logs")
     
     args = parser.parse_args()
@@ -107,6 +143,88 @@ f"""Library not found at {so_path}:
     challenge_id = challenge_ids[CHALLENGE]
 
     settings = {"algorithm_id": "", "challenge_id": challenge_id, "track_id": args.track_id, "block_id": "", "player_id": ""}
+
+    # Build the index once, before any nonce runs.
+    #
+    # This is the whole point of the phase split: the build is charged its own
+    # `--build-fuel` budget and its wall clock is reported separately, so it
+    # lands in NO nonce's `elapsed`. An index-building method is therefore
+    # measured on its query cost, the way it would be in production where one
+    # build is amortised over a whole bundle.
+    #
+    # Gated on c004 because `tig-runtime build-index` is `#[cfg(feature = c004)]`
+    # -- on any other challenge it exits 84 rather than doing anything, and a
+    # stray symbol match would turn that into a spurious run failure.
+    index_path = None
+    if (
+        challenge_id == "c004"
+        and ptx_path is not None
+        and not args.no_index_build
+        and exports_index_abi(so_path)
+    ):
+        build_fuel = args.build_fuel if args.build_fuel is not None else int(BUILD_FUEL_ALPHA * args.fuel)
+        index_dir = tempfile.mkdtemp(prefix="tig_index_")
+        index_path = os.path.join(index_dir, "index.blob")
+        build_cmd = [
+            args.tig_runtime_path,
+            "build-index",
+            json.dumps(settings, separators=(',',':')),
+            args.seed,
+            so_path,
+            "--build-fuel", str(build_fuel),
+            "--index-out", index_path,
+            "--ptx", ptx_path,
+            "--gpu", "0",
+        ]
+        if args.build_timeout is not None:
+            build_cmd += ["--build-timeout", str(args.build_timeout)]
+        if args.memory_cap is not None:
+            build_cmd += ["--memory-cap", str(args.memory_cap)]
+        if args.hyperparameters:
+            build_cmd += ["--hyperparameters", args.hyperparameters]
+        if args.verbose:
+            printable = build_cmd[:2] + ["'" + build_cmd[2] + "'"] + build_cmd[3:]
+            print("[build-index] " + " ".join(printable))
+        build_start = now()
+        build_ret = subprocess.run(build_cmd, capture_output=True, text=True)
+        build_ms = now() - build_start
+        if build_ret.returncode != 0:
+            # Fatal, never a silent fall back to running without an index: the
+            # algorithm declared the ABI, so its `entry_point` is entitled to
+            # assume `load_index` already ran. Solving without one would either
+            # crash or quietly produce a worse answer, and the run would report
+            # that as the algorithm's real score.
+            rc = build_ret.returncode
+            hint = ""
+            if rc < 0:
+                # subprocess encodes death by signal as a NEGATIVE returncode.
+                # Printed raw it reads as an ordinary non-zero exit, and a
+                # killed child writes no stderr -- so the reader gets
+                # "exit -9" and an empty message and debugs the algorithm.
+                # Measured 2026-09-01: that is exactly what happened, twice,
+                # and the agent rewrote a correct IVF in response.
+                try:
+                    why = f"killed by signal {-rc} ({signal.Signals(-rc).name})"
+                except ValueError:
+                    # A number this platform does not name. Still say the
+                    # number: raising here would replace a diagnosable
+                    # failure with a traceback.
+                    why = f"killed by signal {-rc}"
+                # Say where to look, since there is no stderr to read.
+                hint = ("  (a killed build produces no stderr; if this box runs "
+                        "the gpuq runner, check its orphan sweep in the runner log)")
+            else:
+                why = f"exit {rc}"
+            print(f"build-index failed ({why}) after {build_ms}ms")
+            if hint:
+                print(hint)
+            print(build_ret.stderr.strip())
+            sys.exit(1)
+        print(f"index built in {build_ms}ms, {os.path.getsize(index_path)} bytes "
+              f"(not counted in any nonce's elapsed)")
+        if args.verbose and build_ret.stderr.strip():
+            print(f"[build-index] {build_ret.stderr.strip()}")
+
     pool = ThreadPoolExecutor(max_workers=args.workers + 1)
 
     results = {}
@@ -163,6 +281,12 @@ f"""Library not found at {so_path}:
                     "--ptx", ptx_path,
                     "--gpu", str(nonce % len(VISIBLE_GPUS)),
                 ]
+            if index_path is not None:
+                # `load_index` runs inside this process, so its wall clock IS in
+                # this nonce's elapsed -- only the build itself was hoisted out.
+                # With c004 at one nonce per score that is the honest number; a
+                # real bundle would amortise the load over every nonce too.
+                cmd += ["--index", index_path]
             if args.hyperparameters:
                 cmd += [
                     "--hyperparameters", args.hyperparameters,
@@ -233,3 +357,9 @@ f"""Library not found at {so_path}:
         list(pool.map(run_tig_runtime, nonces))
     except RuntimeError as e:
         pass
+    finally:
+        # mkdtemp, not TemporaryDirectory: the index has to outlive the build
+        # subprocess and every nonce that loads it, so it cannot be scoped to a
+        # `with` around either one.
+        if index_path is not None:
+            shutil.rmtree(os.path.dirname(index_path), ignore_errors=True)
