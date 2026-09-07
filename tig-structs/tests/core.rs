@@ -1,5 +1,5 @@
 use tig_structs::core::{BenchmarkSettings, CPUArchitecture, OutputData};
-use tig_utils::MerkleHash;
+use tig_utils::{jsonify, u8s_from_str, MerkleHash};
 
 #[test]
 fn test_calc_solution_signature() {
@@ -36,6 +36,43 @@ fn test_calc_seed() {
             207, 7, 208, 15, 193, 111, 99, 209, 131, 27, 189, 226, 175
         ]
     );
+}
+
+#[test]
+fn test_calc_db_seed() {
+    let settings = BenchmarkSettings {
+        player_id: "some_player".to_string(),
+        block_id: "some_block".to_string(),
+        challenge_id: "some_challenge".to_string(),
+        algorithm_id: "some_algorithm".to_string(),
+        track_id: "a=1,b=2".to_string(),
+    };
+    let rand_hash = "random_hash".to_string();
+
+    // Assert same as Python version: tig-benchmarker/tests/data.py
+    assert_eq!(
+        settings.calc_db_seed(&rand_hash),
+        [
+            209, 209, 150, 41, 179, 131, 168, 223, 27, 59, 221, 124, 237, 86, 161, 52, 118, 79,
+            8, 0, 171, 205, 118, 2, 64, 244, 59, 240, 176, 44, 51, 185
+        ]
+    );
+}
+
+#[test]
+fn test_db_seed_carries_its_domain_tag() {
+    // Catches dropping the `_db` suffix, which would make this seed the
+    // plain hash of "{settings}_{rand_hash}".
+    let settings = BenchmarkSettings {
+        player_id: "some_player".to_string(),
+        block_id: "some_block".to_string(),
+        challenge_id: "some_challenge".to_string(),
+        algorithm_id: "some_algorithm".to_string(),
+        track_id: "a=1,b=2".to_string(),
+    };
+    let rand_hash = "random_hash".to_string();
+    let untagged = u8s_from_str(&format!("{}_{}", jsonify(&settings), rand_hash));
+    assert_ne!(settings.calc_db_seed(&rand_hash), untagged);
 }
 
 #[test]

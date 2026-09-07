@@ -40,6 +40,22 @@ class TestData(unittest.TestCase):
         ])
         self.assertEqual(settings.calc_seed(rand_hash, nonce), expected)
 
+    def test_calc_db_seed(self):
+        settings = BenchmarkSettings(
+            player_id="some_player",
+            block_id="some_block",
+            challenge_id="some_challenge",
+            algorithm_id="some_algorithm",
+            track_id="a=1,b=2"
+        )
+        rand_hash = "random_hash"
+        # Assert same as Rust version: tig-structs/tests/core.rs
+        expected = bytes([
+            209, 209, 150, 41, 179, 131, 168, 223, 27, 59, 221, 124, 237, 86, 161, 52, 118, 79,
+            8, 0, 171, 205, 118, 2, 64, 244, 59, 240, 176, 44, 51, 185
+        ])
+        self.assertEqual(settings.calc_db_seed(rand_hash), expected)
+
     def test_outputdata_to_merklehash(self):
         output_data = OutputData(
             nonce=123,
