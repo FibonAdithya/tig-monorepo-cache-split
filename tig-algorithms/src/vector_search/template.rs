@@ -66,4 +66,54 @@ pub fn solve_challenge(
     Err(anyhow!("Not implemented"))
 }
 
+// ---------------------------------------------------------------------------
+// Optional: two stages. Build a cache once per batch, solve every nonce with it.
+// ---------------------------------------------------------------------------
+//
+// The database is derived from the precommit alone, so it is identical for
+// every nonce of a precommit. Define BOTH functions below and build the .so
+// with `BUILD_CACHE=1` to have tig-runtime call them when it is given
+// `--algorithm-cache <path>` (the database itself is cached separately via
+// `--challenge-cache`, which the verifier also reads; your blob never reaches
+// the verifier):
+//
+//   * cache miss: `build_cache` runs, its bytes are written to disk, and the
+//     SAME process continues straight into `solve_challenge`. So `build_cache`
+//     must leave the algorithm ready to solve (stash the structure in a static,
+//     e.g. a `OnceLock`), exactly as `load_cache` would.
+//   * cache hit: `load_cache` runs with the bytes from disk, then
+//     `solve_challenge`.
+//
+// The slave lets only one worker run until the first build has succeeded.
+// Without both functions, or without BUILD_CACHE, the .so exports neither and
+// the runtime solves without a cache.
+//
+// Seeds: `build_cache` gets its own RNG seed (per precommit, no nonce), and
+// `challenge.seed` in `solve_challenge` is the per-nonce RNG seed. Neither is
+// the seed that generated the database or the queries.
+//
+// The blob is opaque to the runtime: whatever bytes you return come back to
+// `load_cache` unchanged. Nothing in consensus re-runs the build.
+//
+// pub fn build_cache(
+//     database: &Database,
+//     seed: &[u8; 32],
+//     hyperparameters: &Option<Map<String, Value>>,
+//     module: Arc<CudaModule>,
+//     stream: Arc<CudaStream>,
+//     prop: &cudaDeviceProp,
+// ) -> anyhow::Result<Vec<u8>> {
+//     Err(anyhow!("Not implemented"))
+// }
+//
+// pub fn load_cache(
+//     database: &Database,
+//     blob: &[u8],
+//     module: Arc<CudaModule>,
+//     stream: Arc<CudaStream>,
+//     prop: &cudaDeviceProp,
+// ) -> anyhow::Result<()> {
+//     Err(anyhow!("Not implemented"))
+// }
+
 // Important! Do not include any tests in this file, it will result in your submission being rejected
