@@ -1,3 +1,4 @@
+use crate::Seeds;
 use crate::QUALITY_PRECISION;
 use anyhow::{anyhow, Result};
 use cudarc::driver::*;
@@ -52,12 +53,13 @@ pub const MAX_THREADS_PER_BLOCK: u32 = 1024;
 
 impl Challenge {
     pub fn generate_instance(
-        seed: &[u8; 32],
+        seeds: &Seeds,
         track: &Track,
         module: Arc<CudaModule>,
         stream: Arc<CudaStream>,
         _prop: &cudaDeviceProp,
     ) -> Result<Self> {
+        let seed = &seeds.instance;
         let mut rng = StdRng::from_seed(seed.clone());
         let num_hyperedges = track.n_h_edges;
         let target_num_nodes = track.n_h_edges; // actual number may be around 8% less

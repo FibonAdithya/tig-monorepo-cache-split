@@ -2,6 +2,24 @@ pub const BUILD_TIME_PATH: &str = env!("CARGO_MANIFEST_DIR");
 
 const QUALITY_PRECISION: i32 = 1_000_000;
 
+/// The seeds a GPU challenge instance and its algorithm are derived from.
+///
+/// Two are per precommit and carry no nonce; two are per nonce. c005 and c006
+/// read only `instance`, exactly as before the split.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Seeds {
+    /// Generates the database. Per precommit. Never handed to the algorithm.
+    pub db: [u8; 32],
+    /// The algorithm's RNG for `build_index`. Per precommit.
+    pub build: [u8; 32],
+    /// Generates the per-nonce instance (for c004, the queries). This is the
+    /// seed every challenge has always used. Never handed to a c004 algorithm.
+    pub instance: [u8; 32],
+    /// The algorithm's RNG for `solve_challenge`, exposed as `Challenge::seed`
+    /// on c004. Per nonce.
+    pub algo: [u8; 32],
+}
+
 macro_rules! conditional_pub {
     (fn $name:ident $($rest:tt)*) => {
         #[cfg(not(feature = "hide_verification"))]

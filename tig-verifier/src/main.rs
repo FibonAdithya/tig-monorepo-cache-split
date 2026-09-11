@@ -7,7 +7,14 @@ use tig_structs::core::BenchmarkSettings;
 use tig_utils::dejsonify;
 
 #[cfg(feature = "cuda")]
-use cudarc::{driver::CudaContext, nvrtc::Ptx, runtime::result::device::get_device_prop};
+use {
+    cudarc::{
+        driver::{CudaContext, CudaModule, CudaStream},
+        nvrtc::Ptx,
+        runtime::{result::device::get_device_prop, sys::cudaDeviceProp},
+    },
+    std::sync::Arc,
+};
 
 fn cli() -> Command {
     Command::new("tig-verifier")
@@ -28,6 +35,10 @@ fn cli() -> Command {
         )
         .arg(arg!(--ptx [PTX] "Path to a CUDA ptx file").value_parser(clap::value_parser!(PathBuf)))
         .arg(arg!(--gpu [GPU] "Which GPU device to use").value_parser(clap::value_parser!(usize)))
+        .arg(
+            arg!(--"challenge-cache" [PATH] "c004: the challenge's shared input (the database) as written by tig-runtime; read if present, never written. There is deliberately no algorithm-cache flag here")
+                .value_parser(clap::value_parser!(PathBuf)),
+        )
         .arg(arg!(--verbose "Enable verbose output").action(clap::ArgAction::SetTrue))
 }
 
@@ -41,6 +52,7 @@ fn main() {
         matches.get_one::<String>("SOLUTION").unwrap().clone(),
         matches.get_one::<PathBuf>("ptx").cloned(),
         matches.get_one::<usize>("gpu").cloned(),
+        matches.get_one::<PathBuf>("challenge-cache").cloned(),
         matches.get_one::<bool>("verbose").cloned().unwrap_or(false),
     ) {
         eprintln!("Error: {}", e);
@@ -55,29 +67,56 @@ pub fn verify_solution(
     solution_path: String,
     ptx_path: Option<PathBuf>,
     gpu_device: Option<usize>,
+    challenge_cache: Option<PathBuf>,
     verbose: bool,
 ) -> Result<()> {
     let settings = load_settings(&settings);
-    let seed = settings.calc_seed(&rand_hash, nonce);
+
+    let seeds = Seeds {
+        db: settings.calc_db_seed(&rand_hash),
+        build: settings.calc_build_seed(&rand_hash),
+        instance: settings.calc_seed(&rand_hash, nonce),
+        algo: settings.calc_algo_seed(&rand_hash, nonce),
+    };
 
     let mut err_msg = Option::<String>::None;
 
     macro_rules! dispatch_challenge {
+        // CPU challenges without a shared input: the whole instance from the
+        // instance seed, as before.
         ($c:ident, cpu) => {{
+            dispatch_challenge!($c, cpu_with, |track: &$c::Track| -> Result<$c::Challenge> {
+                $c::Challenge::generate_instance(&seeds.instance, track)
+            })
+        }};
+        // A CPU challenge with a shared input: the database from the challenge
+        // cache when present and valid for this seed, else regenerated. Read
+        // only, and the algorithm's cache is never seen. No shipped CPU
+        // challenge selects this yet.
+        ($c:ident, cpu_cached) => {{
+            dispatch_challenge!($c, cpu_with, |track: &$c::Track| -> Result<$c::Challenge> {
+                let db = match challenge_cache.as_ref().filter(|p| p.exists()) {
+                    Some(path) => $c::Database::from_bytes(&fs::read(path)?, &seeds.db, track)?,
+                    None => $c::Database::generate(&seeds.db, track)?,
+                };
+                $c::Challenge::for_nonce(&db, &seeds, track)
+            })
+        }};
+        ($c:ident, cpu_with, $make_challenge:expr) => {{
             let track_id = if settings.track_id.starts_with('"') && settings.track_id.ends_with('"')
             {
                 settings.track_id.clone()
             } else {
                 format!(r#""{}""#, settings.track_id)
             };
-            let track = serde_json::from_str(&track_id).map_err(|_| {
+            let track: $c::Track = serde_json::from_str(&track_id).map_err(|_| {
                 anyhow::anyhow!(
                     "Failed to parse track_id '{}' as {}::Track",
                     settings.track_id,
                     stringify!($c)
                 )
             })?;
-            let challenge = $c::Challenge::generate_instance(&seed, &track).unwrap();
+            let challenge = $make_challenge(&track)?;
             if verbose {
                 println!("{:?}", challenge);
             }
@@ -102,7 +141,46 @@ pub fn verify_solution(
             }
         }};
 
+        // c005 / c006: the whole instance from the instance seed, as before.
         ($c:ident, gpu) => {{
+            dispatch_challenge!($c, gpu_with, |track: &$c::Track,
+                                               module: Arc<CudaModule>,
+                                               stream: Arc<CudaStream>,
+                                               prop: &cudaDeviceProp|
+             -> Result<$c::Challenge> {
+                $c::Challenge::generate_instance(&seeds, track, module, stream, prop)
+            })
+        }};
+        // c004: the database from the challenge cache when one is present and
+        // valid for this seed, else regenerated. The verifier never writes it,
+        // and never sees the algorithm's cache: verification depends only on
+        // what the challenge crate derives from the seed. Consensus
+        // verification runs without the flag and always regenerates.
+        ($c:ident, gpu_cached) => {{
+            dispatch_challenge!($c, gpu_with, |track: &$c::Track,
+                                               module: Arc<CudaModule>,
+                                               stream: Arc<CudaStream>,
+                                               prop: &cudaDeviceProp|
+             -> Result<$c::Challenge> {
+                let db = match challenge_cache.as_ref().filter(|p| p.exists()) {
+                    Some(path) => $c::Database::from_bytes(
+                        &fs::read(&path)?,
+                        &seeds.db,
+                        track,
+                        stream.clone(),
+                    )?,
+                    None => $c::Database::generate(
+                        &seeds.db,
+                        track,
+                        module.clone(),
+                        stream.clone(),
+                        prop,
+                    )?,
+                };
+                $c::Challenge::for_nonce(&db, &seeds, track, module, stream, prop)
+            })
+        }};
+        ($c:ident, gpu_with, $make_challenge:expr) => {{
             let track_id = if settings.track_id.starts_with('"') && settings.track_id.ends_with('"')
             {
                 settings.track_id.clone()
@@ -133,14 +211,7 @@ pub fn verify_solution(
             let stream = ctx.default_stream();
             let prop = get_device_prop(gpu_device as i32).unwrap();
 
-            let challenge = $c::Challenge::generate_instance(
-                &seed,
-                &track,
-                module.clone(),
-                stream.clone(),
-                &prop,
-            )
-            .unwrap();
+            let challenge = $make_challenge(&track, module.clone(), stream.clone(), &prop)?;
 
             let solution = load_solution(&solution_path);
             match serde_json::from_str::<$c::Solution>(&solution) {
@@ -195,7 +266,7 @@ pub fn verify_solution(
             #[cfg(not(feature = "c004"))]
             panic!("tig-verifier was not compiled with '--features c004'");
             #[cfg(feature = "c004")]
-            dispatch_challenge!(c004, gpu)
+            dispatch_challenge!(c004, gpu_cached)
         }
         "c005" => {
             #[cfg(not(feature = "c005"))]

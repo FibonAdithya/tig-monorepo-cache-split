@@ -1,3 +1,4 @@
+use crate::Seeds;
 use crate::QUALITY_PRECISION;
 use anyhow::Result;
 use cudarc::{
@@ -123,12 +124,14 @@ pub struct Challenge {
 
 impl Challenge {
     pub fn generate_instance(
-        seed: &[u8; 32],
+        seeds: &Seeds,
         track: &Track,
         module: Arc<CudaModule>,
         stream: Arc<CudaStream>,
         _prop: &cudaDeviceProp,
     ) -> Result<Self> {
+        let seed = &seeds.instance;
+
         const K_RFF: usize = 128;
         const RFF_AMPLITUDE_PER_FUNC: f32 = 1.0;
         const RFF_LENGTHSCALE_PER_INPUT_DIM: f32 = 0.3;
