@@ -40,8 +40,8 @@ cargo build -p tig-runtime --release --features knapsack
 
 > Two optional flags, `--challenge-cache` and `--algorithm-cache`, let a
 > challenge with a shared input (c004) build once per precommit and reuse it
-> for every nonce. See [docs/guides/two_stage_cache.md](../docs/guides/two_stage_cache.md)
-> (a branch-only explainer, not part of the final implementation).
+> for every nonce. See the [root README](../README.md) (a branch-only
+> explainer, not part of the final implementation).
 
 
 ```
