@@ -74,5 +74,24 @@ class TestData(unittest.TestCase):
         ]))
         self.assertEqual(merkle_hash, expected)
 
+    def test_calc_build_seed_and_algo_seed(self):
+        settings = BenchmarkSettings(
+            player_id="some_player",
+            block_id="some_block",
+            challenge_id="some_challenge",
+            algorithm_id="some_algorithm",
+            track_id="a=1,b=2"
+        )
+        rand_hash = "random_hash"
+        # Assert same as Rust version: tig-structs/tests/core.rs
+        self.assertEqual(settings.calc_build_seed(rand_hash), bytes([
+            230, 15, 5, 145, 73, 116, 20, 28, 133, 186, 18, 181, 117, 31, 14, 27, 145, 87, 205,
+            250, 142, 167, 162, 155, 169, 214, 182, 17, 92, 233, 87, 40
+        ]))
+        self.assertEqual(settings.calc_algo_seed(rand_hash, 1337), bytes([
+            174, 144, 243, 115, 171, 160, 114, 124, 193, 48, 133, 36, 208, 187, 37, 230, 32, 219,
+            79, 232, 53, 130, 153, 83, 130, 227, 18, 103, 157, 217, 242, 5
+        ]))
+
 if __name__ == '__main__':
     unittest.main()

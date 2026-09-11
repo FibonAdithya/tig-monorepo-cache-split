@@ -175,6 +175,20 @@ impl BenchmarkSettings {
     pub fn calc_db_seed(&self, rand_hash: &String) -> [u8; 32] {
         u8s_from_str(&format!("{}_{}_db", jsonify(&self), rand_hash))
     }
+
+    /// The algorithm's RNG seed for the build phase. Per precommit, no nonce,
+    /// and distinct from the database seed so the algorithm is never handed the
+    /// value that generates its input.
+    pub fn calc_build_seed(&self, rand_hash: &String) -> [u8; 32] {
+        u8s_from_str(&format!("{}_{}_build", jsonify(&self), rand_hash))
+    }
+
+    /// The algorithm's RNG seed for the solve phase. Per nonce, and distinct
+    /// from the instance seed (`calc_seed`) so the algorithm is never handed
+    /// the value that generates the queries.
+    pub fn calc_algo_seed(&self, rand_hash: &String, nonce: u64) -> [u8; 32] {
+        u8s_from_str(&format!("{}_{}_{}_algo", jsonify(&self), rand_hash, nonce))
+    }
 }
 serializable_struct_with_getters! {
     BenchmarkDetails {

@@ -53,8 +53,8 @@ fn test_calc_db_seed() {
     assert_eq!(
         settings.calc_db_seed(&rand_hash),
         [
-            209, 209, 150, 41, 179, 131, 168, 223, 27, 59, 221, 124, 237, 86, 161, 52, 118, 79,
-            8, 0, 171, 205, 118, 2, 64, 244, 59, 240, 176, 44, 51, 185
+            209, 209, 150, 41, 179, 131, 168, 223, 27, 59, 221, 124, 237, 86, 161, 52, 118, 79, 8,
+            0, 171, 205, 118, 2, 64, 244, 59, 240, 176, 44, 51, 185
         ]
     );
 }
@@ -95,4 +95,57 @@ fn test_outputdata_to_merklehash() {
             214, 216, 68, 6, 125, 247, 248, 4, 165, 185, 157, 44, 13, 151
         ])
     );
+}
+
+#[test]
+fn test_calc_build_seed_and_algo_seed() {
+    let settings = BenchmarkSettings {
+        player_id: "some_player".to_string(),
+        block_id: "some_block".to_string(),
+        challenge_id: "some_challenge".to_string(),
+        algorithm_id: "some_algorithm".to_string(),
+        track_id: "a=1,b=2".to_string(),
+    };
+    let rand_hash = "random_hash".to_string();
+
+    // Assert same as Python version: tig-benchmarker/tests/data.py
+    assert_eq!(
+        settings.calc_build_seed(&rand_hash),
+        [
+            230, 15, 5, 145, 73, 116, 20, 28, 133, 186, 18, 181, 117, 31, 14, 27, 145, 87, 205,
+            250, 142, 167, 162, 155, 169, 214, 182, 17, 92, 233, 87, 40
+        ]
+    );
+    assert_eq!(
+        settings.calc_algo_seed(&rand_hash, 1337),
+        [
+            174, 144, 243, 115, 171, 160, 114, 124, 193, 48, 133, 36, 208, 187, 37, 230, 32, 219,
+            79, 232, 53, 130, 153, 83, 130, 227, 18, 103, 157, 217, 242, 5
+        ]
+    );
+}
+
+#[test]
+fn the_four_seeds_are_pairwise_distinct() {
+    // Catches a copy-paste that drops a domain tag: two seeds colliding would
+    // hand the algorithm the value that generates its own input.
+    let settings = BenchmarkSettings {
+        player_id: "some_player".to_string(),
+        block_id: "some_block".to_string(),
+        challenge_id: "some_challenge".to_string(),
+        algorithm_id: "some_algorithm".to_string(),
+        track_id: "a=1,b=2".to_string(),
+    };
+    let rand_hash = "random_hash".to_string();
+    let seeds = [
+        settings.calc_db_seed(&rand_hash),
+        settings.calc_build_seed(&rand_hash),
+        settings.calc_seed(&rand_hash, 1337),
+        settings.calc_algo_seed(&rand_hash, 1337),
+    ];
+    for i in 0..4 {
+        for j in (i + 1)..4 {
+            assert_ne!(seeds[i], seeds[j], "seeds {} and {} collide", i, j);
+        }
+    }
 }

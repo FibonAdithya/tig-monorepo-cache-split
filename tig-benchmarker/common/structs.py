@@ -51,6 +51,12 @@ class BenchmarkSettings(FromDict):
     def calc_db_seed(self, rand_hash: str) -> bytes:
         return u8s_from_str(f"{jsonify(self)}_{rand_hash}_db")
 
+    def calc_build_seed(self, rand_hash: str) -> bytes:
+        return u8s_from_str(f"{jsonify(self)}_{rand_hash}_build")
+
+    def calc_algo_seed(self, rand_hash: str, nonce: int) -> bytes:
+        return u8s_from_str(f"{jsonify(self)}_{rand_hash}_{nonce}_algo")
+
 @dataclass
 class PrecommitDetails(FromDict):
     block_started: int
