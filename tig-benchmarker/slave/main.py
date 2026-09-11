@@ -18,6 +18,7 @@ import zlib
 from queue import Queue
 from glob import glob
 from threading import Thread
+from common.cache import benchmark_id_of, cache_paths, forget_gate, gate_for, has_cache, purge_cache_files, run_gated
 from common.structs import OutputData, MerkleProof
 from common.merkle_tree import MerkleTree, MerkleHash
 
@@ -79,6 +80,18 @@ def run_tig_runtime(nonce, batch, so_path, ptx_path, results_dir):
         cmd += [
             "--ptx", ptx_path,
         ]
+    if has_cache(batch):
+        # Two caches per precommit, shared by every batch and nonce of it. The
+        # challenge cache is the database, deterministic from the seed; the
+        # algorithm cache is the algorithm's own build output, opaque. The
+        # runtime writes both when missing and reads them afterwards;
+        # process_nonces makes sure only one worker runs until they exist.
+        # Purged once every batch of the precommit is gone.
+        challenge_cache, algorithm_cache = cache_paths(results_dir, batch)
+        cmd += [
+            "--challenge-cache", challenge_cache,
+            "--algorithm-cache", algorithm_cache,
+        ]
     logger.debug(f"computing nonce: {' '.join(cmd[:4] + [f"'{cmd[4]}'"] + cmd[5:])}")
     process = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
@@ -104,6 +117,13 @@ def run_tig_runtime(nonce, batch, so_path, ptx_path, results_dir):
             if ptx_path is not None:
                 cmd += [
                     "--ptx", ptx_path,
+                ]
+            if has_cache(batch):
+                # Local check only: read the database the runtime cached rather
+                # than regenerating it. The verifier gets the challenge cache
+                # only, never the algorithm's.
+                cmd += [
+                    "--challenge-cache", cache_paths(results_dir, batch)[0],
                 ]
             logger.debug(f"verifying nonce: {' '.join(cmd[:4] + [f"'{cmd[4]}'"] + cmd[5:])}")
             ret = subprocess.run(cmd, capture_output=True, text=True)
@@ -193,6 +213,20 @@ def purge_folders(output_path, ttl):
             logger.info(f"purging batch {batch_id}")
             shutil.rmtree(f"{output_path}/{batch_id}", ignore_errors=True)
         FINISHED_BATCH_IDS.pop(batch_id)
+
+    # A precommit's cache files outlive its batches. Drop them once no batch
+    # of that precommit is left anywhere in the pipeline.
+    for benchmark_id in {benchmark_id_of(b) for b in purge_batch_ids}:
+        prefix = f"{benchmark_id}_"
+        still_live = any(
+            b.startswith(prefix)
+            for b in list(PENDING_BATCH_IDS) + list(PROCESSING_BATCH_IDS)
+            + list(READY_BATCH_IDS) + list(FINISHED_BATCH_IDS)
+        )
+        if not still_live:
+            for path in purge_cache_files(output_path, benchmark_id):
+                logger.info(f"purged cache {path}")
+            forget_gate(benchmark_id)
 
 
 def send_results(headers, master_ip, master_port, results_dir):
@@ -318,6 +352,9 @@ def process_batch(algorithms_dir, results_dir):
         "q": q,
         "finished": set(),
         "start": now(),
+        # c004 writes its caches on the first run that finds them missing.
+        # The gate is per precommit, so batches of one precommit share it.
+        "cache_gate": gate_for(batch["benchmark_id"]) if has_cache(batch) else None,
     }
 
     
@@ -339,7 +376,16 @@ def process_nonces(results_dir):
     
     logger.debug(f"batch {batch_id}, nonce {nonce} started")
     try:
-        run_tig_runtime(nonce, batch, so_path, ptx_path, results_dir)
+        challenge_cache, algorithm_cache = cache_paths(results_dir, batch)
+        run_gated(
+            job["cache_gate"],
+            lambda: run_tig_runtime(nonce, batch, so_path, ptx_path, results_dir),
+            # Waiters may go as soon as both caches are on disk; the runtime
+            # writes them before it starts solving.
+            cache_exists=lambda: (
+                os.path.exists(challenge_cache) and os.path.exists(algorithm_cache)
+            ),
+        )
         job["finished"].add(nonce)
     except Exception as e:
         msg = f"batch {batch_id}, nonce {nonce}, runtime error: {e}"
