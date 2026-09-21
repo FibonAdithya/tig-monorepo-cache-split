@@ -1,5 +1,17 @@
 use anyhow::{anyhow, Result};
 
+/// Weights are committed rather than fetched: every verifier regenerates the
+/// instance independently, so a single differing byte would fail verification
+/// network-wide.
+///
+/// Each blob gets exactly ONE `include_bytes!`, here, referenced once from the
+/// arm below. Rust does not guarantee that two identical consts in different
+/// modules are merged, so a second `include_bytes!` of the same file can embed
+/// the 7 MB blob twice -- in every algorithm .so, since they all link
+/// tig-challenges. (`gan_generator::v1` also includes this file, but only under
+/// `#[cfg(test)]`, so no shipped build carries that copy.)
+const SIFT_128_BLOB: &[u8] = include_bytes!("weights/v1_sift.bin");
+
 /// One scenario per real embedding corpus. Tracks are one-to-one with
 /// scenarios, so adding a variant adds a track.
 ///
@@ -61,12 +73,7 @@ impl From<Scenario> for ScenarioConfig {
                 n_queries: 7_000,
                 database_size: 700_000,
                 vector_dims: 128,
-                // Reuses generator.rs's existing constant. Do NOT add a second
-                // include_bytes! of the same file here: Rust does not guarantee
-                // that two identical consts in different modules are merged, so
-                // it can embed the 7 MB blob twice -- in every algorithm .so,
-                // since they all link tig-challenges.
-                weights: super::generator::V1_BLOB,
+                weights: SIFT_128_BLOB,
                 min_recall: 0.9,
                 recall_tolerance: 1e-6,
                 audit_samples: 1_000,
