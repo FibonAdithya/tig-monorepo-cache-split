@@ -58,12 +58,16 @@ Checkpoint sizes and hashes, MEASURED with `ls -l` and `sha256sum` over SSH:
 | NYTimes v3 | 53,002,329 | `b1acfdda41795d310ea384d75e00c975073ce47ffbe58e551c3e5b4727ee363a` |
 | GloVe v1 s42 | 30,059,597 | `38d8013a748c83b02f4e4aa99bb64fcda221cbc14e4ac8bd9c8f20404b66d7a3` |
 
-One thing to confirm before exporting NYTimes: that `v3_best` in
+~~One thing to confirm before exporting NYTimes: that `v3_best` in
 `gates/nytimes.yaml` and `tests/test_check_gate.py` refers to
 `v3_seed42/best_generator.pt` and not to a step checkpoint or the
 `v3_seed42_100k` continuation. The doc says the selected step "is a transient",
 so the file identity matters. Check the committed `docs/results/nytimes-*`
-summary that carries the `v3_best` label.
+summary that carries the `v3_best` label.~~
+
+**Correction 2026-09-21 (measured):** confirmed. Three copies of
+`best_generator.pt` on the box are byte-identical (sha256 `b1acfdda…`). See
+`docs/measurements/2026-09-21-c004-multi-arch-generators.md`.
 
 ### Scenario decisions
 
@@ -182,11 +186,16 @@ the mlp's final layer: `SphericalGenerator.trunk` is
 Computed exactly from the layer shapes in the three configs (float count × 4,
 plus headers of under 200 B):
 
-| blob | floats | bytes |
-|---|---|---|
-| `glove_100_v1.bin` | 1,743,460 | 6,973,840 + header |
-| `sift_128_v4.bin` | 1,937,153 | 7,748,612 + header |
-| `nytimes_256_v3.bin` | 3,281,152 | 13,124,608 + header |
+| blob | floats | bytes (computed) | bytes (measured, `ls -l`) | header |
+|---|---|---|---|---|
+| `glove_100_v1.bin` | 1,743,460 | 6,973,840 + header | 6,973,936 | 96 B |
+| `sift_128_v4.bin` | 1,937,153 | 7,748,612 + header | 7,748,764 | 152 B |
+| `nytimes_256_v3.bin` | 3,281,152 | 13,124,608 + header | 13,124,768 | 160 B |
+
+**Correction 2026-09-21 (measured):** the "bytes (measured)" and "header"
+columns are new. `ls -l` on the box. See
+`docs/measurements/2026-09-21-c004-multi-arch-generators.md`, "Blob sizes
+(weights)".
 
 These are arithmetic from config shapes, not file measurements; the exporter
 prints the real byte count. All three exceed the 1 MB commit guard, as
@@ -329,12 +338,31 @@ only `fmaf`, `mul`, `add` and `select`. This design adds, per row: GloVe one
   distances by far less than a typical first-to-second-neighbour gap.
 - **SIFT has a discontinuity.** A gate with `logit + noise` within rounding
   distance of 0 can open on one architecture and close on another, which
-  changes the whole row after normalisation. ESTIMATE (unverified): of order
-  1–10 coordinates per instance of 89.6 million gate draws (700,000 × 128). A
-  changed row matters only to an audited query whose true nearest neighbour is
-  that row. The plan replaces this estimate with a measurement: count draws
-  with `|logit + noise| < 1e-5` in one generated instance and state the implied
-  upper bound on recall disagreement between two verifiers.
+  changes the whole row after normalisation. ~~ESTIMATE (unverified): of order
+  1–10 coordinates per instance of 89.6 million gate draws (700,000 × 128).~~
+  **Correction 2026-09-21 (measured):** on 4,096 rows (524,288 gates), 0 gate
+  margins fell within 1e-5 of zero, 5 within 1e-4, 55 within 1e-3; density
+  ~0.05 per unit margin per gate. Extrapolated to a full 700,000-row database
+  (89.6 million gates), ESTIMATE (extrapolated from the MEASURED density):
+  ~9 within 1e-6, ~94 within 1e-5, ~940 within 1e-4 — the 1–10 figure only
+  holds for the tightest of these bands, and the cross-GPU disagreement
+  window itself is still unmeasured (no second architecture was available).
+  See `docs/measurements/2026-09-21-c004-multi-arch-generators.md`, "SIFT
+  near-threshold gates". A changed row matters only to an audited query whose
+  true nearest neighbour is that row. The plan replaces this estimate with a
+  measurement: count draws with `|logit + noise| < 1e-5` in one generated
+  instance and state the implied upper bound on recall disagreement between
+  two verifiers.
+- **NYTimes projected-tangent norm sensitivity.** **Correction 2026-09-21
+  (measured), addition — a risk this design did not anticipate:** the
+  spherical forward divides by `max(‖x‖, eps)`; if the pre-normalisation norm
+  were near the `eps = 1e-8` clamp, rounding error would be amplified. Measured
+  over 8,192 generated rows, the minimum projected-tangent norm is 1.499242
+  (p0.1 1.714236, p1 1.9771563, p50 3.765099); 0 rows fall below 1e-3 or
+  1e-5. With norm ≥ 1.499, the division scales rounding error by at most
+  1/1.499 ≈ 0.67x, so the eps clamp does not come into play on generated
+  data. See `docs/measurements/2026-09-21-c004-multi-arch-generators.md`,
+  "NYTimes projected-tangent norm".
 - **Cross-architecture bit-exactness stays open**, as the 2026-08-25 spec left
   it. Validation on the sm_86 box can show launch-geometry invariance and
   in-band results. It cannot show agreement with a second architecture. If an
@@ -369,6 +397,18 @@ Test 10 is the acceptance test for the port. Tests 4 and 6 pin arithmetic; only
 test 10 shows that the challenge samples the distribution the gates accepted.
 Its known gap is decision 2 above: gates are measured at N = 20,000 and say
 nothing about 700,000.
+
+**Correction 2026-09-21 (measured):** test 10's outcome is MET for sift and
+glove (pass on all four statistics) and NOT MET for nytimes (`ivf_gini`
+0.7246, below the band [0.7602, 0.8403]). The investigation shows this is not
+a port bug: the gate's own recorded sample and five fresh PyTorch draws of
+the same checkpoint also fail `ivf_gini` at rates consistent with the port's
+result (mean 0.7440, sd 0.0180 over six draws including the gate's own; only
+1 of 6 clears the band). The port is accepted on the stated alternative
+criterion — its statistics lie inside the range of PyTorch's own samples of
+the same checkpoint — not on the plan's original all-pass criterion. See
+`docs/measurements/2026-09-21-c004-multi-arch-generators.md`, "WGAN gate
+acceptance" and "The NYTimes investigation".
 
 GPU tests run on tig-gpu under a `gpu-claim`, through the job queue.
 
@@ -411,7 +451,52 @@ fails the other two.
   does not re-judge it.
 - **Audit timing for SIFT may regress** if `AUDIT_MAX_DIMS` is raised; handled
   by the measured fallback above.
-- **Generation time is unmeasured for the new architectures.** SIFT v1 took
-  628 ms at this size (2026-08-25 spec, not re-measured here). NYTimes has
+- ~~**Generation time is unmeasured for the new architectures.**~~
+  **Correction 2026-09-21 (measured):** `Database::generate`, 700,000 rows,
+  three runs each: sift_128 885/812/811 ms, glove_100 680/669/666 ms,
+  nytimes_256 1585/1584/1581 ms. SIFT/GloVe = 1.22x (median/median), under
+  the plan's 2x threshold for the gate-noise cost decision, so the curand
+  sequence base `2^40` stays and the fallback scheme was not needed. See
+  `docs/measurements/2026-09-21-c004-multi-arch-generators.md`, "Generation
+  time". SIFT v1 took 628 ms at this size (2026-08-25 spec, not re-measured
+  here, and not comparable: different card). NYTimes has
   1.85× the floats of the v1 MLP (3,281,152 against 1,772,171) and SIFT v4 adds two 128×128 products and
   a transcendental pass per coordinate. The plan measures all three.
+
+## Validation
+
+Measured 2026-09-21 on tig-gpu, RTX 3060 Ti (sm_86). Full detail:
+`docs/measurements/2026-09-21-c004-multi-arch-generators.md`.
+
+| claim | value | MEASURED / ESTIMATED |
+|---|---|---|
+| WGAN gate, sift | pass on all four statistics | MEASURED |
+| WGAN gate, glove | pass on all four statistics | MEASURED |
+| WGAN gate, nytimes | FAIL on `ivf_gini` (0.7246, band [0.7602, 0.8403]) | MEASURED |
+| nytimes port vs. five fresh PyTorch draws of the same checkpoint | port's four statistics fall inside the range of the five draws on every statistic | MEASURED |
+| generation time, sift/glove/nytimes (median of 3, 700,000 rows) | 812 / 669 / 1584 ms | MEASURED |
+| SIFT gate-margin density near the threshold | ~0.05 per unit margin per gate, over 524,288 gates | MEASURED |
+| NYTimes projected-tangent norm, minimum over 8,192 rows | 1.499242 | MEASURED |
+
+### What this establishes
+
+Launch-geometry invariance and in-band results on sm_86, for all three
+architectures (test counts, mutation checks, output-digest sanity — see the
+measurement note). Generation time for all three architectures. That the
+SIFT gate-margin discontinuity is rare and its per-database rate is
+estimated from a measured density. That the NYTimes projected-tangent
+sensitivity the spec did not originally anticipate does not occur on
+generated data. That SIFT and GloVe pass their WGAN gates on all four
+statistics. That the NYTimes port samples the same distribution as the
+PyTorch generator as far as the four gate statistics can tell, even though
+neither the port nor five fresh PyTorch draws of the same checkpoint
+robustly clears the gate's `ivf_gini` band.
+
+### What this does NOT establish
+
+Cross-architecture bit-exactness (one card only; no second architecture was
+available). Gate statistics at N = 700,000 (the gates are defined and
+measured at N = 20,000). `min_recall` for the two new corpora (copied from
+SIFT as a placeholder) and for SIFT on v4 instances (the 0.9 bar was derived
+on v1 instances). `AUDIT_TQ` optimality at 256. Timings on non-Ampere cards.
+Fuel budgets at 100 and 256 dims.
