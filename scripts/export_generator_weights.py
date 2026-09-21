@@ -2,9 +2,13 @@
 """Export a trained generator's weights to the flat blob tig-challenges embeds.
 
 Every verifier must load byte-identical weights, so the blob is committed to git
-rather than downloaded. The format is self-describing (per-layer dims in the
-header) so a second generator architecture can be added without changing the
-Rust parser.
+rather than downloaded. The TIGGAN02 container is self-describing about SHAPES
+(every tensor carries its own rows and cols), so the Rust side never has to
+guess a dimension. It is not self-describing about MEANING: the tensor order is
+positional and fixed per `arch`, so adding a fourth architecture means a new
+`from_container` arm in `gan_generator` and a new device driver in
+`vector_search/generator.rs` as well as a new `--arch` here. What the format
+buys is that neither side has to hard-code a layer count or a width.
 """
 
 import argparse

@@ -26,7 +26,8 @@ inside the range of five fresh PyTorch draws of the same checkpoint.
 | test count, + NYTimes scenario (`7f659f0`) | 99 / 0, wall 366.23 s, audit 87 ms | MEASURED | same | 2026-09-21 |
 | test count, + structured-gate driver, SIFT on v4 (`e5ff819`) | 105 / 0, wall 450.60 s, audit 88 ms | MEASURED | same | 2026-09-21 |
 | test count, + clamp test (`4fcd5af`) | 106 / 0, wall 446.98 s, audit 87 ms | MEASURED | same | 2026-09-21 |
-| compiler warnings, `3df8cb2` through `4fcd5af` | 0 in every run | MEASURED | queue `.out` logs | 2026-09-21 |
+| test count, branch HEAD (`8eb8506`) | 107 passed / 0 failed / 4 ignored, wall 452.06 s, audit 87 ms, 0 compiler warnings | MEASURED | `scripts/box_submit.sh` whole suite, queue job `tig-monorepo-20260921T144509Z-ecce8e`, `.out` log | 2026-09-21 |
+| compiler warnings, `3df8cb2` through `8eb8506` | 0 in every run | MEASURED | queue `.out` logs | 2026-09-21 |
 | local ungated suite at `16753ee`, `tig-challenges` | 60 passed | MEASURED | `cargo test -p tig-challenges` | 2026-09-21 |
 | local ungated suite at `16753ee`, `gan_generator` | 50 passed | MEASURED | `cargo test` (module filter `gan_generator`) | 2026-09-21 |
 | audit ms, `AUDIT_MAX_DIMS=128`, best-of-three, SIFT_128 workload | 87, 87, 87 ms | MEASURED | `audit_is_much_cheaper_than_a_naive_solve`, three whole-suite jobs `6c03f4`, `6041bf`, `4f95a5` | 2026-09-21 |
@@ -74,6 +75,10 @@ inside the range of five fresh PyTorch draws of the same checkpoint.
 | sd of the six draws | 0.0180 | computed (statistics.stdev, sample sd, of the row above) | arithmetic | 2026-09-21 |
 | draws clearing the lower gate edge (0.7602) | 1 of 6 (the gate's own sample, 0.7704) | MEASURED (count over the row above) | arithmetic on the six-draw row | 2026-09-21 |
 | `v3_best` admission margin over the lower edge | 0.0102 (0.7704 − 0.7602) | computed | arithmetic | 2026-09-21 |
+| mean of the FIVE fresh PyTorch `ivf_gini` draws (seeds 42, 1, 2, 3, 4; the gate's own sample excluded) | 0.7387 | computed (mean of 0.7511, 0.7530, 0.7409, 0.7250, 0.7234) | arithmetic on the six-series table | 2026-09-21 |
+| sample sd of those five draws | 0.0140 | computed (sample sd, n−1) | same | 2026-09-21 |
+| the port's `ivf_gini` as a z-score against those five | −1.007 ((0.7246 − 0.7387) / 0.0140) | computed | arithmetic on the two rows above | 2026-09-21 |
+| probability a same-distribution draw lies inside the range of `n = 5` others | 0.667 ((n−1)/(n+1)) | computed | arithmetic | 2026-09-21 |
 | blob size, `glove_100_v1.bin` | computed 6,973,840 + header; measured 6,973,936 B (header 96 B) | MEASURED (`ls -l`, local) / computed (spec's float-count arithmetic) | `ls -l tig-challenges/src/vector_search/weights/glove_100_v1.bin` on the local machine; spec's layer-shape arithmetic | 2026-09-21 |
 | blob size, `sift_128_v4.bin` | computed 7,748,612 + header; measured 7,748,764 B (header 152 B) | MEASURED (local) / computed | `ls -l tig-challenges/src/vector_search/weights/sift_128_v4.bin` on the local machine | 2026-09-21 |
 | blob size, `nytimes_256_v3.bin` | computed 13,124,608 + header; measured 13,124,768 B (header 160 B) | MEASURED (local) / computed | `ls -l tig-challenges/src/vector_search/weights/nytimes_256_v3.bin` on the local machine | 2026-09-21 |
@@ -105,9 +110,27 @@ persist.
 | `7f659f0` | + NYTimes scenario | 99 / 0 | 366.23 s | 87 |
 | `e5ff819` | + structured-gate driver, SIFT on v4 | 105 / 0 | 450.60 s | 88 |
 | `4fcd5af` | + clamp test | 106 / 0 | 446.98 s | 87 |
+| `8eb8506` | + the Task 10 measurement tests and the projected-tangent refactor; branch HEAD | 107 / 0, 4 ignored | 452.06 s | 87 |
 
-Zero compiler warnings in every run from `3df8cb2` on. Local ungated suite at
-`16753ee`: `cargo test -p tig-challenges` 60 passed; `gan_generator` 50 passed.
+Zero compiler warnings in every run from `3df8cb2` on, `8eb8506` included. Local
+ungated suite at `16753ee`: `cargo test -p tig-challenges` 60 passed;
+`gan_generator` 50 passed.
+
+Why the `8eb8506` run is 107 and not 106. Commit `16753ee` added one UNGATED
+test, `nytimes_projected_tangent_norm_is_what_forward_cpu_divides_by`, whose
+assertions are `to_bits()` equalities on the projected-tangent refactor. The
+ungated `gan_generator` tests are compiled into the gated suite as well, so that
+one test raises the gated count by one: 106 + 1 = 107. The 4 ignored are the
+measurement tests (`dump_rows_for_the_wgan_gates`, `print_generation_times`,
+`count_sift_gates_near_the_threshold`,
+`measure_nytimes_projected_tangent_norms`), which run only under `--ignored`.
+
+`16753ee` was NOT a test-only commit, which is why this run matters rather than
+being a formality. It moved `Spherical::forward_cpu` onto the shared helper
+`direction_and_projected_tangent_cpu`, and `forward_cpu` is the oracle that
+`nytimes_gpu_forward_matches_the_cpu_reference` compares the GPU against. A
+refactor of the oracle changes what that GPU test asserts. The `8eb8506` run is
+the GPU run that covers it; the `4fcd5af` run at 106 predates the refactor.
 
 ## Audit width
 
@@ -303,6 +326,38 @@ accepted on a different, stated criterion: under identical measurement, its
 statistics lie inside the range of PyTorch's own samples of the same
 checkpoint across sampling seeds. The decision about the NYTimes generator
 and its gate band belongs to the WGAN repository's owner, not to this repo.
+
+**Correction 2026-09-21 (final review):** the argument above is restated, as the
+final review asked. Every number is kept; three things are added.
+
+(i) "Inside the range of five draws" is a weak criterion taken on its own. A
+fresh draw from the same distribution lies inside the range of `n` others with
+probability `(n-1)/(n+1)`, which for `n = 5` is 0.667 (computed). So passing that
+test is what two thirds of same-distribution draws would do, and failing it would
+have been the informative outcome. The same data give a stronger summary, so use
+that one instead: against the five FRESH PyTorch draws (seeds 42, 1, 2, 3, 4 —
+0.7511, 0.7530, 0.7409, 0.7250, 0.7234; mean 0.7387, sample sd 0.0140, both
+computed), the port's `ivf_gini` of 0.7246 is
+`z = (0.7246 − 0.7387) / 0.0140 = −1.007` (computed). One sd below the mean of
+five draws is an ordinary position for a sixth draw from the same distribution.
+Note which five: the gate's own sample (0.7704) is excluded here, for the reason
+in (iii).
+
+(ii) The gate statistics are corroboration, not the primary evidence for the
+port. What the port's correctness rests on is the arithmetic tests: the CPU
+reference against the PyTorch goldens at 1e-5, the GPU against the CPU reference
+at 1e-5 on the GPU's own drawn inputs, the trunk/skip latent-independence test
+and the gate-noise sequence tests. Those compare values, row by row, against
+what PyTorch produced. The latent sampling kernel is unchanged by this work, so
+the distribution the port draws from is the one that was already in use. A gate
+statistic over 50,000 rows is a much coarser instrument than any of these; it is
+here to show nothing at the distribution level contradicts them.
+
+(iii) The one PyTorch draw that does clear the lower gate edge, 0.7704, is not an
+independent sixth witness. It is the sample the `v3_best` checkpoint was selected
+on and the sample the gate bands were set from, so it sits at the top of the six
+by construction. Its 0.0102 admission margin over the 0.7602 edge is the margin
+of the draw the edge was fitted to.
 
 ## Blob sizes (weights)
 

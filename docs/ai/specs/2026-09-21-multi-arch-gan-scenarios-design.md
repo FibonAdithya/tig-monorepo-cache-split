@@ -82,6 +82,18 @@ summary that carries the `v3_best` label.~~
    280.0 MB. Not checked: the WGAN gates were measured at N = 20,000, and the
    challenge samples 700,000 rows, more than NYTimes' ~290k real rows. SIFT
    already works this way, but no gate statistic has been measured at 700,000.
+
+   **Correction 2026-09-21 (final review):** the VRAM figures above count the
+   database only, and the generation scratch is not negligible. NYTimes is the
+   largest: `SphericalDevice` holds 5,120 floats per row, computed from the
+   blob's own shapes (z_trunk 256 + z_skip 256, h_a and h_b 1,024 each, d 256,
+   v 256, and a, g, b, m 512 each — 256+256+1024+1024+256+256+512+512+512+512).
+   At the production `FORWARD_CHUNK` of 65,536 rows that is
+   65,536 × 5,120 × 4 = 1,342,177,280 bytes (computed), held on top of the
+   716.8 MB database while `Database::generate` runs, and freed when it returns.
+   The output is invariant to the chunk size (tested by
+   `nytimes_output_is_invariant_to_launch_geometry`), so `FORWARD_CHUNK` can be
+   reduced later without changing any instance and therefore without a resubmit.
 3. **`min_recall = 0.9`, `recall_tolerance = 1e-6`, `audit_samples = 1,000`**
    for the two new tracks, copied from SIFT. The 0.9 bar was derived from
    SIFT's d2/d1 distribution. For NYTimes and GloVe it is a placeholder, not a
@@ -136,11 +148,24 @@ the activation follows its last layer too, unlike the mlp's final layer:
 ```
 m      = max(softplus(magnitude_head(h)), magnitude_floor)
 logit  = logit_clamp · tanh((coupling · gate_head(h) + sparsity_head(h)) / logit_clamp)
-noise  = smoothing · (log(u) − log1p(−u)),   u = clamp(uniform, eps, 1 − eps)
+noise  = smoothing · (log(u) − log1p(−u)),   u = clamp(uniform, eps, 0.99999994)
 open_j = (logit_j + noise_j > 0)
 if no gate is open: open = one_hot(argmax_j logit_j)
 x      = open ⊙ m;   out = x / max(‖x‖, eps)
 ```
+
+**Correction 2026-09-21 (final review):** the superseded `noise` line read
+`u = clamp(uniform, eps, 1 − eps)`. That is wrong as a specification, not just
+imprecise. In float32 `1 − 1e-8` rounds to exactly `1.0`, and `curand_uniform`
+returns a value in `(0, 1]`, so the upper clamp written that way is no clamp at
+all: `u = 1.0` passes through, `log1p(−1.0)` is `−inf` and the noise is `+inf`.
+The shipped upper bound is the literal `0.99999994f`, the largest float below
+1.0. The lower bound is `eps` as written. The mapping lives in one device
+function, `gate_noise_from_uniform` (`kernels.cu:342-347`), which the shipped
+kernel and the test kernel both call, so a clamp removed from it is removed from
+both. `gate_noise_from_uniform_is_finite_at_both_ends_of_the_unit_interval`
+drives it at `u = 1.0` and `u = 0.0`; MEASURED: removing either clamp fails that
+test.
 
 Three things the exporter or the formula removes from the GPU path:
 
@@ -193,9 +218,14 @@ plus headers of under 200 B):
 | `nytimes_256_v3.bin` | 3,281,152 | 13,124,608 + header | 13,124,768 | 160 B |
 
 **Correction 2026-09-21 (measured):** the "bytes (measured)" and "header"
-columns are new. `ls -l` on the box. See
+columns are new. ~~`ls -l` on the box.~~ See
 `docs/measurements/2026-09-21-c004-multi-arch-generators.md`, "Blob sizes
 (weights)".
+
+**Correction 2026-09-21 (final review):** not the box. The three blobs were
+exported on the local machine by `scripts/export_generator_weights.py` and
+measured there with `ls -l tig-challenges/src/vector_search/weights/*.bin`. The
+measurement note and `PROVENANCE.md` both say local; the line above was wrong.
 
 These are arithmetic from config shapes, not file measurements; the exporter
 prints the real byte count. All three exceed the 1 MB commit guard, as
@@ -256,8 +286,14 @@ sequentially in index order, so results do not depend on launch geometry.
 | `gan_row_normalize` | `x / max(‖x‖, eps)` in place, sum of squares by sequential `fmaf` | mlp |
 | `gan_film_leaky` | `leaky(a · (1 + γ) + β)`, element-wise | spherical |
 | `gan_sphere_combine` | `u = unit(d)`; `v −= (v·u)u`; `t = unit(v)`; `out = cos_r·u + sin_r·t`, written at `out_row_offset` | spherical |
-| `gan_gate_noise` | per row and coordinate, `u = clamp(curand_uniform, eps, 1−eps)`; `log(u) − log1p(−u)` | structured_gate |
+| `gan_gate_noise` | per row and coordinate, `u = clamp(curand_uniform, eps, 0.99999994)`; `log(u) − log1p(−u)`, through the device function `gate_noise_from_uniform` | structured_gate |
 | `gan_gate_apply` | the `logit`, `open`, fallback, `m` and normalise steps above, written at `out_row_offset` | structured_gate |
+
+**Correction 2026-09-21 (final review):** the `gan_gate_noise` row read
+~~`u = clamp(curand_uniform, eps, 1−eps)`~~ and named no device function. The
+upper bound is the literal `0.99999994f` for the float32 reason given in the
+correction under the structured_gate forward block above, and the mapping is in
+`gate_noise_from_uniform`.
 
 ### Two random-stream rules
 
@@ -321,6 +357,40 @@ vector_search/
 - `Scenario::ALL: [Scenario; 3]`, tied to the enum by a wildcard-free `match`
   in a const fn, so a new variant that is not added to `ALL` fails to compile.
 
+**Correction 2026-09-21 (final review):** the layout and the three bullets above
+describe a design that was not built. The superseded text is kept as written; what
+exists is this:
+
+```
+gan_generator/            UNGATED: not behind the c004 feature
+  mod.rs              Generator enum, from_blob, forward_cpu, shared parse helpers
+  blob.rs             the TIGGAN02 container parser
+  v1.rs               the TIGGAN01 parser
+  mlp.rs              from_container + forward_cpu
+  structured_gate.rs  from_container + forward_cpu
+  spherical.rs        from_container + forward_cpu
+vector_search/
+  generator.rs        GATED: DeviceGenerator::{new, sample_inputs, forward},
+                      one private DeviceArch enum, one file for all three
+  scenarios.rs        the Scenario enum, ALL, Display and FromStr, from one macro
+  mod.rs              generate_vectors drives DeviceGenerator
+```
+
+- Parsing and the CPU reference passes live in a crate-level `gan_generator`
+  module that is NOT behind the `c004` feature, and the GPU drivers live in the
+  gated `vector_search::generator`. The split is there because the gated code
+  cannot be compiled at all without a CUDA toolkit, while the ungated module —
+  which is where every blob check and every PyTorch-golden comparison sits — can
+  be built and tested on any machine.
+- There is no `generator/` directory and no per-architecture gated file: one
+  `vector_search/generator.rs` holds all three drivers behind a private
+  `DeviceArch` enum.
+- There is no `Generator::forward_chunk`. `generate_vectors` keeps its chunk loop
+  and calls `DeviceGenerator::sample_inputs` then `DeviceGenerator::forward`.
+- `ALL` is not tied to the enum by a const fn. A `scenarios!` macro generates the
+  enum, `ALL`, `Display` and `FromStr` together from one list, so the four cannot
+  disagree.
+
 Rollout order, by risk: GloVe (new blob, one new kernel), then NYTimes, then
 SIFT v4 (most new ops, second random stream). Each lands with its tests before
 the next starts. All three land before the resubmit.
@@ -363,6 +433,18 @@ only `fmaf`, `mul`, `add` and `select`. This design adds, per row: GloVe one
   1/1.499 ≈ 0.67x, so the eps clamp does not come into play on generated
   data. See `docs/measurements/2026-09-21-c004-multi-arch-generators.md`,
   "NYTimes projected-tangent norm".
+- **SIFT's all-gates-closed fallback is a second disagreement source.**
+  **Addition 2026-09-21 (final review)** — this design listed the gate
+  discontinuity but not this. When no gate opens, the row is decided by the
+  argmax over the tanh-clamped logits, and that argmax is not a continuous
+  function of them: two logits within rounding distance of each other, or two
+  logits both saturating to exactly `logit_clamp` on one card and not on
+  another, select a different coordinate, and the row becomes a different unit
+  vector entirely rather than differing in its last bits. It needs two
+  conditions at once, an all-closed row AND a near-tie among that row's logits,
+  so it is rarer than the gate discontinuity above, which needs only one. The
+  fallback rate on real SIFT rows has NOT been measured; the 4,096-row gate-margin
+  run measured margins, not fallbacks. See Follow-ups.
 - **Cross-architecture bit-exactness stays open**, as the 2026-08-25 spec left
   it. Validation on the sm_86 box can show launch-geometry invariance and
   in-band results. It cannot show agreement with a second architecture. If an
@@ -378,7 +460,7 @@ confirm the test fails, restore.
 | # | test | runs on | mutation it catches |
 |---|---|---|---|
 | 1 | Literal wire strings `s=nytimes_256` and `s=glove_100` serialise and parse. The unknown-scenario tests switch from `glove_300` to `deep_96`. | CPU | renamed variant; changed case convention |
-| 2 | `every_scenario_blob_matches_its_declared_dims` iterates `Scenario::ALL`; asserts output dims, asserts latent dim against the blob header, asserts `vector_dims <= AUDIT_MAX_DIMS` (or the wide-kernel bound). | CPU | wrong blob wired to a scenario; variant missing from `ALL` (compile error); 256-dim scenario against a 128-wide audit buffer |
+| 2 | `every_scenario_blob_matches_its_declared_dims` iterates `Scenario::ALL`; asserts output dims, ~~asserts latent dim against the blob header,~~ asserts `vector_dims <= AUDIT_MAX_DIMS` (or the wide-kernel bound). **Correction 2026-09-21 (final review):** the test as built has no latent-dim assertion. Latent dims are asserted per blob instead, by `glove_blob_declares_its_shape`, `nytimes_blob_declares_its_shape` and `sift_v4_blob_declares_its_shape` in `gan_generator`, each against that blob's own expected pair. | CPU | wrong blob wired to a scenario; variant missing from `ALL` (compile error); 256-dim scenario against a 128-wide audit buffer |
 | 3 | `TIGGAN02` rejects: bad magic, truncation, trailing bytes, absurd tensor count, element-count overflow, unknown `arch`, wrong tensor count for the arch, shape-relation mismatch. One test each. | CPU | removal of each check |
 | 4 | Per-architecture `forward_cpu` against PyTorch goldens at 1e-5; SIFT support pattern compared exactly. | CPU | transposed matrix; missing bias; `a·γ` in place of `a·(1+γ)`; swapped `cos`/`sin`; projection using un-normalised `u`; missing argmax fallback; trunk-final activation dropped for spherical; baked matrix with wrong padding |
 | 5 | Exporter pytest: baked `coupling` and `smoothing` equal the module's own conv output on 64 inputs from `torch.manual_seed(0)`, at 1e-6. | CPU | transposed or interior-only baked map |
@@ -436,6 +518,10 @@ fails the other two.
 - The DEEP-96 milestone from the 2026-08-25 spec is not part of this change.
   DEEP's accepted rung would need the same check made here: which
   `generator_type` it uses.
+- **Added 2026-09-21 (final review):** count fallback rows. Measure how many
+  rows of a generated SIFT database open no gate and are decided by the argmax
+  fallback, which is the second disagreement source added under Determinism. The
+  rate bounds how much of the database that source can reach.
 
 ## Risks
 
@@ -491,6 +577,20 @@ statistics. That the NYTimes port samples the same distribution as the
 PyTorch generator as far as the four gate statistics can tell, even though
 neither the port nor five fresh PyTorch draws of the same checkpoint
 robustly clears the gate's `ivf_gini` band.
+
+**Correction 2026-09-21 (final review):** how much weight the last sentence
+carries needs stating. "Inside the range of five draws" is weak alone: a
+same-distribution draw lands inside the range of `n = 5` others with probability
+`(n-1)/(n+1) = 0.667` (computed), so the stronger summary of the same data is the
+one to quote — against the five fresh draws (mean 0.7387, sample sd 0.0140, both
+computed) the port's `ivf_gini` of 0.7246 is `z = −1.007` (computed). The port's
+correctness rests mainly on the arithmetic tests, not on these statistics: CPU
+reference against the PyTorch goldens at 1e-5, GPU against the CPU reference at
+1e-5 on the GPU's own drawn inputs, plus the latent-independence and
+gate-noise-sequence tests, with the latent sampling kernel unchanged by this
+work. The gate statistics are corroboration. And the one PyTorch draw that does
+clear the band, 0.7704, is the sample the checkpoint was selected on and the
+bands were set from, so it is not an independent sixth witness.
 
 ### What this does NOT establish
 

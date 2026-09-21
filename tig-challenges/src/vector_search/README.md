@@ -191,8 +191,8 @@ The audit kernel stages the queries it is checking in a fixed-width
 shared-memory buffer. That buffer widened from 128 to 256 dimensions to fit
 `nytimes_256`'s rows, at no measurable cost to SIFT's audit: 87, 87, 87 ms at
 128 dims against 88, 88, 87 ms at 256 dims, MEASURED on an RTX 3060 Ti (see the
-comment above the row-wise kernels in `kernels.cu`, and the measurement note in
-the reading order below).
+`AUDIT_TQ` comment block in `kernels.cu`, around line 465, and the measurement
+note in the reading order below).
 
 `min_recall = 0.9` is a floor with measured headroom beneath it, not above it:
 measured floors for a viable bar are far lower (0.281 on an oracle worst-case
