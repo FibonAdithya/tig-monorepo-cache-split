@@ -6,20 +6,24 @@
 pub mod blob;
 pub mod mlp;
 pub mod spherical;
+pub mod structured_gate;
 pub mod v1;
 
 use anyhow::{anyhow, Result};
 use blob::Tensor;
 pub use mlp::Mlp;
 pub use spherical::Spherical;
+pub use structured_gate::StructuredGate;
 pub use v1::Layer;
 
 pub const ARCH_MLP: u32 = 0;
+pub const ARCH_STRUCTURED_GATE: u32 = 1;
 pub const ARCH_SPHERICAL: u32 = 2;
 
 pub enum Generator {
     Mlp(Mlp),
     Spherical(Spherical),
+    StructuredGate(StructuredGate),
 }
 
 impl Generator {
@@ -32,6 +36,7 @@ impl Generator {
         let container = blob::parse_container(blob)?;
         match container.arch {
             ARCH_MLP => Ok(Generator::Mlp(Mlp::from_container(container)?)),
+            ARCH_STRUCTURED_GATE => Ok(Generator::StructuredGate(StructuredGate::from_container(container)?)),
             ARCH_SPHERICAL => Ok(Generator::Spherical(Spherical::from_container(container)?)),
             other => Err(anyhow!("weight blob declares unknown arch {}", other)),
         }
@@ -41,6 +46,7 @@ impl Generator {
         match self {
             Generator::Mlp(m) => m.layers[0].in_dim,
             Generator::Spherical(s) => s.trunk[0].in_dim + s.tangent_in.in_dim,
+            Generator::StructuredGate(s) => s.trunk[0].in_dim,
         }
     }
 
@@ -48,6 +54,7 @@ impl Generator {
         match self {
             Generator::Mlp(m) => m.layers.last().unwrap().out_dim,
             Generator::Spherical(s) => s.direction.out_dim,
+            Generator::StructuredGate(s) => s.magnitude_head.out_dim,
         }
     }
 
@@ -72,6 +79,13 @@ impl Generator {
                     return Err(anyhow!("gate noise supplied to a spherical generator"));
                 }
                 Ok(s.forward_cpu(latent))
+            }
+            Generator::StructuredGate(s) => {
+                let noise = gate_noise.ok_or_else(|| anyhow!("structured_gate needs gate noise"))?;
+                if noise.len() != s.magnitude_head.out_dim {
+                    return Err(anyhow!("gate noise has {} values; generator needs {}", noise.len(), s.magnitude_head.out_dim));
+                }
+                Ok(s.forward_cpu(latent, noise))
             }
         }
     }
@@ -98,6 +112,18 @@ impl std::fmt::Debug for Generator {
                 .field("tangent_out", &(s.tangent_out.in_dim, s.tangent_out.out_dim))
                 .field("cos_r", &s.cos_r)
                 .field("sin_r", &s.sin_r)
+                .field("eps", &s.eps)
+                .finish(),
+            Generator::StructuredGate(s) => f
+                .debug_struct("Generator::StructuredGate")
+                .field("trunk", &s.trunk.iter().map(|l| (l.in_dim, l.out_dim)).collect::<Vec<_>>())
+                .field("magnitude_head", &(s.magnitude_head.in_dim, s.magnitude_head.out_dim))
+                .field("gate_head", &(s.gate_head.in_dim, s.gate_head.out_dim))
+                .field("sparsity_head", &(s.sparsity_head.in_dim, s.sparsity_head.out_dim))
+                .field("coupling", &(s.coupling.in_dim, s.coupling.out_dim))
+                .field("smoothing", &(s.smoothing.in_dim, s.smoothing.out_dim))
+                .field("logit_clamp", &s.logit_clamp)
+                .field("magnitude_floor", &s.magnitude_floor)
                 .field("eps", &s.eps)
                 .finish(),
         }
@@ -348,5 +374,75 @@ pub(crate) mod tests {
     #[test]
     fn spherical_rejects_an_even_tensor_count() {
         assert!(Generator::from_blob(&tiny_spherical(8, &TINY_SPH[..10])).unwrap_err().to_string().contains("tensors"));
+    }
+
+    const SIFT: &[u8] = include_bytes!("../vector_search/weights/sift_128_v4.bin");
+
+    #[test]
+    fn sift_v4_blob_matches_pytorch_with_an_exact_support_pattern() {
+        assert_matches_golden(SIFT, include_str!("../vector_search/weights/sift_128_v4.golden.json"), true);
+    }
+
+    #[test]
+    fn sift_v4_blob_declares_its_shape() {
+        let g = Generator::from_blob(SIFT).unwrap();
+        assert_eq!((g.latent_dim(), g.output_dim()), (128, 128));
+        let Generator::StructuredGate(s) = &g else { panic!("expected the structured_gate variant") };
+        assert_eq!(s.logit_clamp, 4.0, "configs/sift/v4.yaml sets logit_clamp: 4.0");
+        assert_eq!(s.magnitude_floor, 1.0e-6);
+        assert_eq!((s.sparsity_head.out_dim, s.coupling.in_dim, s.smoothing.out_dim), (1, 128, 128));
+    }
+
+    #[test]
+    fn structured_gate_requires_noise_of_the_right_length() {
+        let g = Generator::from_blob(SIFT).unwrap();
+        assert!(g.forward_cpu(&[0.0; 128], None).is_err());
+        assert!(g.forward_cpu(&[0.0; 128], Some(&[0.0; 127])).is_err());
+    }
+
+    #[test]
+    fn structured_gate_output_is_non_negative_and_unit_norm() {
+        let g = Generator::from_blob(SIFT).unwrap();
+        let latent: Vec<f32> = (0..128).map(|i| ((i * 29 % 97) as f32) / 48.0 - 1.0).collect();
+        let noise: Vec<f32> = (0..128).map(|i| ((i * 53 % 89) as f32) / 15.0 - 3.0).collect();
+        let out = g.forward_cpu(&latent, Some(&noise)).unwrap();
+        assert!(out.iter().all(|v| *v >= 0.0));
+        assert!((out.iter().map(|x| x * x).sum::<f32>().sqrt() - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn a_row_with_every_gate_closed_falls_back_to_the_argmax_logit() {
+        let g = Generator::from_blob(SIFT).unwrap();
+        let latent: Vec<f32> = (0..128).map(|i| ((i * 29 % 97) as f32) / 48.0 - 1.0).collect();
+        // -1e6 everywhere closes every gate whatever the logits are (|logit| <= 4).
+        // Smoothing is linear with positive weights, so the smoothed noise is
+        // large and negative at every coordinate too.
+        let out = g.forward_cpu(&latent, Some(&[-1.0e6; 128])).unwrap();
+        let open: Vec<usize> = (0..128).filter(|j| out[*j] != 0.0).collect();
+        assert_eq!(open.len(), 1, "exactly one coordinate is rescued");
+        assert!((out[open[0]] - 1.0).abs() < 1e-6, "a one-hot row normalises to 1.0");
+    }
+
+    #[test]
+    fn softplus_matches_pytorch_including_the_threshold() {
+        use crate::gan_generator::structured_gate::softplus;
+        assert!((softplus(0.0) - std::f32::consts::LN_2).abs() < 1e-7);
+        assert_eq!(softplus(25.0), 25.0, "above 20 PyTorch returns x unchanged");
+        assert!(softplus(-100.0) >= 0.0 && softplus(-100.0) < 1e-30);
+    }
+
+    #[test]
+    fn structured_gate_rejects_a_sparsity_head_wider_than_one() {
+        // trunk 3x4, magnitude 2x3, gate 2x3, sparsity 2x3 (WRONG), coupling 2x2, smoothing 2x2
+        let shapes = [(3, 4), (3, 1), (2, 3), (2, 1), (2, 3), (2, 1), (2, 3), (2, 1), (2, 2), (2, 2)];
+        let b = container_bytes(1, 4, 2, &[4.0, 1e-6, 1e-8], &shapes);
+        assert!(Generator::from_blob(&b).unwrap_err().to_string().contains("sparsity"));
+    }
+
+    #[test]
+    fn structured_gate_rejects_a_non_square_coupling() {
+        let shapes = [(3, 4), (3, 1), (2, 3), (2, 1), (2, 3), (2, 1), (1, 3), (1, 1), (2, 3), (2, 2)];
+        let b = container_bytes(1, 4, 2, &[4.0, 1e-6, 1e-8], &shapes);
+        assert!(Generator::from_blob(&b).unwrap_err().to_string().contains("coupling"));
     }
 }
