@@ -346,6 +346,75 @@ pub(crate) mod tests {
         assert!((dot - s.cos_r).abs() < 1e-5, "out.u was {dot}, cos_r is {}", s.cos_r);
     }
 
+    /// `projected_tangent_norm_cpu` returns exactly what `forward_cpu` divides
+    /// by, checked on the 8 golden latents.
+    ///
+    /// The assertion is bit-exact, not within a tolerance: the reconstruction
+    /// repeats the only two steps `forward_cpu` takes after the shared helper --
+    /// divide by `max(norm, eps)`, then `cos_r * u + sin_r * t` -- so both sides
+    /// must come out identical bit for bit. Two mutations MEASURED as caught
+    /// (2026-09-21): accumulating the sum of squares with `*x * *x + ss` instead
+    /// of `mul_add` (the reconstruction then differs in the last bit at row 1
+    /// coordinate 0), and iterating the accumulation in reverse index order (row 0
+    /// coordinate 0).
+    ///
+    /// It does NOT catch a dropped projection. `forward_cpu` and this norm read
+    /// the same `v` out of one shared helper, so a projection removed there moves
+    /// both sides of the reconstruction together. That is what the shared helper
+    /// is for; the mutation is caught by `nytimes_blob_matches_pytorch` and
+    /// `spherical_output_is_unit_norm_and_the_tangent_is_orthogonal`, both MEASURED
+    /// as failing when the projection line is replaced with `t[j] = t[j]`.
+    ///
+    /// It also pins `direction_cpu` against the helper's `u`: the two reach the
+    /// direction by separate code paths and must agree bit for bit, so neither
+    /// can be changed alone.
+    ///
+    /// What it does NOT show: nothing here bounds how small the projected norm
+    /// gets on latents drawn from the real N(0, 1) prior, which is what decides
+    /// whether the division can amplify a cross-architecture difference. That is
+    /// a measurement over many rows, and `measure_nytimes_projected_tangent_norms`
+    /// in `vector_search` (gated, `#[ignore]`d) is where it is taken. The eight
+    /// golden rows' norms are 1.588, 1.598, 1.609, 1.621, 1.634, 1.647, 1.662 and
+    /// 1.677 (MEASURED 2026-09-21 by this test under a temporary print, via
+    /// `cargo test -p tig-challenges gan_generator -- --nocapture`), all far above
+    /// the 1e-8 floor, so the `max(norm, eps)` branch is not exercised here either.
+    /// Those eight latents are the exporter's own fixed sample, not draws from the
+    /// prior, so they say nothing about the tail.
+    #[test]
+    fn nytimes_projected_tangent_norm_is_what_forward_cpu_divides_by() {
+        let golden: Golden =
+            serde_json::from_str(include_str!("../vector_search/weights/nytimes_256_v3.golden.json")).unwrap();
+        let g = Generator::from_blob(NYT).unwrap();
+        let Generator::Spherical(s) = &g else { panic!("expected the spherical variant") };
+        assert_eq!(golden.latents.len(), 8, "golden file should carry 8 rows");
+        for (row, latent) in golden.latents.iter().enumerate() {
+            let norm = s.projected_tangent_norm_cpu(latent);
+            assert!(norm.is_finite() && norm > 0.0, "row {row}: the projected norm is {norm}");
+
+            let (u, v) = s.direction_and_projected_tangent_cpu(latent);
+            let direct = s.direction_cpu(latent);
+            assert_eq!(u.len(), direct.len(), "row {row}: the two directions differ in length");
+            assert!(
+                u.iter().zip(&direct).all(|(a, b)| a.to_bits() == b.to_bits()),
+                "row {row}: direction_cpu disagrees with the shared helper's u"
+            );
+
+            let divisor = norm.max(s.eps);
+            let out = s.forward_cpu(latent);
+            assert_eq!(out.len(), u.len());
+            for j in 0..out.len() {
+                let want = s.cos_r.mul_add(u[j], s.sin_r * (v[j] / divisor));
+                assert_eq!(
+                    out[j].to_bits(),
+                    want.to_bits(),
+                    "row {row} coord {j}: forward_cpu gave {} but the reconstruction gives {}",
+                    out[j],
+                    want
+                );
+            }
+        }
+    }
+
     /// trunk 4->3, direction 2x3, tangent_in 5x4 (+b), gamma 5x3 (+b), beta 5x3 (+b), tangent_out 2x5 (+b)
     fn tiny_spherical(latent: u32, shapes: &[(u32, u32)]) -> Vec<u8> {
         container_bytes(2, latent, 2, &[0.6, 0.8, 1e-8], shapes)

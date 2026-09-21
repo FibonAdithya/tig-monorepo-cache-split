@@ -69,7 +69,15 @@ impl Spherical {
         u
     }
 
-    pub fn forward_cpu(&self, latent: &[f32]) -> Vec<f32> {
+    /// The unit direction `u` and the projected tangent `v = t - (t.u) u`,
+    /// BEFORE `v` is normalised.
+    ///
+    /// Every step of `forward_cpu` up to that point lives here and nowhere
+    /// else, so `forward_cpu` and `projected_tangent_norm_cpu` cannot drift
+    /// apart in the arithmetic or in the `mul_add` order. Public because the
+    /// ungated test reconstructs `forward_cpu`'s output from what this returns;
+    /// `generate_instance` never calls it.
+    pub fn direction_and_projected_tangent_cpu(&self, latent: &[f32]) -> (Vec<f32>, Vec<f32>) {
         let h = self.trunk_cpu(latent);
         let mut u = dense_cpu(&self.direction, &h, false);
         normalize_cpu(&mut u, self.eps);
@@ -93,6 +101,34 @@ impl Spherical {
         for j in 0..t.len() {
             t[j] = (-dot).mul_add(u[j], t[j]);
         }
+        (u, t)
+    }
+
+    /// `||v||` for the projected tangent, i.e. the quantity `forward_cpu`
+    /// divides by. Reported WITHOUT the `max(_, eps)` floor, which is what
+    /// makes it a measurement rather than a copy of what the normalise step
+    /// uses: when `v` is nearly parallel to `u` the projection leaves almost
+    /// nothing behind, and the division then amplifies a difference in the last
+    /// bits of `v` by up to `1 / ||v||`. On a GPU built with `--use_fast_math`
+    /// sqrt and division are approximate, so such a row is where the CPU
+    /// reference and the kernel could disagree by a visible amount. Nothing
+    /// asserts a bound on it; `measure_nytimes_projected_tangent_norms` in
+    /// `vector_search` prints the distribution.
+    ///
+    /// The sum of squares is accumulated in index order with `mul_add`, exactly
+    /// as `normalize_cpu` accumulates it, so this returns bit for bit the value
+    /// `forward_cpu` divides by whenever that value is at or above `eps`.
+    pub fn projected_tangent_norm_cpu(&self, latent: &[f32]) -> f32 {
+        let (_, v) = self.direction_and_projected_tangent_cpu(latent);
+        let mut ss = 0.0f32;
+        for x in v.iter() {
+            ss = x.mul_add(*x, ss);
+        }
+        ss.sqrt()
+    }
+
+    pub fn forward_cpu(&self, latent: &[f32]) -> Vec<f32> {
+        let (u, mut t) = self.direction_and_projected_tangent_cpu(latent);
         normalize_cpu(&mut t, self.eps);
 
         (0..u.len()).map(|j| self.cos_r.mul_add(u[j], self.sin_r * t[j])).collect()
