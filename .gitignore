@@ -45,3 +45,6 @@ tig-algorithms/lib/
 *.safetensors
 *.npy
 *.hdf5
+
+# Logs written by scripts/box_test.sh on the GPU box.
+runs/

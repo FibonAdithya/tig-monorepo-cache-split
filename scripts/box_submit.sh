@@ -15,9 +15,17 @@ if [ "$(git rev-parse "origin/$br")" != "$sha" ]; then
     echo "HEAD $sha is not what origin/$br points at; push first" >&2
     exit 2
 fi
-id=$(ssh -o BatchMode=yes tig-gpu "gpuq submit --project tig-monorepo --commit $sha \
-    --branch '$br' --lane $lane --timeout-s ${BOX_TIMEOUT_S:-5400} -- env ${BOX_ENV:-} bash scripts/box_test.sh $name $*" 2>/dev/null | tail -1)
+remote=(gpuq submit --project tig-monorepo --commit "$sha" --branch "$br" --lane "$lane" --timeout-s "${BOX_TIMEOUT_S:-5400}" -- env)
+# BOX_ENV is a space-separated list of K=V words by contract; split it on purpose.
+read -r -a box_env <<< "${BOX_ENV:-}"
+remote+=("${box_env[@]+"${box_env[@]}"}" bash scripts/box_test.sh "$name" "$@")
+cmd=$(printf '%q ' "${remote[@]}")
+id=$(ssh -o BatchMode=yes tig-gpu "$cmd" 2>/dev/null | tail -1)
 echo "job: $id"
+if [ -z "$id" ]; then
+    echo "gpuq submit produced no job id" >&2
+    exit 3
+fi
 if [ "${BOX_NO_WAIT:-0}" = "1" ]; then
     exit 0
 fi
