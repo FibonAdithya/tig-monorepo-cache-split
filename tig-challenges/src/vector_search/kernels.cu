@@ -186,6 +186,44 @@ extern "C" __global__ void gan_linear(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Row-wise generator steps. One thread owns whole rows and walks a row's
+// coordinates in index order, so the result cannot depend on launch geometry.
+//
+// Unlike gan_linear these use sqrt and division, which --use_fast_math allows
+// to be approximate. Verification is recall within a relative 1e-6, not a
+// bit-exact integer, so a last-bit difference in a row does not by itself
+// change a verdict. See docs/ai/specs/2026-09-21-multi-arch-gan-scenarios-design.md,
+// "Determinism", for what this does and does not establish.
+// ---------------------------------------------------------------------------
+
+// x / max(||x||, eps), in place, for rows [row_offset, row_offset + n).
+extern "C" __global__ void gan_row_normalize(
+    float *data,
+    const int n,
+    const int dim,
+    const float eps,
+    const int row_offset
+)
+{
+    for (int i = threadIdx.x + blockIdx.x * blockDim.x; i < n;
+         i += blockDim.x * gridDim.x)
+    {
+        float *row = data + (long long)(row_offset + i) * dim;
+        float ss = 0.0f;
+        for (int j = 0; j < dim; ++j) {
+            ss = fmaf(row[j], row[j], ss);
+        }
+        float norm = sqrtf(ss);
+        if (norm < eps) {
+            norm = eps;
+        }
+        for (int j = 0; j < dim; ++j) {
+            row[j] = row[j] / norm;
+        }
+    }
+}
+
 #define AUDIT_BLOCK 256
 #define AUDIT_MAX_DIMS 128
 

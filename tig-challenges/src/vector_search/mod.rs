@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 mod generator;
 mod scenarios;
-use generator::{weights_from, LATENT_DIM};
+use crate::gan_generator::Generator;
 pub use scenarios::{Scenario, ScenarioConfig};
 
 impl_kv_string_serde! {
@@ -76,140 +76,70 @@ const AUDIT_TQ: u32 = 18;
 const AUDIT_MAX_DIMS: u32 = 128;
 
 
-/// One forward pass of the generator into `dest`.
+/// Generate `count` vectors into `dest`.
 ///
-/// `index_base` is preserved from the pre-split generator even though the two
-/// halves now use different seeds and no longer need it to separate their
-/// latent streams. Keeping it means `gan_sample_latents` is called exactly as
-/// before, so `kernels.cu` and every algorithm's PTX are untouched.
+/// `index_base` offsets the curand sequence so the database (base 0) and the
+/// queries (base `database_size`) never share a row index.
 fn generate_vectors(
     seed: &[u8; 32],
     count: usize,
     index_base: usize,
     dest: &mut CudaSlice<f32>,
-    layers: &[generator::Layer],
-    widest: usize,
+    generator: &Generator,
     module: Arc<CudaModule>,
     stream: Arc<CudaStream>,
 ) -> Result<()> {
-    let sample_latents_kernel = module.load_function("gan_sample_latents")?;
-    let linear_kernel = module.load_function("gan_linear")?;
+    generate_vectors_with(
+        seed,
+        count,
+        index_base,
+        dest,
+        generator,
+        module,
+        stream,
+        FORWARD_CHUNK,
+        generator::ROW_BLOCK,
+    )
+}
 
-    let d_seed = stream.memcpy_stod(seed)?;
-    let mut d_weights = Vec::with_capacity(layers.len());
-    for layer in layers {
-        d_weights.push((
-            stream.memcpy_stod(&layer.weights)?,
-            stream.memcpy_stod(&layer.bias)?,
+/// `generate_vectors` with the launch geometry exposed, so a test can show the
+/// output does not depend on it.
+///
+/// The local `generator` (a `&Generator`) and the module `generator` (this
+/// file's `mod generator;`) share a name but live in different namespaces, so
+/// `generator::ROW_BLOCK` below resolves to the module, not the value.
+fn generate_vectors_with(
+    seed: &[u8; 32],
+    count: usize,
+    index_base: usize,
+    dest: &mut CudaSlice<f32>,
+    generator: &Generator,
+    module: Arc<CudaModule>,
+    stream: Arc<CudaStream>,
+    chunk: usize,
+    row_block: u32,
+) -> Result<()> {
+    // Row indices reach the kernels as i32, and the spherical driver shifts
+    // its second latent stream by 1 << 30. Both need this bound.
+    if index_base + count >= (1usize << 30) {
+        return Err(anyhow!(
+            "index_base {} + count {} must stay below 2^30",
+            index_base,
+            count
         ));
     }
-
-    let mut d_scratch_a = stream.alloc_zeros::<f32>(FORWARD_CHUNK * widest)?;
-    let mut d_scratch_b = stream.alloc_zeros::<f32>(FORWARD_CHUNK * widest)?;
-    let mut d_latents = stream.alloc_zeros::<f32>(FORWARD_CHUNK * LATENT_DIM)?;
-
-    for chunk_start in (0..count).step_by(FORWARD_CHUNK) {
-        let rows = FORWARD_CHUNK.min(count - chunk_start);
-
-        unsafe {
-            stream
-                .launch_builder(&sample_latents_kernel)
-                .arg(&d_seed)
-                .arg(&(rows as i32))
-                .arg(&(LATENT_DIM as i32))
-                .arg(&mut d_latents)
-                .arg(&((index_base + chunk_start) as i32))
-                .launch(LaunchConfig {
-                    grid_dim: ((rows as u32 + 255) / 256, 1, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                })?;
-        }
-
-        for (i, layer) in layers.iter().enumerate() {
-            let is_last = i + 1 == layers.len();
-            let (d_weight, d_bias) = &d_weights[i];
-            let cfg = LaunchConfig {
-                grid_dim: (
-                    (rows as u32 + 127) / 128,
-                    (layer.out_dim as u32 + 63) / 64,
-                    1,
-                ),
-                block_dim: (16, 16, 1),
-                shared_mem_bytes: 0,
-            };
-            let apply_activation = (!is_last) as i32;
-            let out_row_offset = if is_last { chunk_start as i32 } else { 0 };
-
-            if is_last {
-                let input: &CudaSlice<f32> = if i == 0 {
-                    &d_latents
-                } else if i % 2 == 1 {
-                    &d_scratch_a
-                } else {
-                    &d_scratch_b
-                };
-                unsafe {
-                    stream
-                        .launch_builder(&linear_kernel)
-                        .arg(input)
-                        .arg(d_weight)
-                        .arg(d_bias)
-                        .arg(&mut *dest)
-                        .arg(&(rows as i32))
-                        .arg(&(layer.in_dim as i32))
-                        .arg(&(layer.out_dim as i32))
-                        .arg(&apply_activation)
-                        .arg(&out_row_offset)
-                        .launch(cfg)?;
-                }
-            } else if i == 0 {
-                unsafe {
-                    stream
-                        .launch_builder(&linear_kernel)
-                        .arg(&d_latents)
-                        .arg(d_weight)
-                        .arg(d_bias)
-                        .arg(&mut d_scratch_a)
-                        .arg(&(rows as i32))
-                        .arg(&(layer.in_dim as i32))
-                        .arg(&(layer.out_dim as i32))
-                        .arg(&apply_activation)
-                        .arg(&out_row_offset)
-                        .launch(cfg)?;
-                }
-            } else if i % 2 == 1 {
-                unsafe {
-                    stream
-                        .launch_builder(&linear_kernel)
-                        .arg(&d_scratch_a)
-                        .arg(d_weight)
-                        .arg(d_bias)
-                        .arg(&mut d_scratch_b)
-                        .arg(&(rows as i32))
-                        .arg(&(layer.in_dim as i32))
-                        .arg(&(layer.out_dim as i32))
-                        .arg(&apply_activation)
-                        .arg(&out_row_offset)
-                        .launch(cfg)?;
-                }
-            } else {
-                unsafe {
-                    stream
-                        .launch_builder(&linear_kernel)
-                        .arg(&d_scratch_b)
-                        .arg(d_weight)
-                        .arg(d_bias)
-                        .arg(&mut d_scratch_a)
-                        .arg(&(rows as i32))
-                        .arg(&(layer.in_dim as i32))
-                        .arg(&(layer.out_dim as i32))
-                        .arg(&apply_activation)
-                        .arg(&out_row_offset)
-                        .launch(cfg)?;
-                }
-            }
-        }
+    let d_seed = stream.memcpy_stod(seed)?;
+    let mut device = generator::DeviceGenerator::new(
+        generator,
+        chunk.min(count),
+        row_block,
+        &module,
+        stream.clone(),
+    )?;
+    for chunk_start in (0..count).step_by(chunk) {
+        let rows = chunk.min(count - chunk_start);
+        device.sample_inputs(&d_seed, rows, index_base + chunk_start)?;
+        device.forward(rows, dest, chunk_start)?;
     }
     Ok(())
 }
@@ -234,12 +164,11 @@ impl Database {
         _prop: &cudaDeviceProp,
     ) -> Result<Self> {
         let config = ScenarioConfig::from(track.s);
-        let weights = weights_from(config.weights)?;
-        let layers = &weights.layers;
-        let vector_dims = layers
-            .last()
-            .ok_or_else(|| anyhow!("generator has no layers"))?
-            .out_dim;
+        let generator = Generator::from_blob(config.weights)?;
+        // No "generator has no layers" arm any more: every architecture's
+        // parser rejects an empty layer list, so `output_dim` cannot be asked
+        // of a generator that has none.
+        let vector_dims = generator.output_dim();
         if vector_dims != config.vector_dims {
             return Err(anyhow!(
                 "scenario {} declares {} dims but its blob produces {}",
@@ -248,7 +177,6 @@ impl Database {
                 vector_dims
             ));
         }
-        let widest = layers.iter().map(|layer| layer.out_dim).max().unwrap();
         let database_size = config.database_size;
 
         let mut d_database_vectors =
@@ -258,8 +186,7 @@ impl Database {
             database_size as usize,
             0,
             &mut d_database_vectors,
-            layers,
-            widest,
+            &generator,
             module,
             stream.clone(),
         )?;
@@ -294,9 +221,7 @@ impl Challenge {
             ));
         }
         let config = ScenarioConfig::from(track.s);
-        let weights = weights_from(config.weights)?;
-        let layers = &weights.layers;
-        let widest = layers.iter().map(|layer| layer.out_dim).max().unwrap();
+        let generator = Generator::from_blob(config.weights)?;
         let vector_dims = db.vector_dims as usize;
         let n_queries = config.n_queries;
 
@@ -306,8 +231,7 @@ impl Challenge {
             n_queries as usize,
             db.database_size as usize,
             &mut d_query_vectors,
-            layers,
-            widest,
+            &generator,
             module,
             stream.clone(),
         )?;
@@ -1695,10 +1619,8 @@ extern "C" __global__ void reference_nn_search(
         };
 
         let config = ScenarioConfig::from(track.s);
-        let weights = weights_from(config.weights).unwrap();
-        let layers = &weights.layers;
-        let widest = layers.iter().map(|l| l.out_dim).max().unwrap();
-        let dims = layers.last().unwrap().out_dim;
+        let generator = Generator::from_blob(config.weights).unwrap();
+        let dims = generator.output_dim();
         let n = config.n_queries as usize;
 
         let db = Database::generate(&seeds.db, &track, module.clone(), stream.clone(), &prop)
@@ -1714,8 +1636,7 @@ extern "C" __global__ void reference_nn_search(
                 n,
                 index_base,
                 &mut dest,
-                layers,
-                widest,
+                &generator,
                 module.clone(),
                 stream.clone(),
             )
@@ -1810,10 +1731,8 @@ extern "C" __global__ void reference_nn_search(
         };
 
         let config = ScenarioConfig::from(track.s);
-        let weights = weights_from(config.weights).unwrap();
-        let layers = &weights.layers;
-        let widest = layers.iter().map(|l| l.out_dim).max().unwrap();
-        let dims = layers.last().unwrap().out_dim;
+        let generator = Generator::from_blob(config.weights).unwrap();
+        let dims = generator.output_dim();
         let n = config.database_size as usize;
 
         let db = Database::generate(&seeds.db, &track, module.clone(), stream.clone(), &prop)
@@ -1826,8 +1745,7 @@ extern "C" __global__ void reference_nn_search(
                 n,
                 index_base,
                 &mut dest,
-                layers,
-                widest,
+                &generator,
                 module.clone(),
                 stream.clone(),
             )
