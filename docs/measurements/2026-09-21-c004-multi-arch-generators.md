@@ -74,9 +74,26 @@ inside the range of five fresh PyTorch draws of the same checkpoint.
 | sd of the six draws | 0.0180 | computed (statistics.stdev, sample sd, of the row above) | arithmetic | 2026-09-21 |
 | draws clearing the lower gate edge (0.7602) | 1 of 6 (the gate's own sample, 0.7704) | MEASURED (count over the row above) | arithmetic on the six-draw row | 2026-09-21 |
 | `v3_best` admission margin over the lower edge | 0.0102 (0.7704 − 0.7602) | computed | arithmetic | 2026-09-21 |
-| blob size, `glove_100_v1.bin` | computed 6,973,840 + header; measured 6,973,936 B (header 96 B) | MEASURED (`ls -l`) / computed (spec's float-count arithmetic) | `ls -l` on the box; spec's layer-shape arithmetic | 2026-09-21 |
-| blob size, `sift_128_v4.bin` | computed 7,748,612 + header; measured 7,748,764 B (header 152 B) | MEASURED / computed | same | 2026-09-21 |
-| blob size, `nytimes_256_v3.bin` | computed 13,124,608 + header; measured 13,124,768 B (header 160 B) | MEASURED / computed | same | 2026-09-21 |
+| blob size, `glove_100_v1.bin` | computed 6,973,840 + header; measured 6,973,936 B (header 96 B) | MEASURED (`ls -l`, local) / computed (spec's float-count arithmetic) | `ls -l tig-challenges/src/vector_search/weights/glove_100_v1.bin` on the local machine; spec's layer-shape arithmetic | 2026-09-21 |
+| blob size, `sift_128_v4.bin` | computed 7,748,612 + header; measured 7,748,764 B (header 152 B) | MEASURED (local) / computed | `ls -l tig-challenges/src/vector_search/weights/sift_128_v4.bin` on the local machine | 2026-09-21 |
+| blob size, `nytimes_256_v3.bin` | computed 13,124,608 + header; measured 13,124,768 B (header 160 B) | MEASURED (local) / computed | `ls -l tig-challenges/src/vector_search/weights/nytimes_256_v3.bin` on the local machine | 2026-09-21 |
+| row 65,536 norm, `normalize ignores row_offset` mutation (Task 6, GloVe/mlp) | 0.534 | MEASURED | `task-6-mut-*-box.log`, `glove_database_rows_are_unit_norm` test output | 2026-09-21 |
+| disagreeing values, `normalize ignores row_offset` mutation (Task 6) | 3,950,881 | MEASURED | `task-6-mut-*-box.log`, `glove_output_is_invariant_to_launch_geometry` test output | 2026-09-21 |
+| disagreeing values, `last linear at row 0` mutation (Task 6) | 6,214,400 | MEASURED | `task-6-mut-*-box.log`, `glove_output_is_invariant_to_launch_geometry` test output | 2026-09-21 |
+| gpu vs. cpu value, `no divide` mutation (Task 6) | gpu −0.04766, cpu −0.05582 | MEASURED | `task-6-mut-*-box.log`, `glove_gpu_forward_matches_the_cpu_reference` test output | 2026-09-21 |
+| independence `r`, `z_skip` at the same curand index mutation (Task 8, NYTimes/spherical) | 1 | MEASURED | `task-8-mut-*-box.log`, `nytimes_trunk_and_skip_latents_are_independent` test output | 2026-09-21 |
+| unit-norm value, `projection skipped` mutation (Task 8) | 1.198 | MEASURED | `task-8-mut-*-box.log`, `nytimes_database_rows_are_unit_norm` test output | 2026-09-21 |
+| draws equal, `sequence base dropped` mutation (Task 9, SIFT/structured_gate) | 524,288 of 524,288 | MEASURED | `task-9-mut-*-box.log`, `sift_gate_noise_does_not_reuse_the_latent_sequence` test output | 2026-09-21 |
+| zero fraction, `threshold inverted` mutation (Task 9) | 0.7607 | MEASURED | `task-9-mut-*-box.log`, `sift_database_rows_are_unit_norm_non_negative_and_sparse_like_sift` test output | 2026-09-21 |
+| disagreeing values, `sparsity[0]` mutation (Task 9) | 9,689,324 | MEASURED | `task-9-mut-*-box.log`, `sift_output_is_invariant_to_launch_geometry` test output | 2026-09-21 |
+| output vector, upper `u` clamp removed, caught after the fix (Task 9) | `[inf, 16.635532, 8.262958e-8, -18.420681, -18.420681, -18.420681]` | MEASURED | `task-9-fix-*-box.log`, `gate_noise_from_uniform_is_finite_at_both_ends_of_the_unit_interval` test output | 2026-09-21 |
+| output vector, lower `u` clamp removed (Task 9) | `[16.635532, 16.635532, 8.262958e-8, -18.420681, -inf, -69.077545]` | MEASURED | `task-9-fix-*-box.log`, `gate_noise_from_uniform_is_finite_at_both_ends_of_the_unit_interval` test output | 2026-09-21 |
+
+The `task-6-mut-*-box.log`, `task-8-mut-*-box.log`, `task-9-mut-*-box.log` and
+`task-9-fix-*-box.log` files above live in `.superpowers/sdd/`, the plan's
+workspace directory, which is git-ignored scratch. The rows above are the
+durable, committed source for these sub-values; the logs themselves may not
+persist.
 
 ## Test counts
 
@@ -290,14 +307,18 @@ and its gate band belongs to the WGAN repository's owner, not to this repo.
 ## Blob sizes (weights)
 
 Computed sizes are the spec's arithmetic from layer shapes (float count × 4);
-measured sizes are `ls -l` on the box. The header sizes account for the
-whole difference.
+measured sizes are `ls -l tig-challenges/src/vector_search/weights/*.bin` on
+the local machine, where `scripts/export_generator_weights.py` wrote the
+blobs. The header sizes account for the whole difference.
 
-| blob | computed (floats × 4) | measured (`ls -l`) | header |
+| blob | computed (floats × 4) | measured (`ls -l`, local) | header |
 |---|---|---|---|
 | `glove_100_v1.bin` | 6,973,840 | 6,973,936 | 96 B |
 | `sift_128_v4.bin` | 7,748,612 | 7,748,764 | 152 B |
 | `nytimes_256_v3.bin` | 13,124,608 | 13,124,768 | 160 B |
+
+**Correction 2026-09-21:** an earlier revision of this note sourced these
+sizes to the box; they were measured locally.
 
 ## What was not established
 
