@@ -123,10 +123,13 @@ struct MlpDevice {
 /// streams independent; it leaves `global_i % 4` alone, so both streams read the
 /// same seed word, as two sequences of one seed are meant to.
 ///
-/// `generate_vectors_with` rejects `index_base + count >= 1 << 30`, so every row
-/// index is below this shift and the two streams cannot meet. A shifted index is
-/// then below `1 << 31` and still fits the `int` the kernel takes.
-const SKIP_LATENT_INDEX_SHIFT: usize = 1 << 30;
+/// `generate_vectors_with` rejects `index_base + count >= SKIP_LATENT_INDEX_SHIFT`,
+/// so every row index is below this shift and the two streams cannot meet. A
+/// shifted index is then below `1 << 31` and still fits the `int` the kernel
+/// takes. `pub(super)` so that guard reads this constant rather than repeating
+/// the literal: two literals for one quantity could be changed apart, and
+/// raising only this one would let the two streams overlap again.
+pub(super) const SKIP_LATENT_INDEX_SHIFT: usize = 1 << 30;
 
 struct SphericalDevice {
     trunk: Vec<DeviceLayer>,

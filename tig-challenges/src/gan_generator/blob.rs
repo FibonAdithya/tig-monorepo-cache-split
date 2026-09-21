@@ -11,12 +11,26 @@ const MAGIC: &[u8; 8] = b"TIGGAN02";
 pub const MAX_SCALARS: usize = 16;
 pub const MAX_TENSORS: usize = 64;
 
-#[derive(Debug)]
 pub struct Tensor {
     pub rows: usize,
     pub cols: usize,
     /// Row-major `[rows][cols]`, matching PyTorch `nn.Linear.weight`.
     pub data: Vec<f32>,
+}
+
+impl std::fmt::Debug for Tensor {
+    /// Hand-written rather than derived, for the same reason `Generator`'s is:
+    /// `data` holds up to a million weight floats, so a derived `Debug` would
+    /// dump them all when an assertion on a real blob fails. Print the shape
+    /// and the element count only. `Container`'s derived `Debug` is bounded by
+    /// this one, since its `tensors` field is the only large thing in it.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Tensor")
+            .field("rows", &self.rows)
+            .field("cols", &self.cols)
+            .field("data_len", &self.data.len())
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -139,9 +153,17 @@ pub(crate) mod tests {
 
     #[test]
     fn rejects_tensor_dims_that_overflow_the_element_count() {
+        // Which multiplication fires depends on the width of `usize`. On a
+        // 64-bit target (2^32-1)^2 = 2^64 - 2^33 + 1 fits in a usize, so the
+        // `rows.checked_mul(cols)` above cannot overflow; what fires is
+        // `read_f32s`' `count.checked_mul(4)`, the byte length of the tensor.
+        // The container-level `checked_mul` is live only where usize is 32
+        // bits. Both errors say "overflow", which is all this asserts; it
+        // deliberately does not name one of the two messages, because that
+        // would pin the test to one pointer width.
         let mut b = Vec::from(*b"TIGGAN02");
         for x in [0u32, 4, 2, 0, 1, u32::MAX, u32::MAX] { b.extend_from_slice(&x.to_le_bytes()); }
-        assert!(parse_container(&b).is_err());
+        assert!(parse_container(&b).unwrap_err().to_string().contains("overflow"));
     }
 
     #[test]

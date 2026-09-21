@@ -119,13 +119,33 @@ fn generate_vectors_with(
     chunk: usize,
     row_block: u32,
 ) -> Result<()> {
-    // Row indices reach the kernels as i32, and the spherical driver shifts
-    // its second latent stream by 1 << 30. Both need this bound.
-    if index_base + count >= (1usize << 30) {
+    // Row indices reach the kernels as i32, and the spherical driver shifts its
+    // second latent stream by `generator::SKIP_LATENT_INDEX_SHIFT`. Both need
+    // this bound, and it is that constant here rather than a second literal so
+    // the two cannot be changed apart; see the comment on the constant.
+    //
+    // First statement in the function on purpose: it must reject an out-of-range
+    // index before anything is allocated on the device or any kernel launched.
+    if index_base + count >= generator::SKIP_LATENT_INDEX_SHIFT {
         return Err(anyhow!(
-            "index_base {} + count {} must stay below 2^30",
+            "index_base {} + count {} must stay below {}",
             index_base,
-            count
+            count,
+            generator::SKIP_LATENT_INDEX_SHIFT
+        ));
+    }
+    // `dest` is the caller's buffer and `Database`'s fields are pub, so a
+    // `vector_dims` that disagrees with the generator's `output_dim` would
+    // otherwise be found only by the kernel writing past the end of it.
+    // `count == 0` with an empty `dest` passes: 0 == 0.
+    let want = count * generator.output_dim();
+    if dest.len() != want {
+        return Err(anyhow!(
+            "dest holds {} floats; {} rows of {} need {}",
+            dest.len(),
+            count,
+            generator.output_dim(),
+            want
         ));
     }
     let d_seed = stream.memcpy_stod(seed)?;
@@ -2137,6 +2157,86 @@ extern "C" __global__ void test_gate_noise_from_uniform(
         // the global one would show up: the same row would draw different noise
         // at a different chunk size.
         assert_invariant_to_launch_geometry(Scenario::SIFT_128);
+    }
+
+    /// The `index_base + count` guard, which is `generate_vectors_with`'s first
+    /// statement. Nothing in the crate exercised it before this test.
+    ///
+    /// `count` is 2 and `index_base` sits just under the shift, so the whole test
+    /// allocates 2 x 256 floats and the guard returns before the function
+    /// allocates or launches anything of its own. `index_base + count` is exactly
+    /// `SKIP_LATENT_INDEX_SHIFT`, the smallest rejected value, so a `>` written
+    /// where `>=` belongs fails this test.
+    ///
+    /// `dest` is sized correctly for the two rows, so the error cannot be the
+    /// length check that follows the guard.
+    #[test]
+    fn generate_vectors_rejects_an_index_range_that_reaches_the_skip_latent_shift() {
+        const COUNT: usize = 2;
+        let (module, stream) = gpu_context();
+        let generator =
+            Generator::from_blob(ScenarioConfig::from(Scenario::NYTIMES_256).weights).unwrap();
+        let mut dest = stream.alloc_zeros::<f32>(COUNT * generator.output_dim()).unwrap();
+        let err = generate_vectors_with(
+            &[1u8; 32],
+            COUNT,
+            generator::SKIP_LATENT_INDEX_SHIFT - COUNT,
+            &mut dest,
+            &generator,
+            module,
+            stream.clone(),
+            FORWARD_CHUNK,
+            generator::ROW_BLOCK,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("must stay below 1073741824"), "got {err}");
+    }
+
+    /// `dest` one float short of `count * output_dim`. Without the length check
+    /// the last row's write runs off the end of the caller's buffer.
+    #[test]
+    fn generate_vectors_rejects_a_dest_that_is_the_wrong_length() {
+        const COUNT: usize = 8;
+        let (module, stream) = gpu_context();
+        let generator =
+            Generator::from_blob(ScenarioConfig::from(Scenario::GLOVE_100).weights).unwrap();
+        let want = COUNT * generator.output_dim();
+        let mut dest = stream.alloc_zeros::<f32>(want - 1).unwrap();
+        let err = generate_vectors_with(
+            &[2u8; 32],
+            COUNT,
+            0,
+            &mut dest,
+            &generator,
+            module,
+            stream.clone(),
+            FORWARD_CHUNK,
+            generator::ROW_BLOCK,
+        )
+        .unwrap_err()
+        .to_string();
+        // Both numbers, so the message cannot name only one of them.
+        assert!(
+            err.contains(&format!("holds {}", want - 1)) && err.contains(&format!("need {}", want)),
+            "got {err}"
+        );
+    }
+
+    /// `sample_inputs`' own bound. Every device buffer is sized by `max_rows` and
+    /// `forward` allocates nothing, so a chunk above `max_rows` would write past
+    /// the end of the scratch buffers instead of reallocating them.
+    #[test]
+    fn sample_inputs_rejects_a_chunk_larger_than_the_generator_was_sized_for() {
+        let (module, stream) = gpu_context();
+        let generator =
+            Generator::from_blob(ScenarioConfig::from(Scenario::GLOVE_100).weights).unwrap();
+        let d_seed = stream.memcpy_stod(&[8u8; 32]).unwrap();
+        let mut device =
+            generator::DeviceGenerator::new(&generator, 4, generator::ROW_BLOCK, &module, stream.clone())
+                .unwrap();
+        let err = device.sample_inputs(&d_seed, 5, 0).unwrap_err().to_string();
+        assert!(err.contains("chunk of 5 rows exceeds the 4"), "got {err}");
     }
 
     /// Every database row is unit-norm. Returns the rows for further checks.

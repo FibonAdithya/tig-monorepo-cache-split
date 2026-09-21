@@ -102,7 +102,10 @@ def test_spherical_scalars_are_cos_and_sin_of_the_learned_radius():
                            skip_dim=8, tangent_hidden_dim=12).eval()
     arch, latent, out, scalars, tensors = read_blob(ex.encode(s, "spherical"))
     assert (arch, latent, out) == (2, 24, 8)
-    r = float(s.radius)
+    # `.detach()` first: `radius` is a leaf Parameter with requires_grad, and
+    # `float()` on it raises a UserWarning about converting a tensor that needs
+    # a gradient. The exporter itself already detaches.
+    r = float(s.radius.detach())
     assert scalars[0] == pytest.approx(torch.cos(torch.tensor(r, dtype=torch.float64)).item(), abs=1e-7)
     assert scalars[1] == pytest.approx(torch.sin(torch.tensor(r, dtype=torch.float64)).item(), abs=1e-7)
     assert len(tensors) == 2 * 2 + 9

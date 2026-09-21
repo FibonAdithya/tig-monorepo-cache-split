@@ -31,6 +31,11 @@ impl Generator {
         if blob.len() >= 8 && &blob[..8] == b"TIGGAN01" {
             // The v1 format has no normalisation step and no header dims.
             let weights = v1::parse_weights(blob)?;
+            // `parse_weights` checks each layer's own dims but not that layer i
+            // consumes what layer i-1 produces. Without this a chain-broken
+            // blob loads and then reads past a scratch buffer, on the CPU in
+            // `dense_cpu` and on the GPU in `gan_linear`.
+            check_chain(&weights.layers, "mlp")?;
             return Ok(Generator::Mlp(Mlp { layers: weights.layers, normalize_eps: None }));
         }
         let container = blob::parse_container(blob)?;
@@ -259,6 +264,41 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn tiggan01_rejects_a_broken_layer_chain() {
+        // layer 0 is 4 -> 3, layer 1 consumes 5. `v1::parse_weights` checks
+        // each layer's own dims only, so `from_blob` is where the chain is
+        // checked for this format too.
+        let b = crate::gan_generator::v1::tests::blob_with(&[(4, 3), (5, 2)]);
+        let e = Generator::from_blob(&b).unwrap_err().to_string();
+        assert!(e.contains("mlp layer 1 consumes 5 but layer 0 produces 3"), "got {e}");
+    }
+
+    #[test]
+    fn rejects_a_non_finite_scalar() {
+        // The scalar count is right (mlp wants exactly 1), so only the
+        // finiteness clause of `expect_scalars` can reject this blob. A NaN
+        // normalize_eps would otherwise reach `normalize_cpu`, where
+        // `max(NaN)` makes the whole row NaN without an error anywhere.
+        let b = container_bytes(0, 4, 2, &[f32::NAN], &[(2, 4), (2, 1)]);
+        let e = Generator::from_blob(&b).unwrap_err().to_string();
+        assert!(e.contains("non-finite"), "got {e}");
+    }
+
+    /// `Debug` on a parsed real blob must stay small enough to read.
+    ///
+    /// Both `Generator` and `Tensor` hand-write `Debug` for this reason. The
+    /// bound is 2,000 characters: the SIFT blob carries about 1.8 million weight
+    /// floats, so a derived `Debug` on either type would print megabytes when a
+    /// `.unwrap()` on a real blob fails.
+    #[test]
+    fn debug_on_a_real_blob_prints_shapes_not_weights() {
+        let printed = format!("{:?}", Generator::from_blob(SIFT).unwrap());
+        assert!(printed.len() < 2_000, "Generator Debug was {} characters", printed.len());
+        let printed = format!("{:?}", blob::parse_container(SIFT).unwrap());
+        assert!(printed.len() < 2_000, "Container Debug was {} characters", printed.len());
+    }
+
+    #[test]
     fn mlp_output_is_unit_norm() {
         let g = Generator::from_blob(include_bytes!("../vector_search/weights/glove_100_v1.bin")).unwrap();
         let latent: Vec<f32> = (0..128).map(|i| (i as f32) / 64.0 - 1.0).collect();
@@ -329,7 +369,14 @@ pub(crate) mod tests {
         assert_eq!(s.trunk[0].in_dim, 256, "trunk consumes latent_dim - skip_dim");
         assert_eq!(s.tangent_in.in_dim, 256, "tangent_in consumes skip_dim");
         assert!((s.cos_r * s.cos_r + s.sin_r * s.sin_r - 1.0).abs() < 1e-6);
-        assert!(s.sin_r > 0.19 && s.cos_r > 0.07, "r lies in [0.2, 1.5], so both are positive");
+        // Each scalar pinned to its own value, not just to a positive range:
+        // cos_r and sin_r are read out of the same scalar array at adjacent
+        // indices, and a range assertion (or the Pythagorean identity, which is
+        // symmetric in the two) passes just as well if the two reads are
+        // swapped. MEASURED from this blob's header: cos_r 0.36633438,
+        // sin_r 0.93048328.
+        assert!(s.cos_r > 0.366 && s.cos_r < 0.367, "cos_r was {}", s.cos_r);
+        assert!(s.sin_r > 0.930 && s.sin_r < 0.931, "sin_r was {}", s.sin_r);
     }
 
     #[test]
@@ -341,6 +388,13 @@ pub(crate) mod tests {
         let norm = out.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-5, "norm was {norm}");
         // out . u == cos_r exactly when t is orthogonal to u and both are unit.
+        //
+        // This assertion is not what catches a deleted projection, although the
+        // test as a whole does. MEASURED in Task 4's mutation run (the
+        // projection line replaced with `t[j] = t[j]`): the norm assertion above
+        // fires first, at norm 1.18, so execution never reaches the dot product.
+        // What this assertion adds is a second, independent statement about the
+        // same row, and it pins `direction_cpu` as well as `forward_cpu`.
         let u = s.direction_cpu(&latent);
         let dot: f32 = out.iter().zip(&u).map(|(a, b)| a * b).sum();
         assert!((dot - s.cos_r).abs() < 1e-5, "out.u was {dot}, cos_r is {}", s.cos_r);
@@ -440,9 +494,86 @@ pub(crate) mod tests {
         assert!(Generator::from_blob(&tiny_spherical(8, &shapes)).unwrap_err().to_string().contains("gamma"));
     }
 
+    // The five tests below cover the remaining shape checks in
+    // `Spherical::from_container`'s ordered `checks` array. Each changes one
+    // tuple of TINY_SPH, passes every check BEFORE its own, and asserts a
+    // substring that only its own check's message contains. These are not
+    // hygiene: `DeviceGenerator::new` sizes the device buffers `a`, `g`, `b`
+    // and `m` by `tangent_in.out_dim` and `d`, `v` by `direction.out_dim`, on
+    // the assumption that the parser has already forced every other tensor to
+    // agree. Without the beta or tangent_out check a blob writes past a device
+    // buffer and nothing reports it.
+
+    #[test]
+    fn spherical_rejects_a_direction_that_does_not_consume_the_trunk_output() {
+        // direction is now 2x4: out_dim 2 still matches output_dim, in_dim 4
+        // does not match the trunk's output width of 3. The latent check, which
+        // comes first, reads trunk[0].in_dim + tangent_in.in_dim = 4 + 4 = 8
+        // and is untouched.
+        let mut shapes = TINY_SPH;
+        shapes[2] = (2, 4);
+        let e = Generator::from_blob(&tiny_spherical(8, &shapes)).unwrap_err().to_string();
+        assert!(e.contains("direction must consume"), "got {e}");
+    }
+
+    #[test]
+    fn spherical_rejects_a_direction_that_does_not_produce_output_dim() {
+        // direction is now 3x3: in_dim 3 matches the trunk output, so the
+        // earlier check passes, and out_dim 3 is not output_dim 2.
+        let mut shapes = TINY_SPH;
+        shapes[2] = (3, 3);
+        let e = Generator::from_blob(&tiny_spherical(8, &shapes)).unwrap_err().to_string();
+        assert!(e.contains("direction must produce"), "got {e}");
+    }
+
+    #[test]
+    fn spherical_rejects_a_beta_that_does_not_match_tangent_in() {
+        // beta is now 6x3 with a 6x1 bias, so the bias-shape check in `dense`
+        // still passes and in_dim 3 still matches the trunk output; only
+        // beta.out_dim 6 against tangent_in.out_dim 5 is wrong. gamma, checked
+        // just before, is untouched at 5x3.
+        let mut shapes = TINY_SPH;
+        shapes[7] = (6, 3);
+        shapes[8] = (6, 1);
+        let e = Generator::from_blob(&tiny_spherical(8, &shapes)).unwrap_err().to_string();
+        assert!(e.contains("beta"), "got {e}");
+    }
+
+    #[test]
+    fn spherical_rejects_a_tangent_out_that_does_not_consume_tangent_ins_width() {
+        // tangent_out is now 2x6: out_dim 2 still matches output_dim, in_dim 6
+        // does not match tangent_in.out_dim 5. Its bias stays 2x1, so `dense`
+        // accepts it, and gamma and beta are untouched.
+        let mut shapes = TINY_SPH;
+        shapes[9] = (2, 6);
+        let e = Generator::from_blob(&tiny_spherical(8, &shapes)).unwrap_err().to_string();
+        assert!(e.contains("tangent_out must consume"), "got {e}");
+    }
+
+    #[test]
+    fn spherical_rejects_a_tangent_out_that_does_not_produce_output_dim() {
+        // tangent_out is now 3x5 with a 3x1 bias: in_dim 5 matches
+        // tangent_in.out_dim, so the earlier check passes, and out_dim 3 is not
+        // output_dim 2.
+        let mut shapes = TINY_SPH;
+        shapes[9] = (3, 5);
+        shapes[10] = (3, 1);
+        let e = Generator::from_blob(&tiny_spherical(8, &shapes)).unwrap_err().to_string();
+        assert!(e.contains("tangent_out must produce"), "got {e}");
+    }
+
     #[test]
     fn spherical_rejects_an_even_tensor_count() {
-        assert!(Generator::from_blob(&tiny_spherical(8, &TINY_SPH[..10])).unwrap_err().to_string().contains("tensors"));
+        // 12 tensors, not 10: the count check is `n < 11 || n % 2 == 0`, and a
+        // 10-tensor blob trips `n < 11` first, which leaves the evenness clause
+        // untested. 12 is even AND above the minimum, so only the evenness
+        // clause can reject it. The first 11 shapes are the valid fixture, so
+        // nothing else in the parser can fail either: with the clause deleted,
+        // `trunk_layers` is (12 - 9) / 2 = 1, the parser consumes the same 11
+        // tensors, ignores the twelfth and accepts the blob.
+        let mut shapes = TINY_SPH.to_vec();
+        shapes.push((2, 2));
+        assert!(Generator::from_blob(&tiny_spherical(8, &shapes)).unwrap_err().to_string().contains("tensors"));
     }
 
     const SIFT: &[u8] = include_bytes!("../vector_search/weights/sift_128_v4.bin");
@@ -633,5 +764,34 @@ pub(crate) mod tests {
         assert!(Generator::from_blob(&zero).unwrap_err().to_string().contains("logit_clamp must be positive"));
         let negative = container_bytes(1, 4, 2, &[-4.0, 1e-6, 1e-8], &VALID_STRUCTURED_GATE);
         assert!(Generator::from_blob(&negative).unwrap_err().to_string().contains("logit_clamp must be positive"));
+    }
+
+    /// The tensor-count check is `n < 10 || n % 2 != 0`, two clauses. Each of
+    /// the two blobs here can only be rejected by one of them.
+    ///
+    /// 11 is odd and above the minimum, so only the oddness clause applies; 8 is
+    /// even and below the minimum, so only the minimum applies. 9 would satisfy
+    /// both and isolate neither.
+    #[test]
+    fn structured_gate_rejects_an_odd_tensor_count_above_the_minimum() {
+        // The first 10 shapes are the valid fixture; the eleventh is never
+        // consumed. With the oddness clause deleted, `trunk_layers` is
+        // (11 - 8) / 2 = 1, the parser reads the same 10 tensors, ignores the
+        // eleventh and accepts the blob.
+        let mut shapes = VALID_STRUCTURED_GATE.to_vec();
+        shapes.push((2, 2));
+        let b = container_bytes(1, 4, 2, &[4.0, 1e-6, 1e-8], &shapes);
+        let e = Generator::from_blob(&b).unwrap_err().to_string();
+        assert!(e.contains("tensors"), "got {e}");
+    }
+
+    #[test]
+    fn structured_gate_rejects_an_even_tensor_count_below_the_minimum() {
+        // The valid fixture's first 8 shapes: even, so the oddness clause
+        // cannot fire. With the minimum lowered to 8 there are no trunk layers
+        // left and the parser reads past the end of `trunk`.
+        let b = container_bytes(1, 4, 2, &[4.0, 1e-6, 1e-8], &VALID_STRUCTURED_GATE[..8]);
+        let e = Generator::from_blob(&b).unwrap_err().to_string();
+        assert!(e.contains("tensors"), "got {e}");
     }
 }

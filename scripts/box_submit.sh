@@ -20,16 +20,37 @@ remote=(gpuq submit --project tig-monorepo --commit "$sha" --branch "$br" --lane
 read -r -a box_env <<< "${BOX_ENV:-}"
 remote+=("${box_env[@]+"${box_env[@]}"}" bash scripts/box_test.sh "$name" "$@")
 cmd=$(printf '%q ' "${remote[@]}")
-id=$(ssh -o BatchMode=yes tig-gpu "$cmd" 2>/dev/null | tail -1)
+
+# ssh's stderr goes to a file rather than /dev/null, and every failure path
+# prints it. Discarding it made an unreachable host and a failed submit produce
+# the same message, which is the one distinction worth having here. The job id is
+# still read from stdout only, so a connect-timeout line cannot be mistaken for
+# one. Exit 4 means ssh itself failed; exit 3 means ssh succeeded and no job id
+# came back.
+err=$(mktemp)
+trap 'rm -f "$err"' EXIT
+
+rc=0
+id=$(ssh -o BatchMode=yes tig-gpu "$cmd" 2>"$err" | tail -1) || rc=$?
+if [ "$rc" -ne 0 ]; then
+    echo "ssh failed (exit $rc); the box may be unreachable. ssh said:" >&2
+    cat "$err" >&2
+    exit 4
+fi
 echo "job: $id"
 if [ -z "$id" ]; then
-    echo "gpuq submit produced no job id" >&2
+    echo "gpuq submit produced no job id; ssh succeeded. ssh said:" >&2
+    cat "$err" >&2
     exit 3
 fi
 if [ "${BOX_NO_WAIT:-0}" = "1" ]; then
     exit 0
 fi
 rc=0
-ssh -o BatchMode=yes tig-gpu "gpuq wait $id" 2>/dev/null || rc=$?
-ssh -o BatchMode=yes tig-gpu "gpuq show $id" 2>/dev/null
+ssh -o BatchMode=yes tig-gpu "gpuq wait $id" 2>"$err" || rc=$?
+if [ "$rc" -ne 0 ]; then
+    echo "gpuq wait exited $rc. ssh said:" >&2
+    cat "$err" >&2
+fi
+ssh -o BatchMode=yes tig-gpu "gpuq show $id" 2>"$err" || cat "$err" >&2
 exit $rc
