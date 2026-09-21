@@ -323,13 +323,22 @@ extern "C" __global__ void gan_sphere_combine(
 // times per instance, not a corner case. So the upper clamp is the largest
 // float below 1.0, written out.
 //
-// What makes that clamp worth its own test: the damage is silent. The smoothing
-// layer sums over EVERY tap, and a zero weight times an infinity is a NaN, so
-// one corrupted draw turns the whole 128-wide smoothed row into NaN -- not just
-// the taps near it. `logit + NaN > 0` is false for every coordinate, so
-// `any_open` stays 0 and gan_gate_apply's all-closed fallback replaces the row
-// with a one-hot vector. The output is still finite and still unit-norm, which
-// is why the 700,000-row unit-norm test cannot see it.
+// What makes that clamp worth its own test: the damage is silent, and it spreads.
+// The smoothing layer sums over EVERY tap. Under IEEE 754 rules a zero weight
+// times an infinity is a NaN, so one corrupted draw is expected to turn the whole
+// 128-wide smoothed row into NaN, not just the taps near it. `logit + NaN > 0` is
+// false for every coordinate, so `any_open` stays 0 and gan_gate_apply's
+// all-closed fallback replaces the row with a one-hot vector: still finite, still
+// unit-norm, which is why the 700,000-row unit-norm test cannot see it.
+//
+// That is what is expected, not something to reason from: this PTX is built with
+// --use_fast_math, and what a zero times an infinity does under it is not
+// guaranteed by the IEEE rules. The code does not rely on it either way. The
+// clamp is needed regardless, because an infinite noise value is wrong whatever
+// the smoothing map and the gate comparison then make of it -- NaN across the
+// row, or a single coordinate forced open or closed. The argument above says why
+// the wrongness is hard to SEE, which is the case for the dedicated test; it is
+// not the reason the clamp is there.
 //
 // Hence a function rather than an expression inlined into each caller: the
 // test-only test_gate_noise_from_uniform drives these two clamps directly, and

@@ -65,8 +65,10 @@ scenarios! {
 pub struct ScenarioConfig {
     pub n_queries: u32,
     pub database_size: u32,
-    /// Expected dims. Asserted against the blob's final layer so a mismatched
-    /// blob fails in tests rather than network-wide.
+    /// Expected dims. Asserted against the generator's `output_dim()` so a
+    /// mismatched blob fails in tests rather than network-wide. Not "the blob's
+    /// final layer": only the mlp architecture has one, and for the other two
+    /// `output_dim()` reads `direction.out_dim` or `magnitude_head.out_dim`.
     pub vector_dims: usize,
     pub weights: &'static [u8],
     /// Recall@1 a solution must declare to qualify. Per scenario because the
@@ -120,8 +122,8 @@ impl From<Scenario> for ScenarioConfig {
             //
             // min_recall's 0.9 was derived from measurements taken on
             // v1-generated SIFT instances, and has NOT been re-derived on the v4
-            // instances this arm now generates. The field comment below records
-            // where the figure came from.
+            // instances this arm now generates. The comment on the `min_recall`
+            // field, ABOVE in this file, records where the figure came from.
             //
             // `weights/v1_sift.bin` is no longer wired to any scenario. It
             // survives only as the `TIGGAN01` fixture in `gan_generator::v1`,

@@ -2451,11 +2451,17 @@ extern "C" __global__ void test_gate_noise_from_uniform(
     ///
     /// This is the only test that reaches those clamps. The 700,000-row
     /// unit-norm test cannot, because the damage is silent: an infinity in the
-    /// raw noise becomes a NaN across the WHOLE smoothed row, since the
-    /// smoothing layer sums every tap and a zero weight times an infinity is a
-    /// NaN. `logit + NaN > 0` is then false for every coordinate, so `any_open`
-    /// stays 0 and `gan_gate_apply`'s fallback replaces the row with a one-hot
-    /// vector -- finite, unit-norm, and wrong.
+    /// raw noise is expected to become a NaN across the WHOLE smoothed row, since
+    /// the smoothing layer sums every tap and, under IEEE 754 rules, a zero
+    /// weight times an infinity is a NaN. `logit + NaN > 0` is then false for
+    /// every coordinate, so `any_open` stays 0 and `gan_gate_apply`'s fallback
+    /// replaces the row with a one-hot vector -- finite, unit-norm, and wrong.
+    ///
+    /// The kernels are built with `--use_fast_math`, under which that zero-times-
+    /// infinity result is not guaranteed, so treat the paragraph above as what is
+    /// expected rather than as something to reason from. Nothing in the code
+    /// relies on it. The clamp is needed either way: an infinite noise value is
+    /// wrong whatever the smoothing map and the gate comparison then do with it.
     #[test]
     fn gate_noise_from_uniform_is_finite_at_both_ends_of_the_unit_interval() {
         // The kernel's upper clamp is the literal `0.99999994f`. These two
