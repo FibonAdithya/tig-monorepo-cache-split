@@ -414,20 +414,76 @@ pub(crate) mod tests {
     fn a_row_with_every_gate_closed_falls_back_to_the_argmax_logit() {
         let g = Generator::from_blob(SIFT).unwrap();
         let latent: Vec<f32> = (0..128).map(|i| ((i * 29 % 97) as f32) / 48.0 - 1.0).collect();
+        let Generator::StructuredGate(s) = &g else { panic!("expected the structured_gate variant") };
+
+        // Zero noise smooths to zero (the smoothing layer has no bias), so
+        // gate_margin_cpu returns the logits themselves: compute the
+        // expected argmax independently of forward_cpu's own fallback code.
+        let margins = s.gate_margin_cpu(&latent, &[0.0; 128]);
+        let max = margins.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let expected = margins.iter().position(|m| *m == max).unwrap();
+        let ties = margins.iter().filter(|m| **m == max).count();
+        assert_eq!(ties, 1, "the maximum logit must be unique in this row, or this test cannot tell first-argmax from last-argmax");
+
         // -1e6 everywhere closes every gate whatever the logits are (|logit| <= 4).
         // Smoothing is linear with positive weights, so the smoothed noise is
         // large and negative at every coordinate too.
         let out = g.forward_cpu(&latent, Some(&[-1.0e6; 128])).unwrap();
         let open: Vec<usize> = (0..128).filter(|j| out[*j] != 0.0).collect();
         assert_eq!(open.len(), 1, "exactly one coordinate is rescued");
+        // This rules out argmin and any other wrong index, but a tie-free
+        // row (asserted above) cannot by itself rule out a last-maximum
+        // implementation agreeing with a first-maximum one by coincidence;
+        // the_argmax_fallback_breaks_ties_toward_the_first_index covers that.
+        assert_eq!(open[0], expected, "the rescued coordinate must be the argmax logit");
         assert!((out[open[0]] - 1.0).abs() < 1e-6, "a one-hot row normalises to 1.0");
+    }
+
+    #[test]
+    fn the_argmax_fallback_breaks_ties_toward_the_first_index() {
+        let zero = |in_dim: usize, out_dim: usize| Layer {
+            in_dim,
+            out_dim,
+            weights: vec![0.0; in_dim * out_dim],
+            bias: vec![0.0; out_dim],
+        };
+        let mut smoothing = zero(4, 4);
+        for i in 0..4 {
+            smoothing.weights[i * 4 + i] = 1.0; // identity: preserves the noise's sign
+        }
+        let s = StructuredGate {
+            trunk: vec![zero(2, 2)],
+            magnitude_head: zero(2, 4),
+            gate_head: zero(2, 4),
+            sparsity_head: zero(2, 1),
+            coupling: zero(4, 4),
+            smoothing,
+            logit_clamp: 4.0,
+            magnitude_floor: 1e-6,
+            eps: 1e-8,
+        };
+        // Every weight and bias is zero, so every logit is exactly 0.0: a
+        // four-way tie. -1e6 noise through the identity smoothing closes
+        // every gate, so the fallback alone decides which coordinate opens.
+        // magnitude is softplus(0) = ln 2 at every coordinate, so a one-hot
+        // row still normalises to exactly 1.0.
+        let out = s.forward_cpu(&[0.0, 0.0], &[-1.0e6; 4]);
+        assert_eq!(out, vec![1.0, 0.0, 0.0, 0.0],
+            "the fallback must break the tie toward the FIRST index, as torch.argmax does; a last-maximum implementation would open index 3");
     }
 
     #[test]
     fn softplus_matches_pytorch_including_the_threshold() {
         use crate::gan_generator::structured_gate::softplus;
         assert!((softplus(0.0) - std::f32::consts::LN_2).abs() < 1e-7);
-        assert_eq!(softplus(25.0), 25.0, "above 20 PyTorch returns x unchanged");
+        // In f32, exp(x).ln_1p() already rounds to exactly x for any x from
+        // 20 up to about 88.7 (where exp(x) overflows f32 to infinity), so
+        // this pins the value at x=25 but does not exercise the x > 20
+        // branch: the branch and its absence agree here.
+        assert_eq!(softplus(25.0), 25.0, "pins the value at x=25; does not by itself exercise the x > 20 branch");
+        // exp(100.0) overflows f32 to infinity, and ln_1p(inf) is inf, so
+        // this assertion only passes because the branch returns x directly.
+        assert_eq!(softplus(100.0), 100.0, "without the x > 20 branch, exp(100) overflows f32 and ln_1p gives inf");
         assert!(softplus(-100.0) >= 0.0 && softplus(-100.0) < 1e-30);
     }
 
@@ -444,5 +500,69 @@ pub(crate) mod tests {
         let shapes = [(3, 4), (3, 1), (2, 3), (2, 1), (2, 3), (2, 1), (1, 3), (1, 1), (2, 3), (2, 2)];
         let b = container_bytes(1, 4, 2, &[4.0, 1e-6, 1e-8], &shapes);
         assert!(Generator::from_blob(&b).unwrap_err().to_string().contains("coupling"));
+    }
+
+    /// trunk 4->3, magnitude_head 3->2, gate_head 3->2, sparsity_head 3->1,
+    /// coupling 2x2, smoothing 2x2: every check passes with these shapes and
+    /// latent_dim 4 / output_dim 2, so each rejection test below changes
+    /// exactly one tuple (or the header) to break exactly one check.
+    const VALID_STRUCTURED_GATE: [(u32, u32); 10] =
+        [(3, 4), (3, 1), (2, 3), (2, 1), (2, 3), (2, 1), (1, 3), (1, 1), (2, 2), (2, 2)];
+
+    #[test]
+    fn structured_gate_rejects_a_trunk_that_does_not_consume_latent_dim() {
+        // trunk still declares in_dim 4 (shape (3, 4) is unchanged), but the
+        // header now claims latent_dim 5: only the trunk-vs-latent_dim check
+        // can fail. magnitude_head/gate_head/sparsity_head still match
+        // hidden=3, and coupling/smoothing still match output_dim=2.
+        let b = container_bytes(1, 5, 2, &[4.0, 1e-6, 1e-8], &VALID_STRUCTURED_GATE);
+        assert!(Generator::from_blob(&b).unwrap_err().to_string().contains("consume latent_dim"));
+    }
+
+    #[test]
+    fn structured_gate_rejects_a_magnitude_head_of_the_wrong_width() {
+        // magnitude_head W/b now declare out_dim 5 instead of output_dim 2;
+        // in_dim is still 3, matching hidden. trunk, gate_head,
+        // sparsity_head, coupling and smoothing are all untouched and still
+        // consistent with latent_dim 4 / hidden 3 / output_dim 2.
+        let mut shapes = VALID_STRUCTURED_GATE;
+        shapes[2] = (5, 3);
+        shapes[3] = (5, 1);
+        let b = container_bytes(1, 4, 2, &[4.0, 1e-6, 1e-8], &shapes);
+        assert!(Generator::from_blob(&b).unwrap_err().to_string().contains("magnitude_head"));
+    }
+
+    #[test]
+    fn structured_gate_rejects_a_gate_head_of_the_wrong_width() {
+        // gate_head W/b now declare out_dim 5 instead of output_dim 2;
+        // trunk, magnitude_head, sparsity_head, coupling and smoothing are
+        // all untouched and still consistent.
+        let mut shapes = VALID_STRUCTURED_GATE;
+        shapes[4] = (5, 3);
+        shapes[5] = (5, 1);
+        let b = container_bytes(1, 4, 2, &[4.0, 1e-6, 1e-8], &shapes);
+        assert!(Generator::from_blob(&b).unwrap_err().to_string().contains("gate_head"));
+    }
+
+    #[test]
+    fn structured_gate_rejects_a_non_square_smoothing() {
+        // smoothing is now 3x2 (in_dim 2 still matches output_dim, out_dim 3
+        // does not). trunk, magnitude_head, gate_head, sparsity_head and
+        // coupling are all untouched and still consistent.
+        let mut shapes = VALID_STRUCTURED_GATE;
+        shapes[9] = (3, 2);
+        let b = container_bytes(1, 4, 2, &[4.0, 1e-6, 1e-8], &shapes);
+        assert!(Generator::from_blob(&b).unwrap_err().to_string().contains("smoothing"));
+    }
+
+    #[test]
+    fn structured_gate_rejects_a_non_positive_logit_clamp() {
+        // shapes are the valid fixture throughout; only scalars[0]
+        // (logit_clamp) is bad. NaN is already covered by expect_scalars'
+        // finiteness check, so it is not exercised here.
+        let zero = container_bytes(1, 4, 2, &[0.0, 1e-6, 1e-8], &VALID_STRUCTURED_GATE);
+        assert!(Generator::from_blob(&zero).unwrap_err().to_string().contains("logit_clamp must be positive"));
+        let negative = container_bytes(1, 4, 2, &[-4.0, 1e-6, 1e-8], &VALID_STRUCTURED_GATE);
+        assert!(Generator::from_blob(&negative).unwrap_err().to_string().contains("logit_clamp must be positive"));
     }
 }
