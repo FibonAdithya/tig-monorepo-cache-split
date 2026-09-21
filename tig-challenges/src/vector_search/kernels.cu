@@ -255,11 +255,36 @@ extern "C" __global__ void gan_row_normalize(
 // kernel measures 85-87 ms on five later runs of the full suite, against a
 // 150 ms gate. Both figures are the same PTX (56 registers, 27,720 bytes of
 // shared memory), so the spread is the card's clocks, not the code. The
-// timing table above and the 27,720-byte figure were both measured at
-// AUDIT_MAX_DIMS = 128. At AUDIT_MAX_DIMS = 256, shared memory is 36,936
-// bytes (18*256*4 + 256*17*4 + 256*4 + 18*4 = 18,432 + 17,408 + 1,024 + 72),
-// computed from the __shared__ declarations below, not read from ptxas. No
-// timing at 256 has been measured yet.
+// timing table above and the 27,720-byte figure were both measured on an
+// RTX 3060 at AUDIT_MAX_DIMS = 128. At AUDIT_MAX_DIMS = 256, shared memory
+// is 36,936 bytes (18*256*4 + 256*17*4 + 256*4 + 18*4 = 18,432 + 17,408 +
+// 1,024 + 72), computed from the __shared__ declarations below, not read
+// from ptxas.
+//
+// MEASURED on 2026-09-21, on an RTX 3060 Ti (compute capability 8.6, CUDA
+// 12.8, PTX built -arch compute_70 -code sm_70 --use_fast_math, the same
+// target as above), recall_audit_tests, SIFT_128 -- the same 1,000-sample,
+// 700,000 x 128 workload as the table above -- best of three, three
+// separate whole-suite runs each:
+//
+//   AUDIT_MAX_DIMS = 128   87, 87, 87 ms
+//   AUDIT_MAX_DIMS = 256   88, 88, 87 ms   <- this commit; 21/21 tests green
+//
+// Raising the staging width from 128 to 256 dims cost at most 1 ms here: the
+// concern that a wider s_query would cost a resident block -- the 107 -> 182
+// ms step the table above records between AUDIT_TQ 22 and 23 -- did not
+// materialise at AUDIT_TQ = 18. Both rows above were taken on the same
+// RTX 3060 Ti on the same day, so that pair is a like-for-like comparison;
+// neither row is directly comparable to the AUDIT_TQ table above, which was
+// taken on a different card, an RTX 3060.
+//
+// Not measured: AUDIT_TQ was not re-swept at 256, so 18 is known to be
+// acceptable at that width, not known to be optimal for it. Also not
+// measured: any scenario that actually declares 256 dims, where each staged
+// query is twice as wide and the per-row distance loop runs twice as long --
+// SIFT_128 stays at 128 dims regardless of AUDIT_MAX_DIMS, so nothing above
+// exercises that cost. The first such number comes from the NYTimes
+// scenario's box run.
 //
 // The curve is not monotonic, and neither end of it is where the cost lives:
 //
