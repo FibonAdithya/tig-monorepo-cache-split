@@ -550,10 +550,25 @@ mod track_tests {
     }
 
     #[test]
+    fn glove_track_uses_the_protocol_wire_form() {
+        let encoded = serde_json::to_string(&Track {
+            s: Scenario::GLOVE_100,
+        })
+        .unwrap();
+        assert_eq!(encoded, r#""s=glove_100""#);
+        let track: Track = serde_json::from_str(r#""s=glove_100""#).unwrap();
+        assert_eq!(track.s, Scenario::GLOVE_100);
+    }
+
+    #[test]
     fn track_rejects_unknown_scenario() {
-        let err = serde_json::from_str::<Track>(r#""s=glove_300""#).unwrap_err();
+        // `deep_96`, not `glove_300`: glove_100 is a real scenario now, and a
+        // rejection test whose input is one character away from a valid name
+        // is one typo away from asserting nothing. `deep_96` is a corpus this
+        // crate does not ship.
+        let err = serde_json::from_str::<Track>(r#""s=deep_96""#).unwrap_err();
         assert!(
-            err.to_string().contains("glove_300"),
+            err.to_string().contains("deep_96"),
             "error should name the offending scenario, got: {}",
             err
         );
@@ -794,11 +809,10 @@ extern "C" __global__ void reference_nn_search(
         })
     }
 
-    /// A real instance on a real GPU. Panics with an actionable message if
-    /// there is no CUDA device -- again, no skip path.
-    fn gpu_instance(
-        seed_byte: u8,
-    ) -> (Challenge, Arc<CudaModule>, Arc<CudaStream>, cudaDeviceProp) {
+    /// A module and stream on a real GPU, with no instance attached. Panics
+    /// with an actionable message if there is no CUDA device -- no skip path,
+    /// for the same reason `nvcc_path` has none.
+    fn gpu_context() -> (Arc<CudaModule>, Arc<CudaStream>) {
         let ptx = Ptx::from_file(test_ptx_path().clone());
         let ctx = CudaContext::new(0).unwrap_or_else(|e| {
             panic!(
@@ -808,12 +822,17 @@ extern "C" __global__ void reference_nn_search(
             )
         });
         ctx.set_blocking_synchronize().unwrap();
-        let module = ctx.load_module(ptx).unwrap();
-        let stream = ctx.default_stream();
+        (ctx.load_module(ptx).unwrap(), ctx.default_stream())
+    }
+
+    /// A real instance on a real GPU, on the caller's scenario.
+    fn gpu_instance_for(
+        scenario: Scenario,
+        seed_byte: u8,
+    ) -> (Challenge, Arc<CudaModule>, Arc<CudaStream>, cudaDeviceProp) {
+        let (module, stream) = gpu_context();
         let prop = get_device_prop(0).unwrap();
-        let track = Track {
-            s: Scenario::SIFT_128,
-        };
+        let track = Track { s: scenario };
         let challenge = Challenge::generate_instance(
             // The two fields must never hold the same bytes. `db` seeds the
             // database and `nonce` seeds the queries, so identical bytes would
@@ -832,6 +851,15 @@ extern "C" __global__ void reference_nn_search(
         )
         .unwrap();
         (challenge, module, stream, prop)
+    }
+
+    /// The SIFT_128 instance every test here used before there was a second
+    /// scenario. Kept so those tests still read as being about the audit
+    /// rather than about which corpus they run on.
+    fn gpu_instance(
+        seed_byte: u8,
+    ) -> (Challenge, Arc<CudaModule>, Arc<CudaStream>, cudaDeviceProp) {
+        gpu_instance_for(Scenario::SIFT_128, seed_byte)
     }
 
     // The three floats that make the hit tolerance's two edges reachable, and
@@ -1770,5 +1798,194 @@ extern "C" __global__ void reference_nn_search(
             got, at_zero,
             "Database::generate must sample latents from index_base 0"
         );
+    }
+
+    // ---- Cross-scenario probes -------------------------------------------
+    //
+    // Everything below is written against a `Scenario` parameter rather than
+    // against SIFT_128, because what they check is the GPU driver, not the
+    // corpus: a second architecture or a second blob must satisfy the same
+    // four properties. Each helper is called by a `#[test]` per scenario, so a
+    // failure names the scenario in the test name as well as in the message.
+
+    /// GPU forward == CPU reference, on the inputs the GPU actually drew.
+    ///
+    /// Reading the latents back off the device rather than redrawing them on
+    /// the host is the point: it compares the two forward passes on identical
+    /// inputs, so a curand difference cannot be mistaken for a forward-pass
+    /// difference (and could not be reproduced on the host anyway).
+    ///
+    /// Returns how many rows were compared (rows with a gate margin too close
+    /// to zero are skipped; see the structured_gate caller).
+    fn assert_gpu_matches_cpu(
+        scenario: Scenario,
+        skip_row: impl Fn(&Generator, &[f32], Option<&[f32]>) -> bool,
+    ) -> usize {
+        const ROWS: usize = 1024;
+        let (module, stream) = gpu_context();
+        let generator = Generator::from_blob(ScenarioConfig::from(scenario).weights).unwrap();
+        let (latent_dim, out_dim) = (generator.latent_dim(), generator.output_dim());
+        let d_seed = stream.memcpy_stod(&[7u8; 32]).unwrap();
+        let mut device = generator::DeviceGenerator::new(
+            &generator,
+            ROWS,
+            generator::ROW_BLOCK,
+            &module,
+            stream.clone(),
+        )
+        .unwrap();
+        let mut dest = stream.alloc_zeros::<f32>(ROWS * out_dim).unwrap();
+        device.sample_inputs(&d_seed, ROWS, 0).unwrap();
+        device.forward(ROWS, &mut dest, 0).unwrap();
+        stream.synchronize().unwrap();
+        let got = stream.memcpy_dtov(&dest).unwrap();
+        let (latents, noise) = device.read_inputs(ROWS).unwrap();
+
+        let mut compared = 0;
+        for row in 0..ROWS {
+            let latent = &latents[row * latent_dim..(row + 1) * latent_dim];
+            let row_noise = noise.as_ref().map(|n| &n[row * out_dim..(row + 1) * out_dim]);
+            if skip_row(&generator, latent, row_noise) {
+                continue;
+            }
+            let expected = generator.forward_cpu(latent, row_noise).unwrap();
+            for j in 0..out_dim {
+                let g = got[row * out_dim + j];
+                assert!(
+                    (g - expected[j]).abs() < 1e-5,
+                    "{} row {} coord {}: gpu {} cpu {}",
+                    scenario,
+                    row,
+                    j,
+                    g,
+                    expected[j]
+                );
+            }
+            compared += 1;
+        }
+        compared
+    }
+
+    #[test]
+    fn glove_gpu_forward_matches_the_cpu_reference() {
+        // The returned count is asserted, not discarded: a `skip_row` that
+        // skipped everything would make the loop body unreachable and the test
+        // vacuous. This caller skips nothing, so all 1024 rows must compare.
+        assert_eq!(assert_gpu_matches_cpu(Scenario::GLOVE_100, |_, _, _| false), 1024);
+    }
+
+    fn generated_rows(
+        scenario: Scenario,
+        seed: [u8; 32],
+        count: usize,
+        chunk: usize,
+        row_block: u32,
+    ) -> Vec<f32> {
+        let (module, stream) = gpu_context();
+        let generator = Generator::from_blob(ScenarioConfig::from(scenario).weights).unwrap();
+        let mut dest = stream
+            .alloc_zeros::<f32>(count * generator.output_dim())
+            .unwrap();
+        generate_vectors_with(
+            &seed,
+            count,
+            0,
+            &mut dest,
+            &generator,
+            module,
+            stream.clone(),
+            chunk,
+            row_block,
+        )
+        .unwrap();
+        stream.synchronize().unwrap();
+        stream.memcpy_dtov(&dest).unwrap()
+    }
+
+    /// Bit-exact equality across the four geometries the 2026-08-25 spec used,
+    /// and a different seed as the control that the comparison can fail.
+    /// Over 200,000 rows, not the full 700,000: enough for four chunks at the
+    /// smallest chunk size, and a third of the generation time.
+    fn assert_invariant_to_launch_geometry(scenario: Scenario) {
+        const COUNT: usize = 200_000;
+        let reference = generated_rows(scenario, [3u8; 32], COUNT, 65_536, 256);
+        for (chunk, block) in [(32_768, 256), (65_536, 128), (131_072, 512)] {
+            let other = generated_rows(scenario, [3u8; 32], COUNT, chunk, block);
+            let differing = reference
+                .iter()
+                .zip(&other)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert_eq!(
+                differing, 0,
+                "{}: chunk {} block {} changed {} values",
+                scenario, chunk, block, differing
+            );
+        }
+        // Without this the equalities above are satisfied by any function that
+        // returns a constant -- including one that never ran the generator.
+        let control = generated_rows(scenario, [4u8; 32], COUNT, 65_536, 256);
+        assert!(
+            reference
+                .iter()
+                .zip(&control)
+                .any(|(a, b)| a.to_bits() != b.to_bits()),
+            "a different seed must change the output"
+        );
+    }
+
+    #[test]
+    fn glove_output_is_invariant_to_launch_geometry() {
+        assert_invariant_to_launch_geometry(Scenario::GLOVE_100);
+    }
+
+    /// Every database row is unit-norm. Returns the rows for further checks.
+    fn assert_database_rows_are_unit_norm(scenario: Scenario) -> (Vec<f32>, usize) {
+        let (challenge, _module, stream, _prop) = gpu_instance_for(scenario, 11);
+        let dims = challenge.vector_dims as usize;
+        let rows = stream.memcpy_dtov(&challenge.d_database_vectors).unwrap();
+        // Against the challenge's own declared size, not a literal: a literal
+        // would silently tie this helper to one scenario's row count.
+        assert_eq!(rows.len(), challenge.database_size as usize * dims);
+        for (i, row) in rows.chunks_exact(dims).enumerate() {
+            // Accumulated in f64 so the tolerance measures the GPU's
+            // normalisation and not the host's summation of 100 f32 squares.
+            let norm = row.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>().sqrt();
+            assert!((norm - 1.0).abs() < 1e-4, "{} row {} has norm {}", scenario, i, norm);
+        }
+        (rows, dims)
+    }
+
+    #[test]
+    fn glove_database_rows_are_unit_norm() {
+        assert_database_rows_are_unit_norm(Scenario::GLOVE_100);
+    }
+
+    /// The same two probes `exact_1nn_measures_recall_1` and
+    /// `all_zeros_measures_recall_near_0` run on SIFT, on another scenario.
+    /// GloVe's 100 dims are not a multiple of the audit kernel's AUDIT_KC = 16,
+    /// so this is where a staging loop that assumes a whole number of column
+    /// groups shows up: over-counting breaks the all-zeros bound, under-counting
+    /// breaks the exact-1-NN equality.
+    fn assert_recall_probes(scenario: Scenario) {
+        let (challenge, module, stream, prop) = gpu_instance_for(scenario, 1);
+        let exact = brute_force_1nn(&challenge, module.clone(), stream.clone());
+        let r = challenge
+            .measure_recall(&exact, &[9u8; 32], module.clone(), stream.clone(), &prop)
+            .unwrap();
+        assert_eq!(r, 1.0, "{}: the exact 1-NN must score recall 1.0", scenario);
+
+        let zeros = Solution {
+            indexes: vec![0; challenge.num_queries as usize],
+        };
+        let r = challenge
+            .measure_recall(&zeros, &[9u8; 32], module, stream, &prop)
+            .unwrap();
+        assert!(r < 0.01, "{}: all-zeros scored recall {}", scenario, r);
+    }
+
+    #[test]
+    fn recall_probes_hold_on_glove() {
+        assert_recall_probes(Scenario::GLOVE_100);
     }
 }

@@ -121,13 +121,65 @@ mod tests {
     }
 
     #[test]
+    fn glove_wire_string_is_literal() {
+        // The literal, for the same reason the SIFT test above pins one: this
+        // is what the protocol puts in settings.track_id.
+        assert_eq!(Scenario::GLOVE_100.to_string(), "glove_100");
+        assert_eq!(Scenario::from_str("glove_100").unwrap(), Scenario::GLOVE_100);
+        assert_eq!(Scenario::from_str("GLOVE_100").unwrap(), Scenario::GLOVE_100);
+    }
+
+    #[test]
     fn scenario_from_str_rejects_unknown() {
-        let err = Scenario::from_str("glove_300").unwrap_err();
+        // `deep_96`, not `glove_300`: glove_100 is a real scenario now, and a
+        // rejection test whose input is one character away from a valid name
+        // is one typo away from asserting nothing.
+        let err = Scenario::from_str("deep_96").unwrap_err();
         assert!(
-            err.to_string().contains("glove_300"),
+            err.to_string().contains("deep_96"),
             "error should name the offending input, got: {}",
             err
         );
+    }
+
+    #[test]
+    fn every_scenario_blob_matches_its_declared_dims() {
+        // Iterate over ALL variants, not just the one being added, so a future
+        // scenario cannot silently skip this check. A mismatch here would
+        // otherwise surface as network-wide verification failure.
+        for scenario in Scenario::ALL {
+            let config = ScenarioConfig::from(scenario);
+            let generator = crate::gan_generator::Generator::from_blob(config.weights)
+                .unwrap_or_else(|e| panic!("scenario {} has an unparseable blob: {}", scenario, e));
+            assert_eq!(generator.output_dim(), config.vector_dims, "scenario {}", scenario);
+            // `super::super::AUDIT_MAX_DIMS` resolves without any `pub`: a
+            // descendant module may name an ancestor's private items. Do not
+            // "fix" that constant's visibility -- lib.rs finds it by the exact
+            // text `const AUDIT_MAX_DIMS: u32 = `.
+            assert!(
+                config.vector_dims as u32 <= super::super::AUDIT_MAX_DIMS,
+                "scenario {} has {} dims but the audit kernel stages at most {}",
+                scenario,
+                config.vector_dims,
+                super::super::AUDIT_MAX_DIMS
+            );
+            // The instance shape and the recall bar are shared across
+            // scenarios by design; a variant that quietly diverged would move
+            // the audit's launch geometry or the qualifying bar without any
+            // other test noticing.
+            assert_eq!(
+                (config.n_queries, config.database_size),
+                (7_000, 700_000),
+                "scenario {}",
+                scenario
+            );
+            assert_eq!(
+                (config.min_recall, config.recall_tolerance, config.audit_samples),
+                (0.9, 1e-6, 1_000),
+                "scenario {}",
+                scenario
+            );
+        }
     }
 
     #[test]
