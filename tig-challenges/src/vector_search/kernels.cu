@@ -263,9 +263,13 @@ extern "C" __global__ void gan_row_normalize(
 //
 // MEASURED on 2026-09-21, on an RTX 3060 Ti (compute capability 8.6, CUDA
 // 12.8, PTX built -arch compute_70 -code sm_70 --use_fast_math, the same
-// target as above), recall_audit_tests, SIFT_128 -- the same 1,000-sample,
-// 700,000 x 128 workload as the table above -- best of three, three
-// separate whole-suite runs each:
+// target as above): recall_audit_tests' timed test,
+// audit_is_much_cheaper_than_a_naive_solve, over SIFT_128 -- the same
+// 1,000-sample, 700,000 x 128 workload as the table above. Each value below
+// is one run's own best-of-three, as that test prints it. The three runs at
+// AUDIT_MAX_DIMS = 128 ran the whole crate's test suite; the three runs at
+// AUDIT_MAX_DIMS = 256 ran the recall_audit_tests module only. The timed
+// test and its workload were identical in both:
 //
 //   AUDIT_MAX_DIMS = 128   87, 87, 87 ms
 //   AUDIT_MAX_DIMS = 256   88, 88, 87 ms   <- this commit; 21/21 tests green
@@ -274,9 +278,13 @@ extern "C" __global__ void gan_row_normalize(
 // concern that a wider s_query would cost a resident block -- the 107 -> 182
 // ms step the table above records between AUDIT_TQ 22 and 23 -- did not
 // materialise at AUDIT_TQ = 18. Both rows above were taken on the same
-// RTX 3060 Ti on the same day, so that pair is a like-for-like comparison;
-// neither row is directly comparable to the AUDIT_TQ table above, which was
-// taken on a different card, an RTX 3060.
+// RTX 3060 Ti on the same day, running the same timed test over the same
+// workload, so that pair is a like-for-like comparison on those points -- but
+// not on the neighbouring load, since the 128 runs ran the whole suite and
+// the 256 runs ran only recall_audit_tests. A 1 ms difference is within what
+// that could explain, so read this as no measurable cost, not as exactly
+// 1 ms. Neither row is directly comparable to the AUDIT_TQ table above,
+// which was taken on a different card, an RTX 3060.
 //
 // Not measured: AUDIT_TQ was not re-swept at 256, so 18 is known to be
 // acceptable at that width, not known to be optimal for it. Also not
