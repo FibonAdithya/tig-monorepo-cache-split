@@ -314,7 +314,7 @@ extern "C" __global__ void gan_sphere_combine(
 // are disjoint for the same seed word.
 #define GATE_NOISE_SEQUENCE_BASE (1ULL << 40)
 
-// Logistic noise for the structured gate: log(u) - log1p(-u), u uniform.
+// Logistic noise from one uniform draw: log(u) - log1p(-u).
 //
 // curand_uniform returns (0, 1], and in float32 `1 - 1e-8` IS 1.0, so the
 // PyTorch-style clamp(eps, 1 - eps) would let u = 1.0 through: log1p(-1) is
@@ -322,6 +322,31 @@ extern "C" __global__ void gan_sphere_combine(
 // meets a -inf. At 89.6 million draws per database that is expected several
 // times per instance, not a corner case. So the upper clamp is the largest
 // float below 1.0, written out.
+//
+// What makes that clamp worth its own test: the damage is silent. The smoothing
+// layer sums over EVERY tap, and a zero weight times an infinity is a NaN, so
+// one corrupted draw turns the whole 128-wide smoothed row into NaN -- not just
+// the taps near it. `logit + NaN > 0` is false for every coordinate, so
+// `any_open` stays 0 and gan_gate_apply's all-closed fallback replaces the row
+// with a one-hot vector. The output is still finite and still unit-norm, which
+// is why the 700,000-row unit-norm test cannot see it.
+//
+// Hence a function rather than an expression inlined into each caller: the
+// test-only test_gate_noise_from_uniform drives these two clamps directly, and
+// it drives THESE, not a copy. A test kernel that repeated the expression would
+// still pass with the clamp removed from the shipped kernel, which is exactly
+// the mutation that went uncaught.
+//
+// `__device__ __forceinline__`, the form ref_before in mod.rs's reference kernel
+// already uses.
+__device__ __forceinline__ float gate_noise_from_uniform(float u, const float eps)
+{
+    if (u > 0.99999994f) u = 0.99999994f;
+    if (u < eps) u = eps;
+    return logf(u) - log1pf(-u);
+}
+
+// One logistic draw per output coordinate, for the rows of this chunk.
 extern "C" __global__ void gan_gate_noise(
     const uint8_t *seed,
     const int n,
@@ -340,10 +365,7 @@ extern "C" __global__ void gan_gate_noise(
                     GATE_NOISE_SEQUENCE_BASE + (unsigned long long)global_i, 0, &state);
         float *row = noise + (long long)i * dim;
         for (int j = 0; j < dim; ++j) {
-            float u = curand_uniform(&state);
-            if (u > 0.99999994f) u = 0.99999994f;
-            if (u < eps) u = eps;
-            row[j] = logf(u) - log1pf(-u);
+            row[j] = gate_noise_from_uniform(curand_uniform(&state), eps);
         }
     }
 }
