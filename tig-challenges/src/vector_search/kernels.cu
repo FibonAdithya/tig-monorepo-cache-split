@@ -517,7 +517,10 @@ extern "C" __global__ void gan_gate_apply(
 // query is twice as wide and the per-row distance loop runs twice as long --
 // SIFT_128 stays at 128 dims regardless of AUDIT_MAX_DIMS, so nothing above
 // exercises that cost. The first such number comes from the NYTimes
-// scenario's box run.
+// scenario's box run. Every timing in this file was taken on one of two
+// Ampere cards (RTX 3060, RTX 3060 Ti); none was taken on another
+// architecture, so none of these figures should be assumed to hold across
+// the GPUs miners run.
 //
 // The curve is not monotonic, and neither end of it is where the cost lives:
 //
