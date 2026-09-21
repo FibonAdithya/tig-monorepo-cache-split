@@ -590,6 +590,10 @@ mod track_tests {
 mod recall_audit_tests {
     use super::*;
     use crate::audit_sampling::sample_query_ids;
+    // For the hand-built generator in
+    // `gate_apply_handles_the_softplus_overflow_range_and_the_tied_fallback`;
+    // every other test here gets its generator from a scenario blob.
+    use crate::gan_generator::{Layer, StructuredGate};
     use cudarc::{driver::CudaContext, nvrtc::Ptx, runtime::result::device::get_device_prop};
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -734,6 +738,32 @@ extern "C" __global__ void reference_nn_search(
     if (threadIdx.x == 0) {
         out_indexes[q] = s_idx[0];
         out_second_indexes[q] = s_sidx[0];
+    }
+}
+
+// TEST ONLY. `gan_gate_noise` with GATE_NOISE_SEQUENCE_BASE removed from the
+// curand sequence, and textually identical to it in every other respect --
+// both clamps included. It exists so that
+// sift_gate_noise_does_not_reuse_the_latent_sequence can compare the
+// production noise against what the UNSHIFTED sequence produces: if the base
+// were dropped from kernels.cu the two would agree bit for bit. Keep it in
+// step with gan_gate_noise; a divergence anywhere else would make that test
+// pass for the wrong reason.
+extern "C" __global__ void test_gate_noise_unshifted(
+    const uint8_t *seed, const int n, const int dim, const float eps,
+    float *noise, const int index_offset)
+{
+    for (int i = threadIdx.x + blockIdx.x * blockDim.x; i < n; i += blockDim.x * gridDim.x) {
+        const int global_i = index_offset + i;
+        curandState state;
+        curand_init(((const uint64_t *)(seed))[global_i % 4], global_i, 0, &state);
+        float *row = noise + (long long)i * dim;
+        for (int j = 0; j < dim; ++j) {
+            float u = curand_uniform(&state);
+            if (u > 0.99999994f) u = 0.99999994f;
+            if (u < eps) u = eps;
+            row[j] = logf(u) - log1pf(-u);
+        }
     }
 }
 "#;
@@ -1832,13 +1862,26 @@ extern "C" __global__ void reference_nn_search(
         scenario: Scenario,
         skip_row: impl Fn(&Generator, &[f32], Option<&[f32]>) -> bool,
     ) -> usize {
+        let generator = Generator::from_blob(ScenarioConfig::from(scenario).weights).unwrap();
+        assert_generator_gpu_matches_cpu(&scenario.to_string(), &generator, skip_row).0
+    }
+
+    /// The body of `assert_gpu_matches_cpu`, taking a `Generator` rather than a
+    /// `Scenario` so that a test can drive a hand-built generator through the
+    /// real `DeviceGenerator`. `label` is what a failure names in place of the
+    /// scenario. Returns the compared-row count and the whole GPU output, so a
+    /// caller can assert on the values as well as on the match.
+    fn assert_generator_gpu_matches_cpu(
+        label: &str,
+        generator: &Generator,
+        skip_row: impl Fn(&Generator, &[f32], Option<&[f32]>) -> bool,
+    ) -> (usize, Vec<f32>) {
         const ROWS: usize = 1024;
         let (module, stream) = gpu_context();
-        let generator = Generator::from_blob(ScenarioConfig::from(scenario).weights).unwrap();
         let (latent_dim, out_dim) = (generator.latent_dim(), generator.output_dim());
         let d_seed = stream.memcpy_stod(&[7u8; 32]).unwrap();
         let mut device = generator::DeviceGenerator::new(
-            &generator,
+            generator,
             ROWS,
             generator::ROW_BLOCK,
             &module,
@@ -1856,7 +1899,7 @@ extern "C" __global__ void reference_nn_search(
         for row in 0..ROWS {
             let latent = &latents[row * latent_dim..(row + 1) * latent_dim];
             let row_noise = noise.as_ref().map(|n| &n[row * out_dim..(row + 1) * out_dim]);
-            if skip_row(&generator, latent, row_noise) {
+            if skip_row(generator, latent, row_noise) {
                 continue;
             }
             let expected = generator.forward_cpu(latent, row_noise).unwrap();
@@ -1865,7 +1908,7 @@ extern "C" __global__ void reference_nn_search(
                 assert!(
                     (g - expected[j]).abs() < 1e-5,
                     "{} row {} coord {}: gpu {} cpu {}",
-                    scenario,
+                    label,
                     row,
                     j,
                     g,
@@ -1874,7 +1917,7 @@ extern "C" __global__ void reference_nn_search(
             }
             compared += 1;
         }
-        compared
+        (compared, got)
     }
 
     #[test]
@@ -1889,6 +1932,117 @@ extern "C" __global__ void reference_nn_search(
     fn nytimes_gpu_forward_matches_the_cpu_reference() {
         // Skips nothing, so all 1024 rows must compare -- see the GloVe caller.
         assert_eq!(assert_gpu_matches_cpu(Scenario::NYTIMES_256, |_, _, _| false), 1024);
+    }
+
+    /// Rows where some gate's margin is within 1e-4 of zero are skipped: the
+    /// GPU's tanh and the CPU's differ in the last bits, a gate that close can
+    /// legitimately fall either way, and a flipped gate changes the whole row.
+    /// ESTIMATE (unverified): about 4 of 1024 rows. The assertion below fails
+    /// if far more are skipped, so the skip cannot hide a broken kernel.
+    #[test]
+    fn sift_gpu_forward_matches_the_cpu_reference() {
+        let compared = assert_gpu_matches_cpu(Scenario::SIFT_128, |generator, latent, noise| {
+            let Generator::StructuredGate(s) = generator else { panic!("SIFT_128 should be structured_gate") };
+            s.gate_margin_cpu(latent, noise.unwrap()).iter().any(|m| m.abs() < 1e-4)
+        });
+        assert!(compared >= 1000, "only {compared} of 1024 rows were comparable");
+    }
+
+    /// The two branches of `gan_gate_apply` that real SIFT weights never reach,
+    /// driven by a hand-built generator through the real `DeviceGenerator`.
+    ///
+    /// (i) The softplus threshold. In f32, `log1p(exp(x)) == x` for every x from
+    /// 20 up to about 88.7, and is `inf` above that (MEASURED: equal at 20.5,
+    /// 25, 50 and 88; `inf` at 89 and 100). So a kernel missing the
+    /// `m[j] > 20.0f` branch is indistinguishable from a correct one unless a
+    /// magnitude pre-activation exceeds about 88.7. Here every pre-activation is
+    /// exactly 128, so a missing branch computes `log1p(exp(128))` =
+    /// `log1p(inf)` = `inf` and the row normalises to NaN.
+    ///
+    /// (ii) The all-gates-closed fallback and its FIRST-maximum tie-break. All
+    /// weights are zero, so every coordinate's logit is computed from
+    /// bit-identical inputs: `4 * tanh(-50 / 4)` = `4 * tanh(-12.5)`. tanh(12.5)
+    /// is 1 - 2.8e-11, which rounds to 1.0 in f32, so each logit is -4.0 and the
+    /// four-way maximum is an exact tie -- only the tie-break decides which
+    /// coordinate the fallback opens. A gate opens only when its own logistic
+    /// noise exceeds +4, which has probability 1/(1 + e^4) = 0.01799.
+    ///
+    /// The magnitude bias is 128 rather than 100. Both are far above the f32
+    /// overflow point, so (i) holds either way, but `--use_fast_math` makes
+    /// division and sqrt approximate: a fallback row's norm is sqrt(128^2) =
+    /// sqrt(2^14) = 2^7 and 128/128 = 1 exactly for any approximation that is
+    /// exact at powers of two, while an approximate reciprocal of 100 need not
+    /// give exactly 1.0 -- which would fail the exact-one-hot assertion below
+    /// for a reason that is not a defect.
+    #[test]
+    fn gate_apply_handles_the_softplus_overflow_range_and_the_tied_fallback() {
+        // Row-major [out_dim][in_dim], as `gan_linear` and `dense_cpu` index it.
+        let zero = |out_dim: usize, in_dim: usize, bias: Vec<f32>| Layer {
+            in_dim,
+            out_dim,
+            weights: vec![0.0; out_dim * in_dim],
+            bias,
+        };
+        let identity: Vec<f32> = (0..4)
+            .flat_map(|r| (0..4).map(move |c| if r == c { 1.0 } else { 0.0 }))
+            .collect();
+        let generator = Generator::StructuredGate(StructuredGate {
+            trunk: vec![zero(2, 2, vec![0.0; 2])],
+            magnitude_head: zero(4, 2, vec![128.0; 4]),
+            gate_head: zero(4, 2, vec![0.0; 4]),
+            sparsity_head: zero(1, 2, vec![-50.0]),
+            coupling: zero(4, 4, vec![0.0; 4]),
+            // Identity, so the smoothed noise IS the drawn logistic noise and
+            // the margin is logit + noise with nothing in between.
+            smoothing: Layer { in_dim: 4, out_dim: 4, weights: identity, bias: vec![0.0; 4] },
+            logit_clamp: 4.0,
+            magnitude_floor: 1e-6,
+            eps: 1e-8,
+        });
+
+        let (compared, got) = assert_generator_gpu_matches_cpu(
+            "tied_gate",
+            &generator,
+            |generator, latent, noise| {
+                let Generator::StructuredGate(s) = generator else {
+                    panic!("the literal above is a structured_gate")
+                };
+                s.gate_margin_cpu(latent, noise.unwrap()).iter().any(|m| m.abs() < 1e-4)
+            },
+        );
+        // The logistic density at 4 is e^-4 / (1 + e^-4)^2 = 0.01766, so a margin
+        // lands within 1e-4 of zero with probability 2e-4 * 0.01766 = 3.5e-6 per
+        // coordinate and 0.0145 per 4,096-coordinate run: about one skipped row
+        // every 70 runs. If many are skipped the tie construction has broken and
+        // the assertions below would be measuring nothing.
+        assert!(compared >= 1000, "only {compared} of 1024 rows were comparable");
+        assert!(got.iter().all(|v| v.is_finite()), "the gate output contains inf or NaN");
+
+        // Fallback rows: all four gates closed, so the kernel opens the first
+        // argmax and the row is exactly [1, 0, 0, 0]. Expected fraction
+        // (1 - P(logistic > 4))^4 = 0.98201^4 = 0.9300, so 952 of 1024 rows with
+        // a binomial standard deviation of sqrt(1024 * 0.93 * 0.07) = 8.2. The
+        // 800 below is 18.6 sigma under that mean and cannot fail by chance,
+        // while a last-maximum tie-break would write [0, 0, 0, 1] on every
+        // fallback row, leaving only the 17 rows where gate 0 alone opens, and a
+        // kernel without the softplus branch would write NaN on all of them.
+        let one_hot_first = got
+            .chunks_exact(4)
+            .filter(|row| row[0] == 1.0 && row[1] == 0.0 && row[2] == 0.0 && row[3] == 0.0)
+            .count();
+        assert!(one_hot_first >= 800, "only {one_hot_first} of 1024 rows are exactly [1, 0, 0, 0]");
+
+        // And the open-gate path ran, so the 1e-5 match above is not a statement
+        // about the fallback alone. A nonzero coordinate past index 0 can only be
+        // an open gate, because the fallback always writes coordinate 0. At least
+        // one of gates 1, 2, 3 opens with probability 1 - 0.98201^3 = 0.0529, so
+        // 54 rows are expected and none at all has probability 0.94709^1024,
+        // which is 6e-25.
+        let with_an_open_gate = got
+            .chunks_exact(4)
+            .filter(|row| row[1] != 0.0 || row[2] != 0.0 || row[3] != 0.0)
+            .count();
+        assert!(with_an_open_gate >= 1, "no row opened a gate; only the fallback path ran");
     }
 
     fn generated_rows(
@@ -1966,6 +2120,15 @@ extern "C" __global__ void reference_nn_search(
         assert_invariant_to_launch_geometry(Scenario::NYTIMES_256);
     }
 
+    #[test]
+    fn sift_output_is_invariant_to_launch_geometry() {
+        // The gate's noise stream has its own curand index, so this is also where
+        // a `gan_gate_noise` launch that passed a chunk-local index rather than
+        // the global one would show up: the same row would draw different noise
+        // at a different chunk size.
+        assert_invariant_to_launch_geometry(Scenario::SIFT_128);
+    }
+
     /// Every database row is unit-norm. Returns the rows for further checks.
     fn assert_database_rows_are_unit_norm(scenario: Scenario) -> (Vec<f32>, usize) {
         let (challenge, _module, stream, _prop) = gpu_instance_for(scenario, 11);
@@ -1995,6 +2158,16 @@ extern "C" __global__ void reference_nn_search(
         // has norm sqrt(cos_r^2 + sin_r^2) = 1. So this fails if
         // `gan_sphere_combine` skips either normalise or the projection.
         assert_database_rows_are_unit_norm(Scenario::NYTIMES_256);
+    }
+
+    #[test]
+    fn sift_database_rows_are_unit_norm_non_negative_and_sparse_like_sift() {
+        let (rows, _dims) = assert_database_rows_are_unit_norm(Scenario::SIFT_128);
+        assert!(rows.iter().all(|v| *v >= 0.0), "a SIFT coordinate is negative");
+        let zero_fraction = rows.iter().filter(|v| **v == 0.0).count() as f64 / rows.len() as f64;
+        // docs/datasets/sift.md (WGAN repo): v4's exact-zero fraction is 0.239,
+        // real SIFT's 0.230. An inverted gate would give about 0.76.
+        assert!((0.20..=0.28).contains(&zero_fraction), "exact-zero fraction is {zero_fraction}");
     }
 
     /// The same two probes `exact_1nn_measures_recall_1` and
@@ -2087,5 +2260,70 @@ extern "C" __global__ void reference_nn_search(
             let r = correlation(&column(&latents, 512, j), &column(&latents, 512, 256 + j));
             assert!(r.abs() < 0.05, "z_t column {j} correlates with z_s column {j}: r = {r}");
         }
+    }
+
+    #[test]
+    fn sift_gate_noise_is_finite_standard_logistic_and_independent_of_the_latents() {
+        const ROWS: usize = 65_536;
+        let (module, stream) = gpu_context();
+        let generator = Generator::from_blob(ScenarioConfig::from(Scenario::SIFT_128).weights).unwrap();
+        // The 128 offsets below are the output width, not the latent width: there
+        // is one gate-noise value per output coordinate.
+        assert_eq!(generator.output_dim(), 128, "the 128 offsets below assume this shape");
+        let d_seed = stream.memcpy_stod(&[7u8; 32]).unwrap();
+        let mut device = generator::DeviceGenerator::new(&generator, ROWS, generator::ROW_BLOCK, &module, stream.clone()).unwrap();
+        device.sample_inputs(&d_seed, ROWS, 0).unwrap();
+        stream.synchronize().unwrap();
+        let (latents, noise) = device.read_inputs(ROWS).unwrap();
+        let noise = noise.expect("structured_gate has gate noise");
+
+        assert!(noise.iter().all(|v| v.is_finite()), "gate noise contains inf or NaN");
+        let n = noise.len() as f64;
+        let mean = noise.iter().map(|v| *v as f64).sum::<f64>() / n;
+        let var = noise.iter().map(|v| (*v as f64 - mean).powi(2)).sum::<f64>() / n;
+        // Standard logistic: mean 0, variance pi^2/3 = 3.2899. With 8.4 million
+        // draws the standard error of the mean is 0.0006 and of the variance
+        // about 0.002, so these bounds are many sigma wide and still reject
+        // log(u) alone (mean -1) or a uniform left untransformed (variance 0.083).
+        assert!(mean.abs() < 0.02, "gate noise mean is {mean}");
+        assert!((var - 3.2899).abs() < 0.1, "gate noise variance is {var}");
+
+        for j in 0..128 {
+            let r = correlation(&column(&latents, 128, j), &column(&noise, 128, j));
+            assert!(r.abs() < 0.05, "latent column {j} correlates with gate noise column {j}: r = {r}");
+        }
+    }
+
+    /// The gate noise must not come from the curand state the latents use.
+    /// Statistics cannot show this: Box-Muller maps its uniforms through a
+    /// cosine, so a normal and the logit of the uniform behind it are
+    /// uncorrelated even when they share a state. So compare directly against
+    /// what the UNSHIFTED sequence produces, using a test-only kernel.
+    #[test]
+    fn sift_gate_noise_does_not_reuse_the_latent_sequence() {
+        const ROWS: usize = 4096;
+        let (module, stream) = gpu_context();
+        let generator = Generator::from_blob(ScenarioConfig::from(Scenario::SIFT_128).weights).unwrap();
+        assert_eq!(generator.output_dim(), 128, "the 128 widths below assume this shape");
+        let d_seed = stream.memcpy_stod(&[7u8; 32]).unwrap();
+        let mut device = generator::DeviceGenerator::new(&generator, ROWS, generator::ROW_BLOCK, &module, stream.clone()).unwrap();
+        device.sample_inputs(&d_seed, ROWS, 0).unwrap();
+        let (_, noise) = device.read_inputs(ROWS).unwrap();
+        let production = noise.unwrap();
+
+        let kernel = module.load_function("test_gate_noise_unshifted").unwrap();
+        let mut d_unshifted = stream.alloc_zeros::<f32>(ROWS * 128).unwrap();
+        unsafe {
+            stream.launch_builder(&kernel)
+                .arg(&d_seed).arg(&(ROWS as i32)).arg(&128i32).arg(&1.0e-8f32)
+                .arg(&mut d_unshifted).arg(&0i32)
+                .launch(LaunchConfig { grid_dim: ((ROWS as u32 + 255) / 256, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
+                .unwrap();
+        }
+        stream.synchronize().unwrap();
+        let unshifted = stream.memcpy_dtov(&d_unshifted).unwrap();
+        let equal = production.iter().zip(&unshifted).filter(|(a, b)| a.to_bits() == b.to_bits()).count();
+        assert!(equal < production.len() / 100,
+            "{} of {} gate-noise values equal the unshifted sequence's", equal, production.len());
     }
 }

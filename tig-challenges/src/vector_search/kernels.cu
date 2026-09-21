@@ -309,6 +309,124 @@ extern "C" __global__ void gan_sphere_combine(
     }
 }
 
+// Sequence base for the gate's noise stream. gan_sample_latents passes an
+// int index as the curand sequence, so it cannot reach 2^40: the two streams
+// are disjoint for the same seed word.
+#define GATE_NOISE_SEQUENCE_BASE (1ULL << 40)
+
+// Logistic noise for the structured gate: log(u) - log1p(-u), u uniform.
+//
+// curand_uniform returns (0, 1], and in float32 `1 - 1e-8` IS 1.0, so the
+// PyTorch-style clamp(eps, 1 - eps) would let u = 1.0 through: log1p(-1) is
+// -inf, the noise +inf, and after smoothing (a linear map) a NaN wherever it
+// meets a -inf. At 89.6 million draws per database that is expected several
+// times per instance, not a corner case. So the upper clamp is the largest
+// float below 1.0, written out.
+extern "C" __global__ void gan_gate_noise(
+    const uint8_t *seed,
+    const int n,
+    const int dim,
+    const float eps,
+    float *noise,
+    const int index_offset
+)
+{
+    for (int i = threadIdx.x + blockIdx.x * blockDim.x; i < n;
+         i += blockDim.x * gridDim.x)
+    {
+        const int global_i = index_offset + i;
+        curandState state;
+        curand_init(((const uint64_t *)(seed))[global_i % 4],
+                    GATE_NOISE_SEQUENCE_BASE + (unsigned long long)global_i, 0, &state);
+        float *row = noise + (long long)i * dim;
+        for (int j = 0; j < dim; ++j) {
+            float u = curand_uniform(&state);
+            if (u > 0.99999994f) u = 0.99999994f;
+            if (u < eps) u = eps;
+            row[j] = logf(u) - log1pf(-u);
+        }
+    }
+}
+
+// The structured gate's last step, per row. `noise` is ALREADY smoothed.
+//   logit_j = clamp * tanh((coupled_j + sparsity) / clamp)
+//   open_j  = logit_j + noise_j > 0       (== sigmoid(./T) > 0.5 for any T > 0)
+//   none open -> open only the first argmax of logit
+//   m_j     = max(softplus(mag_pre_j), floor),  softplus(x) = x > 20 ? x : log1p(exp(x))
+//   out     = unit(open * m)
+//
+// Every step matches `StructuredGate::forward_cpu` in order as well as in
+// value: the logit multiplies the clamp back in after the tanh, the softplus
+// threshold is the same 20 (PyTorch's F.softplus default), the argmax
+// comparison is strict so the FIRST maximum wins as torch.argmax does, and the
+// sum of squares accumulates through fmaf in index order, as normalize_cpu
+// does. The two differ only on a NaN magnitude, which no finite weight
+// produces: `max` in Rust returns the non-NaN operand where the `<` test here
+// keeps the NaN. That is the same divergence gan_row_normalize already has
+// against normalize_cpu.
+extern "C" __global__ void gan_gate_apply(
+    const float *mag_pre,
+    const float *coupled,
+    const float *sparsity,
+    const float *noise,
+    float *out,
+    const int n,
+    const int dim,
+    const float logit_clamp,
+    const float magnitude_floor,
+    const float eps,
+    const int out_row_offset
+)
+{
+    for (int i = threadIdx.x + blockIdx.x * blockDim.x; i < n;
+         i += blockDim.x * gridDim.x)
+    {
+        const float *m = mag_pre + (long long)i * dim;
+        const float *c = coupled + (long long)i * dim;
+        const float *z = noise + (long long)i * dim;
+        const float s = sparsity[i];
+        float *o = out + (long long)(out_row_offset + i) * dim;
+
+        int best = 0;
+        // 3.0e38 rather than INFINITY: --use_fast_math permits relaxations
+        // around infinities (same choice as the audit kernel). Any logit is
+        // bounded by logit_clamp, so the first coordinate always takes this
+        // branch and `best` starts at 0 exactly as forward_cpu's does.
+        float best_logit = -3.0e38f;
+        float best_mag = 0.0f;
+        int any_open = 0;
+        float ss = 0.0f;
+        for (int j = 0; j < dim; ++j) {
+            const float logit = logit_clamp * tanhf((c[j] + s) / logit_clamp);
+            float mag = (m[j] > 20.0f) ? m[j] : log1pf(expf(m[j]));
+            if (mag < magnitude_floor) mag = magnitude_floor;
+            if (logit > best_logit) {   // strict: keeps the FIRST maximum, as torch.argmax
+                best_logit = logit;
+                best = j;
+                best_mag = mag;
+            }
+            const int open = (logit + z[j] > 0.0f) ? 1 : 0;
+            const float value = open ? mag : 0.0f;
+            o[j] = value;
+            ss = fmaf(value, value, ss);
+            any_open |= open;
+        }
+        if (!any_open) {
+            o[best] = best_mag;
+            // Not the accumulated `ss`: every value written above was 0 in this
+            // branch, so the sum of squares is this one coordinate's. fmaf of a
+            // single product into 0.0f rounds the same way, which is what
+            // normalize_cpu computes over the same vector.
+            ss = best_mag * best_mag;
+        }
+        float norm = sqrtf(ss);
+        if (norm < eps) norm = eps;
+        for (int j = 0; j < dim; ++j) {
+            o[j] = o[j] / norm;
+        }
+    }
+}
+
 #define AUDIT_BLOCK 256
 #define AUDIT_MAX_DIMS 256
 
