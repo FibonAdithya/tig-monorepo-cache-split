@@ -211,6 +211,7 @@ pub mod knapsack;
 #[cfg(feature = "c003")]
 pub use knapsack as c003;
 pub mod audit_sampling;
+pub mod gan_generator;
 #[cfg(feature = "c004")]
 pub mod vector_search;
 #[cfg(feature = "c004")]
