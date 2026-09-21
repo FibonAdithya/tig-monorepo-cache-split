@@ -73,7 +73,7 @@ const AUDIT_TQ: u32 = 18;
 /// Must equal `AUDIT_MAX_DIMS` in kernels.cu, which sizes the kernel's
 /// shared-memory query staging buffer. A scenario declaring more dims than this
 /// would overrun that buffer with no error, so it is checked on the host.
-const AUDIT_MAX_DIMS: u32 = 128;
+const AUDIT_MAX_DIMS: u32 = 256;
 
 
 /// Generate `count` vectors into `dest`.
@@ -611,7 +611,7 @@ mod recall_audit_tests {
     /// that band is where a tiling bug lives.
     const REFERENCE_1NN_KERNEL: &str = r#"
 #define REF_BLOCK 256
-#define REF_MAX_DIMS 128
+#define REF_MAX_DIMS 256
 
 // Total order over candidates: nearer first, and among exact ties the lower
 // database index. Every comparison in this kernel goes through it, so the

@@ -225,7 +225,7 @@ extern "C" __global__ void gan_row_normalize(
 }
 
 #define AUDIT_BLOCK 256
-#define AUDIT_MAX_DIMS 128
+#define AUDIT_MAX_DIMS 256
 
 // Audited queries staged per block. The block streams the database ONCE for all
 // AUDIT_TQ of them, so database traffic falls by this factor: auditing 1,000
@@ -254,7 +254,12 @@ extern "C" __global__ void gan_row_normalize(
 // The sweep above was taken back to back across many rebuilds; the committed
 // kernel measures 85-87 ms on five later runs of the full suite, against a
 // 150 ms gate. Both figures are the same PTX (56 registers, 27,720 bytes of
-// shared memory), so the spread is the card's clocks, not the code.
+// shared memory), so the spread is the card's clocks, not the code. The
+// timing table above and the 27,720-byte figure were both measured at
+// AUDIT_MAX_DIMS = 128. At AUDIT_MAX_DIMS = 256, shared memory is 36,936
+// bytes (18*256*4 + 256*17*4 + 256*4 + 18*4 = 18,432 + 17,408 + 1,024 + 72),
+// computed from the __shared__ declarations below, not read from ptxas. No
+// timing at 256 has been measured yet.
 //
 // The curve is not monotonic, and neither end of it is where the cost lives:
 //
