@@ -741,14 +741,15 @@ extern "C" __global__ void reference_nn_search(
     }
 }
 
-// TEST ONLY. `gan_gate_noise` with GATE_NOISE_SEQUENCE_BASE removed from the
-// curand sequence, and textually identical to it in every other respect --
-// both clamps included. It exists so that
-// sift_gate_noise_does_not_reuse_the_latent_sequence can compare the
-// production noise against what the UNSHIFTED sequence produces: if the base
-// were dropped from kernels.cu the two would agree bit for bit. Keep it in
-// step with gan_gate_noise; a divergence anywhere else would make that test
-// pass for the wrong reason.
+// TEST ONLY. The ONLY difference from `gan_gate_noise` is the curand sequence
+// argument: this one passes `global_i` where the shipped kernel passes
+// `GATE_NOISE_SEQUENCE_BASE + global_i`. Both call the same
+// `gate_noise_from_uniform`, so neither the clamps nor the formula are
+// duplicated here and the two cannot drift apart.
+//
+// It exists so that sift_gate_noise_does_not_reuse_the_latent_sequence can
+// compare the production noise against what the UNSHIFTED sequence produces: if
+// the base were dropped from kernels.cu the two would agree bit for bit.
 extern "C" __global__ void test_gate_noise_unshifted(
     const uint8_t *seed, const int n, const int dim, const float eps,
     float *noise, const int index_offset)
@@ -759,11 +760,20 @@ extern "C" __global__ void test_gate_noise_unshifted(
         curand_init(((const uint64_t *)(seed))[global_i % 4], global_i, 0, &state);
         float *row = noise + (long long)i * dim;
         for (int j = 0; j < dim; ++j) {
-            float u = curand_uniform(&state);
-            if (u > 0.99999994f) u = 0.99999994f;
-            if (u < eps) u = eps;
-            row[j] = logf(u) - log1pf(-u);
+            row[j] = gate_noise_from_uniform(curand_uniform(&state), eps);
         }
+    }
+}
+
+// TEST ONLY. `gate_noise_from_uniform` on caller-supplied uniforms, so that
+// gate_noise_from_uniform_is_finite_at_both_ends_of_the_unit_interval can feed
+// it the two endpoints curand can actually produce. It calls the SHIPPED
+// function, so removing either clamp from kernels.cu changes what this writes.
+extern "C" __global__ void test_gate_noise_from_uniform(
+    const float *u, const int n, const float eps, float *out)
+{
+    for (int i = threadIdx.x + blockIdx.x * blockDim.x; i < n; i += blockDim.x * gridDim.x) {
+        out[i] = gate_noise_from_uniform(u[i], eps);
     }
 }
 "#;
@@ -2325,5 +2335,105 @@ extern "C" __global__ void test_gate_noise_unshifted(
         let equal = production.iter().zip(&unshifted).filter(|(a, b)| a.to_bits() == b.to_bits()).count();
         assert!(equal < production.len() / 100,
             "{} of {} gate-noise values equal the unshifted sequence's", equal, production.len());
+    }
+
+    /// The two clamps in `gate_noise_from_uniform`, driven directly rather than
+    /// through curand: curand's endpoints are far too rare to reach from a test,
+    /// since `u == 1.0` comes up about once in 2^32 draws.
+    ///
+    /// Mutations caught. Remove the UPPER clamp and `out[0]` becomes
+    /// `logf(1.0) - log1pf(-1.0)` = `0 - (-inf)` = `+inf`, so the finiteness
+    /// assertion, `out[0] == out[1]` and `out[0] > 16.0` all fail. Remove the
+    /// LOWER clamp and `out[4]` becomes `logf(0.0) - log1pf(-0.0)` = `-inf`,
+    /// while `out[5]` becomes -69.08 instead of -18.42, so the finiteness
+    /// assertion and two of the bit-equalities fail. (Both effects MEASURED on
+    /// the host, running the same expression in f32.)
+    ///
+    /// This is the only test that reaches those clamps. The 700,000-row
+    /// unit-norm test cannot, because the damage is silent: an infinity in the
+    /// raw noise becomes a NaN across the WHOLE smoothed row, since the
+    /// smoothing layer sums every tap and a zero weight times an infinity is a
+    /// NaN. `logit + NaN > 0` is then false for every coordinate, so `any_open`
+    /// stays 0 and `gan_gate_apply`'s fallback replaces the row with a one-hot
+    /// vector -- finite, unit-norm, and wrong.
+    #[test]
+    fn gate_noise_from_uniform_is_finite_at_both_ends_of_the_unit_interval() {
+        // The kernel's upper clamp is the literal `0.99999994f`. These two
+        // assertions prove the f32 this test uploads is bit for bit that same
+        // float -- the largest one below 1.0 -- rather than a near neighbour,
+        // which would make `out[0] == out[1]` pass without testing the clamp.
+        const LARGEST_BELOW_ONE: f32 = 0.99999994;
+        assert!(LARGEST_BELOW_ONE < 1.0, "the clamp constant is not below 1.0");
+        assert_eq!(
+            f32::from_bits(LARGEST_BELOW_ONE.to_bits() + 1),
+            1.0,
+            "the clamp constant is not the LARGEST float below 1.0"
+        );
+
+        const EPS: f32 = 1.0e-8;
+        // 1.0 and 0.0 are the two values the clamps exist for; EPS itself is the
+        // lower clamp's boundary and passes through, because the test is
+        // `u < eps`; 1e-30 is far below it; 0.5 is the midpoint.
+        let u = [1.0f32, LARGEST_BELOW_ONE, 0.5, EPS, 0.0, 1.0e-30];
+
+        let (module, stream) = gpu_context();
+        let d_u = stream.memcpy_stod(&u).unwrap();
+        let mut d_out = stream.alloc_zeros::<f32>(u.len()).unwrap();
+        let kernel = module.load_function("test_gate_noise_from_uniform").unwrap();
+        unsafe {
+            stream
+                .launch_builder(&kernel)
+                .arg(&d_u)
+                .arg(&(u.len() as i32))
+                .arg(&EPS)
+                .arg(&mut d_out)
+                .launch(LaunchConfig {
+                    grid_dim: ((u.len() as u32 + 255) / 256, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .unwrap();
+        }
+        stream.synchronize().unwrap();
+        let out = stream.memcpy_dtov(&d_out).unwrap();
+
+        assert!(out.iter().all(|v| v.is_finite()), "gate noise is not finite: {out:?}");
+
+        // u = 1.0 is clamped to the largest float below 1.0, so it must produce
+        // bit for bit what that float itself produces.
+        assert_eq!(
+            out[0].to_bits(), out[1].to_bits(),
+            "u = 1.0 was not clamped: {} vs {}", out[0], out[1]
+        );
+        // 0 and a value far under eps are both clamped to eps, so both must
+        // produce bit for bit what eps itself produces.
+        assert_eq!(
+            out[4].to_bits(), out[3].to_bits(),
+            "u = 0 was not clamped: {} vs {}", out[4], out[3]
+        );
+        assert_eq!(
+            out[5].to_bits(), out[3].to_bits(),
+            "u = 1e-30 was not clamped: {} vs {}", out[5], out[3]
+        );
+
+        // The map is the logit, odd about u = 0.5, so the midpoint is
+        // log(0.5) - log1p(-0.5) = 0. Not asserted exactly: `--use_fast_math`
+        // replaces `logf` with an approximate intrinsic but leaves `log1pf`
+        // accurate, so the two terms can differ by a few ulp of ln 2 = 0.6931,
+        // one ulp being 6.0e-8. 1e-6 is about 17 ulp: far above what fast-math
+        // can move, and far below what a wrong formula would give. In f32 on
+        // the host the same expression is exactly 0.0 (MEASURED).
+        assert!(out[2].abs() < 1e-6, "the midpoint is {}, not 0", out[2]);
+
+        // The endpoint magnitudes, derived rather than copied from the brief.
+        // 1 - u[1] is exactly 2^-24, so log1p(-u[1]) = log(2^-24) = -24 ln 2 =
+        // -16.6355, while log(u[1]) is about -2^-24, i.e. 0: the noise is
+        // +16.6355. Bounding at 16.0 leaves 0.6 of margin -- millions of ulp
+        // more than fast-math can move it -- and still rejects a dropped log1p
+        // term, which would give -6e-8.
+        assert!(out[0] > 16.0, "u at the top of the interval gave {}", out[0]);
+        // And log(1e-8) = -8 ln 10 = -18.4207 with log1p(-1e-8) about -1e-8, so
+        // the noise is -18.4207. Bounding at -18.0 leaves 0.42 of margin.
+        assert!(out[3] < -18.0, "u at the bottom of the interval gave {}", out[3]);
     }
 }
