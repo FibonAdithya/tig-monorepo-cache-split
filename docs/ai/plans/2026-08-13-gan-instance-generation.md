@@ -1365,10 +1365,10 @@ Expected: 3/3 valid at every track, with `avg_quality` above `min_active_quality
 
 - [ ] **Step 4: Record the results in the spec**
 
-Append a "Validation" section to `docs/superpowers/specs/2026-08-13-gan-instance-generation-design.md` with the measured qualities and per-track timings, then:
+Append a "Validation" section to `docs/ai/specs/2026-08-13-gan-instance-generation-design.md` with the measured qualities and per-track timings, then:
 
 ```bash
-git add docs/superpowers/specs/2026-08-13-gan-instance-generation-design.md
+git add docs/ai/specs/2026-08-13-gan-instance-generation-design.md
 git commit -m "Record end-to-end validation of GAN instance generation
 
 A dimension-parameterised reference solver scores above

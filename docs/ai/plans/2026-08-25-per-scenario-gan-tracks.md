@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust (`nightly-2025-02-10`), CUDA 12.6, `cudarc`, `anyhow`, `paste`. Tests via `cargo test -p tig-challenges --features vector_search`.
 
-**Spec:** `docs/superpowers/specs/2026-08-25-per-scenario-gan-tracks-design.md`
+**Spec:** `docs/ai/specs/2026-08-25-per-scenario-gan-tracks-design.md`
 
 ## Global Constraints
 
@@ -466,7 +466,7 @@ git commit -m "Make vector_search tracks select a corpus scenario"
 ### Task 4: On-GPU validation — BLOCKED on hardware
 
 **Files:**
-- Modify: `docs/superpowers/specs/2026-08-25-per-scenario-gan-tracks-design.md` (append measured results)
+- Modify: `docs/ai/specs/2026-08-25-per-scenario-gan-tracks-design.md` (append measured results)
 
 **Interfaces:**
 - Consumes: everything from Tasks 1-3.
@@ -506,7 +506,7 @@ Expected: identical digests across all four configurations at a fixed nonce, and
 Append a `## Validation` section with the measured numbers. Then:
 
 ```bash
-git add docs/superpowers/specs/2026-08-25-per-scenario-gan-tracks-design.md
+git add docs/ai/specs/2026-08-25-per-scenario-gan-tracks-design.md
 git commit -m "Record on-GPU validation of per-scenario tracks"
 ```
 

@@ -109,7 +109,7 @@ serializable_struct_with_getters! {
         // live algorithms implement `build_index`/`load_index`. Otherwise every
         // c004 batch carries `build_fuel_budget`, `run_build_index` runs for
         // every algorithm, and each batch fails ("does not export build_index").
-        // See docs/superpowers/specs/2026-08-31-c004-index-build-split-design.md.
+        // See docs/ai/specs/2026-08-31-c004-index-build-split-design.md.
         build_fuel_alpha: Option<f64>,
         max_build_fuel_budget: Option<u64>,
     }

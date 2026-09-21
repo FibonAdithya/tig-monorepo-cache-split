@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust (edition per workspace, toolchain `nightly-2025-02-10`), CUDA 12.6 via the tig-foundation `cudarc` fork, CUDA C (`kernels.cu` — **not modified**), Python 3 (`tig-benchmarker`), `cargo test`, `unittest`.
 
-**Spec:** `docs/superpowers/specs/2026-08-31-c004-index-build-split-design.md`
+**Spec:** `docs/ai/specs/2026-08-31-c004-index-build-split-design.md`
 
 ## Global Constraints
 
@@ -1737,7 +1737,7 @@ Expected: a `quality:` line at or above 950000 (recall 0.95).
 - [ ] **Step 4: Record the result**
 
 Append a `## Validation` entry to
-`docs/superpowers/specs/2026-08-31-c004-index-build-split-design.md` giving the
+`docs/ai/specs/2026-08-31-c004-index-build-split-design.md` giving the
 algorithm name, the exact commands, and the raw output. **If the run fails, stop
 and report** — the blast-radius section of the spec is wrong and the migration
 needs the network-wide rebuild treatment.
@@ -1746,7 +1746,7 @@ needs the network-wide rebuild treatment.
 
 ```bash
 git status --short
-git add docs/superpowers/specs/2026-08-31-c004-index-build-split-design.md
+git add docs/ai/specs/2026-08-31-c004-index-build-split-design.md
 git commit -m "docs(c004): record whether the split needs an algorithm rebuild"
 ```
 
@@ -2014,7 +2014,7 @@ def run_build_index(batch, so_path, ptx_path, results_dir):
     """Build the index once per batch, before any nonce is computed.
 
     Deliberately passes no nonce: the build process must not be able to derive
-    a query set. See docs/superpowers/specs/2026-08-31-c004-index-build-split-design.md.
+    a query set. See docs/ai/specs/2026-08-31-c004-index-build-split-design.md.
     """
     index_path = f"{results_dir}/{batch['id']}/index.blob"
     os.makedirs(os.path.dirname(index_path), exist_ok=True)
