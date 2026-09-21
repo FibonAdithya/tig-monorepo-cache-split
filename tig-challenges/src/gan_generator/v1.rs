@@ -123,10 +123,12 @@ pub fn forward_cpu(weights: &GeneratorWeights, latent: &[f32]) -> Vec<f32> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn blob_with(layers: &[(u32, u32)]) -> Vec<u8> {
+    /// `pub(crate)` so `gan_generator`'s own tests can build a TIGGAN01 blob
+    /// with a broken layer chain without repeating the byte layout.
+    pub(crate) fn blob_with(layers: &[(u32, u32)]) -> Vec<u8> {
         let mut v = Vec::from(*b"TIGGAN01");
         v.extend_from_slice(&(layers.len() as u32).to_le_bytes());
         for &(in_dim, out_dim) in layers {

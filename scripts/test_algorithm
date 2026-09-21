@@ -45,7 +45,7 @@ if CHALLENGE is None:
     sys.exit(1)
 
 # Fraction of --fuel handed to the index build when the algorithm builds one.
-# Provisional: Task 8 of docs/superpowers/plans/2026-08-31-c004-index-build-split-monorepo.md
+# Provisional: Task 8 of docs/ai/plans/2026-08-31-c004-index-build-split-monorepo.md
 # measures the real value. It is a separate budget, not a slice taken out of
 # --fuel: the query phase still gets the whole of --fuel.
 BUILD_FUEL_ALPHA = 0.25
