@@ -4,25 +4,59 @@ use anyhow::{anyhow, Result};
 /// instance independently, so a single differing byte would fail verification
 /// network-wide.
 ///
-/// Each blob gets exactly ONE `include_bytes!`, here, referenced once from the
-/// arm below. Rust does not guarantee that two identical consts in different
-/// modules are merged, so a second `include_bytes!` of the same file can embed
-/// the 7 MB blob twice -- in every algorithm .so, since they all link
-/// tig-challenges. (`gan_generator::v1` also includes this file, but only under
-/// `#[cfg(test)]`, so no shipped build carries that copy.)
+/// Each blob gets exactly ONE `include_bytes!`, here, referenced once from its
+/// own arm below. Rust does not guarantee that two identical consts in
+/// different modules are merged, so a second `include_bytes!` of the same file
+/// can embed that blob's 7 MB twice -- in every algorithm .so, since they all
+/// link tig-challenges. (`gan_generator::v1` also includes the SIFT file, but
+/// only under `#[cfg(test)]`, so no shipped build carries that copy.)
 const SIFT_128_BLOB: &[u8] = include_bytes!("weights/v1_sift.bin");
+const GLOVE_100_BLOB: &[u8] = include_bytes!("weights/glove_100_v1.bin");
 
-/// One scenario per real embedding corpus. Tracks are one-to-one with
-/// scenarios, so adding a variant adds a track.
-///
-/// Adding a variant is a runtime-side change only: generation kernels come from
-/// each algorithm's PTX, while blobs and config come from the runtime's own
-/// tig-challenges. Do not change kernels.cu to add one — that would force every
-/// algorithm to be rebuilt and resubmitted network-wide.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(non_camel_case_types)]
-pub enum Scenario {
-    SIFT_128,
+/// Generates the enum, `Scenario::ALL`, `Display` and `FromStr` from one list.
+/// `ALL`'s length is computed from the same list the enum is built from, so a
+/// variant cannot exist without being in `ALL`, and the wire name cannot drift
+/// between `Display` and `FromStr`.
+macro_rules! scenarios {
+    ($($variant:ident => $wire:literal),+ $(,)?) => {
+        /// One scenario per real embedding corpus. Tracks are one-to-one with
+        /// scenarios, so adding a variant adds a track.
+        ///
+        /// Adding a variant is a runtime-side change only — generation kernels
+        /// come from each algorithm's PTX, while blobs and config come from the
+        /// runtime's own tig-challenges — PROVIDED the new blob's architecture
+        /// is one of the three the kernels already support. Do not change
+        /// kernels.cu to add a scenario: that would force every algorithm to be
+        /// rebuilt and resubmitted network-wide.
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        #[allow(non_camel_case_types)]
+        pub enum Scenario { $($variant),+ }
+
+        impl Scenario {
+            pub const ALL: [Scenario; [$($wire),+].len()] = [$(Scenario::$variant),+];
+        }
+
+        impl std::fmt::Display for Scenario {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                match self { $(Scenario::$variant => write!(f, $wire)),+ }
+            }
+        }
+
+        impl std::str::FromStr for Scenario {
+            type Err = anyhow::Error;
+            fn from_str(s: &str) -> Result<Self> {
+                match s.to_lowercase().as_str() {
+                    $($wire => Ok(Scenario::$variant),)+
+                    _ => Err(anyhow!("Invalid scenario type: {}", s)),
+                }
+            }
+        }
+    };
+}
+
+scenarios! {
+    SIFT_128 => "sift_128",
+    GLOVE_100 => "glove_100",
 }
 
 pub struct ScenarioConfig {
@@ -78,25 +112,20 @@ impl From<Scenario> for ScenarioConfig {
                 recall_tolerance: 1e-6,
                 audit_samples: 1_000,
             },
-        }
-    }
-}
-
-impl std::fmt::Display for Scenario {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Scenario::SIFT_128 => write!(f, "sift_128"),
-        }
-    }
-}
-
-impl std::str::FromStr for Scenario {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self> {
-        match s.to_lowercase().as_str() {
-            "sift_128" => Ok(Scenario::SIFT_128),
-            _ => Err(anyhow!("Invalid scenario type: {}", s)),
+            // GloVe v1, seed 42 (WGAN run probe_spectrum_seed42). Angular
+            // corpus: rows are unit-normalised by the mlp driver, which makes
+            // Euclidean 1-NN equal to angular 1-NN. min_recall is copied from
+            // SIFT and has NOT been measured for this corpus; see the spec's
+            // Follow-ups.
+            Scenario::GLOVE_100 => ScenarioConfig {
+                n_queries: 7_000,
+                database_size: 700_000,
+                vector_dims: 100,
+                weights: GLOVE_100_BLOB,
+                min_recall: 0.9,
+                recall_tolerance: 1e-6,
+                audit_samples: 1_000,
+            },
         }
     }
 }
@@ -140,6 +169,20 @@ mod tests {
             "error should name the offending input, got: {}",
             err
         );
+    }
+
+    #[test]
+    fn every_wire_name_round_trips() {
+        // The one thing the macro does NOT guarantee. It keeps `Display` and
+        // `FromStr` reading the same literal, so they cannot drift apart, but
+        // `from_str` lowercases its input first: an uppercase wire literal like
+        // `SIFT_128 => "Sift_128"` would be emitted by `Display` and could
+        // never be matched by `FromStr`. A round-trip is the right assertion
+        // here precisely because the literal-string tests above already pin
+        // what the names are.
+        for scenario in Scenario::ALL {
+            assert_eq!(Scenario::from_str(&scenario.to_string()).unwrap(), scenario);
+        }
     }
 
     #[test]
