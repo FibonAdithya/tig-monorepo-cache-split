@@ -8,9 +8,10 @@ use anyhow::{anyhow, Result};
 /// own arm below. Rust does not guarantee that two identical consts in
 /// different modules are merged, so a second `include_bytes!` of the same file
 /// can embed that blob's 7 MB twice -- in every algorithm .so, since they all
-/// link tig-challenges. (`gan_generator::v1` also includes the SIFT file, but
-/// only under `#[cfg(test)]`, so no shipped build carries that copy.)
-const SIFT_128_BLOB: &[u8] = include_bytes!("weights/v1_sift.bin");
+/// link tig-challenges. (`gan_generator`'s tests include this SIFT blob a second
+/// time, and `v1_sift.bin` as well, but only under `#[cfg(test)]`, so no shipped
+/// build carries either copy.)
+const SIFT_128_BLOB: &[u8] = include_bytes!("weights/sift_128_v4.bin");
 const GLOVE_100_BLOB: &[u8] = include_bytes!("weights/glove_100_v1.bin");
 const NYTIMES_256_BLOB: &[u8] = include_bytes!("weights/nytimes_256_v3.bin");
 
@@ -105,6 +106,26 @@ pub struct ScenarioConfig {
 impl From<Scenario> for ScenarioConfig {
     fn from(scenario: Scenario) -> Self {
         match scenario {
+            // SIFT v4, the gate-accepted checkpoint `v4_sift1m_x100k`
+            // (`/workspace/sift-v4/v4_sift1m_x100k/best_generator.pt` on the
+            // training box, EMA weights at step 86,000 of a 100k-step retrain;
+            // see weights/PROVENANCE.md for the hashes and the exporter command).
+            // Structured-gate architecture: every output coordinate passes a
+            // stochastic hard gate, so rows are non-negative and unit-norm with
+            // about 24% of coordinates exactly zero -- 0.239 for v4 against
+            // 0.230 for the real corpus. A Euclidean corpus, unlike GloVe and
+            // NYTimes: nothing here makes Euclidean 1-NN stand in for angular
+            // 1-NN, because SIFT descriptors are compared in Euclidean distance
+            // to begin with.
+            //
+            // min_recall's 0.9 was derived from measurements taken on
+            // v1-generated SIFT instances, and has NOT been re-derived on the v4
+            // instances this arm now generates. The field comment below records
+            // where the figure came from.
+            //
+            // `weights/v1_sift.bin` is no longer wired to any scenario. It
+            // survives only as the `TIGGAN01` fixture in `gan_generator::v1`,
+            // under `#[cfg(test)]`, where the v1 parser's own tests live.
             Scenario::SIFT_128 => ScenarioConfig {
                 n_queries: 7_000,
                 database_size: 700_000,

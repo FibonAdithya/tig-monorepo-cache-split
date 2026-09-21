@@ -162,9 +162,47 @@ struct SphericalDevice {
     v: CudaSlice<f32>,
 }
 
+struct GateDevice {
+    trunk: Vec<DeviceLayer>,
+    magnitude_head: DeviceLayer,
+    gate_head: DeviceLayer,
+    sparsity_head: DeviceLayer,
+    coupling: DeviceLayer,
+    smoothing: DeviceLayer,
+    noise_kernel: CudaFunction,
+    apply_kernel: CudaFunction,
+    logit_clamp: f32,
+    magnitude_floor: f32,
+    eps: f32,
+    latents: CudaSlice<f32>,
+    /// Trunk activations alternate between these; `forward` swaps them so the
+    /// trunk's result is always in `h_a`.
+    h_a: CudaSlice<f32>,
+    h_b: CudaSlice<f32>,
+    /// `magnitude_head(h)`, before the softplus and the floor -- both of which
+    /// `gan_gate_apply` applies, so nothing here is pre-activated.
+    mag_pre: CudaSlice<f32>,
+    /// `gate_head(h)`.
+    gate: CudaSlice<f32>,
+    /// `coupling(gate)`. A buffer of its own rather than `gate` overwritten,
+    /// because cudarc will not lend one slice as both an input and an output
+    /// argument of the same launch.
+    coupled: CudaSlice<f32>,
+    /// `sparsity_head(h)`: ONE value per row, not per coordinate, so this is
+    /// `max_rows` floats and `gan_gate_apply` indexes it by row.
+    sparsity: CudaSlice<f32>,
+    /// The logistic noise `gan_gate_noise` draws, before smoothing. Filled by
+    /// `sample_inputs`, not by `forward`, because it is a random input like the
+    /// latents; `read_inputs` hands this one back.
+    raw_noise: CudaSlice<f32>,
+    /// `smoothing(raw_noise)`, which is what `gan_gate_apply` adds to the logit.
+    smooth_noise: CudaSlice<f32>,
+}
+
 enum DeviceArch {
     Mlp(MlpDevice),
     Spherical(SphericalDevice),
+    StructuredGate(GateDevice),
 }
 
 pub(super) struct DeviceGenerator {
@@ -249,11 +287,52 @@ impl DeviceGenerator {
                     v: stream.alloc_zeros::<f32>(max_rows * out_dim)?,
                 })
             }
-            // Reachable: `Generator` also has `StructuredGate`, whose CPU
-            // reference exists but whose driver does not yet. A scenario
-            // declaring it fails here rather than silently generating something
-            // else.
-            _ => return Err(anyhow!("no GPU driver for this generator architecture yet")),
+            Generator::StructuredGate(g) => {
+                // The widest trunk output, so one pair of scratch buffers serves
+                // every trunk step -- the same argument as the mlp arm's.
+                let widest = g.trunk.iter().map(|l| l.out_dim).max().unwrap();
+                // `magnitude_head.out_dim`: the blob parser has already checked
+                // that gate_head, coupling and smoothing all agree with it, so
+                // one width sizes every per-coordinate buffer. Read from the
+                // blob, never a literal: the synthetic gate test in mod.rs
+                // drives this driver with output_dim 4 and a latent of 2, so
+                // nothing here may assume SIFT's 128.
+                let out_dim = g.magnitude_head.out_dim;
+                let mut trunk = Vec::with_capacity(g.trunk.len());
+                for layer in &g.trunk {
+                    trunk.push(DeviceLayer::upload(&stream, layer)?);
+                }
+                DeviceArch::StructuredGate(GateDevice {
+                    trunk,
+                    magnitude_head: DeviceLayer::upload(&stream, &g.magnitude_head)?,
+                    gate_head: DeviceLayer::upload(&stream, &g.gate_head)?,
+                    sparsity_head: DeviceLayer::upload(&stream, &g.sparsity_head)?,
+                    // `coupling` and `smoothing` are bias-free, but the parser
+                    // gave each `Layer` a zero bias, so the upload and the
+                    // launch need nothing special -- as with `direction` above.
+                    coupling: DeviceLayer::upload(&stream, &g.coupling)?,
+                    smoothing: DeviceLayer::upload(&stream, &g.smoothing)?,
+                    noise_kernel: module.load_function("gan_gate_noise")?,
+                    apply_kernel: module.load_function("gan_gate_apply")?,
+                    logit_clamp: g.logit_clamp,
+                    magnitude_floor: g.magnitude_floor,
+                    eps: g.eps,
+                    // Every buffer is sized by `max_rows`, never by a constant:
+                    // `forward` allocates nothing, so a chunk larger than this
+                    // would run off the end rather than reallocate.
+                    latents: stream.alloc_zeros::<f32>(max_rows * g.trunk[0].in_dim)?,
+                    h_a: stream.alloc_zeros::<f32>(max_rows * widest)?,
+                    h_b: stream.alloc_zeros::<f32>(max_rows * widest)?,
+                    mag_pre: stream.alloc_zeros::<f32>(max_rows * out_dim)?,
+                    gate: stream.alloc_zeros::<f32>(max_rows * out_dim)?,
+                    coupled: stream.alloc_zeros::<f32>(max_rows * out_dim)?,
+                    // One value per row, so no `out_dim` factor. The parser
+                    // checks `sparsity_head.out_dim == 1`.
+                    sparsity: stream.alloc_zeros::<f32>(max_rows)?,
+                    raw_noise: stream.alloc_zeros::<f32>(max_rows * out_dim)?,
+                    smooth_noise: stream.alloc_zeros::<f32>(max_rows * out_dim)?,
+                })
+            }
         };
         Ok(Self {
             sample_latents_kernel: module.load_function("gan_sample_latents")?,
@@ -313,6 +392,47 @@ impl DeviceGenerator {
                     global_index + SKIP_LATENT_INDEX_SHIFT,
                     self.row_block,
                 )
+            }
+            DeviceArch::StructuredGate(g) => {
+                sample_latents(
+                    &self.stream,
+                    &self.sample_latents_kernel,
+                    d_seed,
+                    &mut g.latents,
+                    rows,
+                    g.trunk[0].in_dim,
+                    global_index,
+                    self.row_block,
+                )?;
+                // The gate's noise is a random INPUT, like the latents, so it is
+                // drawn here rather than in `forward`: `read_inputs` must be
+                // able to return it after `sample_inputs` alone, which is how
+                // both gate-noise tests call it.
+                //
+                // `global_index`, not a chunk-local index, for exactly the
+                // reason `gan_sample_latents` takes it: the kernel derives a
+                // row's whole curand state from the index it is given, so a
+                // chunk-local index would make a row's noise depend on where
+                // chunk boundaries happen to fall, and
+                // `sift_output_is_invariant_to_launch_geometry` would fail.
+                // `gan_gate_noise` adds GATE_NOISE_SEQUENCE_BASE to it inside
+                // the kernel, which is what keeps this stream disjoint from the
+                // latents' -- so nothing is shifted here, unlike the spherical
+                // arm's second `sample_latents` call above.
+                let dim = g.magnitude_head.out_dim as i32;
+                let eps = g.eps;
+                unsafe {
+                    self.stream
+                        .launch_builder(&g.noise_kernel)
+                        .arg(d_seed)
+                        .arg(&(rows as i32))
+                        .arg(&dim)
+                        .arg(&eps)
+                        .arg(&mut g.raw_noise)
+                        .arg(&(global_index as i32))
+                        .launch(row_launch(rows, self.row_block))?;
+                }
+                Ok(())
             }
         }
     }
@@ -534,6 +654,156 @@ impl DeviceGenerator {
                 }
                 Ok(())
             }
+            DeviceArch::StructuredGate(g) => {
+                // Destructured for the same reason the other two arms are:
+                // `h_a` and `h_b` must be bindings the borrow checker can see
+                // are disjoint, so one can be swapped while the other was the
+                // input to the launch before it. `noise_kernel` is not used
+                // here -- the noise is drawn in `sample_inputs` -- but it is
+                // named rather than covered by `..` so that a field added to
+                // `GateDevice` later cannot be silently ignored.
+                let GateDevice {
+                    trunk,
+                    magnitude_head,
+                    gate_head,
+                    sparsity_head,
+                    coupling,
+                    smoothing,
+                    noise_kernel: _,
+                    apply_kernel,
+                    logit_clamp,
+                    magnitude_floor,
+                    eps,
+                    latents,
+                    h_a,
+                    h_b,
+                    mag_pre,
+                    gate,
+                    coupled,
+                    sparsity,
+                    raw_noise,
+                    smooth_noise,
+                } = g;
+                for (i, layer) in trunk.iter().enumerate() {
+                    // Activation on EVERY trunk layer, the last included: the
+                    // PyTorch trunk is [Linear, LeakyReLU] x T, and
+                    // `StructuredGate::trunk_cpu` passes `true` for every
+                    // layer. The mlp arm's last layer has none, so this is not
+                    // a copy of that arm -- it matches the spherical one.
+                    if i == 0 {
+                        launch_linear(
+                            &self.stream,
+                            &self.linear_kernel,
+                            latents,
+                            layer,
+                            h_a,
+                            rows,
+                            true,
+                            0,
+                        )?;
+                    } else {
+                        launch_linear(
+                            &self.stream,
+                            &self.linear_kernel,
+                            h_a,
+                            layer,
+                            h_b,
+                            rows,
+                            true,
+                            0,
+                        )?;
+                        // `h_a`'s last use is the call above, so the swap does
+                        // not overlap its borrow. The trunk's result is in `h_a`.
+                        std::mem::swap(h_a, h_b);
+                    }
+                }
+                // No activation on any of these five. Every remaining
+                // nonlinearity is inside `gan_gate_apply` -- the tanh on the
+                // logit, the softplus on the magnitude, and the gate itself --
+                // and `coupling` and `smoothing` are linear maps the exporter
+                // baked from a Conv3d and a fixed smoothing kernel.
+                //
+                // The order matters: `coupling` consumes `gate`, so that launch
+                // follows `gate_head`'s. Launches on one stream run in issue
+                // order, so nothing else is needed to sequence them.
+                launch_linear(
+                    &self.stream,
+                    &self.linear_kernel,
+                    h_a,
+                    magnitude_head,
+                    mag_pre,
+                    rows,
+                    false,
+                    0,
+                )?;
+                launch_linear(
+                    &self.stream,
+                    &self.linear_kernel,
+                    h_a,
+                    gate_head,
+                    gate,
+                    rows,
+                    false,
+                    0,
+                )?;
+                launch_linear(
+                    &self.stream,
+                    &self.linear_kernel,
+                    gate,
+                    coupling,
+                    coupled,
+                    rows,
+                    false,
+                    0,
+                )?;
+                // out_dim 1: one sparsity value per row. `gan_linear`'s grid is
+                // ceil(out_dim / 64) = 1 block in y, and its `col >= out_dim`
+                // guards stop every thread but one from writing, so the narrow
+                // layer needs no special case.
+                launch_linear(
+                    &self.stream,
+                    &self.linear_kernel,
+                    h_a,
+                    sparsity_head,
+                    sparsity,
+                    rows,
+                    false,
+                    0,
+                )?;
+                // The noise the gate compares against is the SMOOTHED noise.
+                // `raw_noise` is what `sample_inputs` drew and what
+                // `read_inputs` returns; the CPU reference smooths it itself.
+                launch_linear(
+                    &self.stream,
+                    &self.linear_kernel,
+                    raw_noise,
+                    smoothing,
+                    smooth_noise,
+                    rows,
+                    false,
+                    0,
+                )?;
+                let dim = magnitude_head.out_dim;
+                unsafe {
+                    // `out_row_offset`, not 0 -- this is the step that lands the
+                    // chunk in `dest`.
+                    self.stream
+                        .launch_builder(apply_kernel)
+                        .arg(&*mag_pre)
+                        .arg(&*coupled)
+                        .arg(&*sparsity)
+                        .arg(&*smooth_noise)
+                        .arg(dest)
+                        .arg(&(rows as i32))
+                        .arg(&(dim as i32))
+                        .arg(&*logit_clamp)
+                        .arg(&*magnitude_floor)
+                        .arg(&*eps)
+                        .arg(&(out_row_offset as i32))
+                        .launch(row_launch(rows, self.row_block))?;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -561,6 +831,24 @@ impl DeviceGenerator {
                     out.extend_from_slice(&zs[row * k..(row + 1) * k]);
                 }
                 Ok((out, None))
+            }
+            DeviceArch::StructuredGate(g) => {
+                // The RAW, pre-smoothing noise, which is exactly the
+                // `gate_noise` argument `StructuredGate::forward_cpu` takes --
+                // it applies the smoothing map itself. Returning `smooth_noise`
+                // would make the CPU reference smooth an already-smoothed
+                // vector, and `sift_gpu_forward_matches_the_cpu_reference` would
+                // fail for a reason that is not a kernel defect.
+                let latent_dim = g.trunk[0].in_dim;
+                let dim = g.magnitude_head.out_dim;
+                Ok((
+                    self.stream
+                        .memcpy_dtov(&g.latents.slice(0..rows * latent_dim))?,
+                    Some(
+                        self.stream
+                            .memcpy_dtov(&g.raw_noise.slice(0..rows * dim))?,
+                    ),
+                ))
             }
         }
     }
