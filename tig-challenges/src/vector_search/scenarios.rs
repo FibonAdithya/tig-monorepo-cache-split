@@ -12,6 +12,7 @@ use anyhow::{anyhow, Result};
 /// only under `#[cfg(test)]`, so no shipped build carries that copy.)
 const SIFT_128_BLOB: &[u8] = include_bytes!("weights/v1_sift.bin");
 const GLOVE_100_BLOB: &[u8] = include_bytes!("weights/glove_100_v1.bin");
+const NYTIMES_256_BLOB: &[u8] = include_bytes!("weights/nytimes_256_v3.bin");
 
 /// Generates the enum, `Scenario::ALL`, `Display` and `FromStr` from one list.
 /// `ALL`'s length is computed from the same list the enum is built from, so a
@@ -57,6 +58,7 @@ macro_rules! scenarios {
 scenarios! {
     SIFT_128 => "sift_128",
     GLOVE_100 => "glove_100",
+    NYTIMES_256 => "nytimes_256",
 }
 
 pub struct ScenarioConfig {
@@ -122,6 +124,24 @@ impl From<Scenario> for ScenarioConfig {
                 database_size: 700_000,
                 vector_dims: 100,
                 weights: GLOVE_100_BLOB,
+                min_recall: 0.9,
+                recall_tolerance: 1e-6,
+                audit_samples: 1_000,
+            },
+            // NYTimes v3, seed 42, the gate-accepted checkpoint `v3_best`
+            // (`/workspace/nytimes-v3/v3_seed42/best_generator.pt` on the
+            // training box). Spherical architecture, so rows are unit-norm by
+            // construction rather than by a normalise step: the output is
+            // cos_r * u + sin_r * t with u and t orthonormal, whose norm is
+            // sqrt(cos_r^2 + sin_r^2) = 1. Angular corpus, and on unit vectors
+            // Euclidean 1-NN is the same ranking as angular 1-NN. min_recall is
+            // copied from SIFT and has NOT been measured for this corpus; see
+            // the spec's Follow-ups.
+            Scenario::NYTIMES_256 => ScenarioConfig {
+                n_queries: 7_000,
+                database_size: 700_000,
+                vector_dims: 256,
+                weights: NYTIMES_256_BLOB,
                 min_recall: 0.9,
                 recall_tolerance: 1e-6,
                 audit_samples: 1_000,
