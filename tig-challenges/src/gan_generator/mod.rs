@@ -5,17 +5,21 @@
 
 pub mod blob;
 pub mod mlp;
+pub mod spherical;
 pub mod v1;
 
 use anyhow::{anyhow, Result};
 use blob::Tensor;
 pub use mlp::Mlp;
+pub use spherical::Spherical;
 pub use v1::Layer;
 
 pub const ARCH_MLP: u32 = 0;
+pub const ARCH_SPHERICAL: u32 = 2;
 
 pub enum Generator {
     Mlp(Mlp),
+    Spherical(Spherical),
 }
 
 impl Generator {
@@ -28,6 +32,7 @@ impl Generator {
         let container = blob::parse_container(blob)?;
         match container.arch {
             ARCH_MLP => Ok(Generator::Mlp(Mlp::from_container(container)?)),
+            ARCH_SPHERICAL => Ok(Generator::Spherical(Spherical::from_container(container)?)),
             other => Err(anyhow!("weight blob declares unknown arch {}", other)),
         }
     }
@@ -35,12 +40,14 @@ impl Generator {
     pub fn latent_dim(&self) -> usize {
         match self {
             Generator::Mlp(m) => m.layers[0].in_dim,
+            Generator::Spherical(s) => s.trunk[0].in_dim + s.tangent_in.in_dim,
         }
     }
 
     pub fn output_dim(&self) -> usize {
         match self {
             Generator::Mlp(m) => m.layers.last().unwrap().out_dim,
+            Generator::Spherical(s) => s.direction.out_dim,
         }
     }
 
@@ -60,6 +67,12 @@ impl Generator {
                 }
                 Ok(m.forward_cpu(latent))
             }
+            Generator::Spherical(s) => {
+                if gate_noise.is_some() {
+                    return Err(anyhow!("gate noise supplied to a spherical generator"));
+                }
+                Ok(s.forward_cpu(latent))
+            }
         }
     }
 }
@@ -74,6 +87,18 @@ impl std::fmt::Debug for Generator {
                 .debug_struct("Generator::Mlp")
                 .field("layers", &m.layers.iter().map(|l| (l.in_dim, l.out_dim)).collect::<Vec<_>>())
                 .field("normalize_eps", &m.normalize_eps)
+                .finish(),
+            Generator::Spherical(s) => f
+                .debug_struct("Generator::Spherical")
+                .field("trunk", &s.trunk.iter().map(|l| (l.in_dim, l.out_dim)).collect::<Vec<_>>())
+                .field("direction", &(s.direction.in_dim, s.direction.out_dim))
+                .field("tangent_in", &(s.tangent_in.in_dim, s.tangent_in.out_dim))
+                .field("gamma", &(s.gamma.in_dim, s.gamma.out_dim))
+                .field("beta", &(s.beta.in_dim, s.beta.out_dim))
+                .field("tangent_out", &(s.tangent_out.in_dim, s.tangent_out.out_dim))
+                .field("cos_r", &s.cos_r)
+                .field("sin_r", &s.sin_r)
+                .field("eps", &s.eps)
                 .finish(),
         }
     }
@@ -135,10 +160,6 @@ pub(crate) fn dense(it: &mut std::vec::IntoIter<Tensor>, what: &str) -> Result<L
 
 /// A bias-free map, as a `Layer` with a zero bias so it runs through the same
 /// dense code on both CPU and GPU.
-///
-/// `Mlp` (this task) has no bias-free layer, so nothing in-crate calls this
-/// yet; Tasks 4 and 5 add the architectures that do.
-#[allow(dead_code)]
 pub(crate) fn no_bias(it: &mut std::vec::IntoIter<Tensor>, what: &str) -> Result<Layer> {
     let w = next_tensor(it, what)?;
     Ok(Layer { in_dim: w.cols, out_dim: w.rows, bias: vec![0.0; w.rows], weights: w.data })
@@ -265,5 +286,67 @@ pub(crate) mod tests {
         let g = Generator::from_blob(&b).unwrap();
         assert!(g.forward_cpu(&[0.0; 4], Some(&[0.0; 2])).is_err());
         assert!(g.forward_cpu(&[0.0; 3], None).is_err(), "wrong latent length must be an error, not a panic");
+    }
+
+    const NYT: &[u8] = include_bytes!("../vector_search/weights/nytimes_256_v3.bin");
+
+    #[test]
+    fn nytimes_blob_matches_pytorch() {
+        assert_matches_golden(NYT, include_str!("../vector_search/weights/nytimes_256_v3.golden.json"), false);
+    }
+
+    #[test]
+    fn nytimes_blob_declares_its_shape() {
+        let g = Generator::from_blob(NYT).unwrap();
+        assert_eq!((g.latent_dim(), g.output_dim()), (512, 256));
+        let Generator::Spherical(s) = &g else { panic!("expected the spherical variant") };
+        assert_eq!(s.trunk[0].in_dim, 256, "trunk consumes latent_dim - skip_dim");
+        assert_eq!(s.tangent_in.in_dim, 256, "tangent_in consumes skip_dim");
+        assert!((s.cos_r * s.cos_r + s.sin_r * s.sin_r - 1.0).abs() < 1e-6);
+        assert!(s.sin_r > 0.19 && s.cos_r > 0.07, "r lies in [0.2, 1.5], so both are positive");
+    }
+
+    #[test]
+    fn spherical_output_is_unit_norm_and_the_tangent_is_orthogonal() {
+        let g = Generator::from_blob(NYT).unwrap();
+        let Generator::Spherical(s) = &g else { panic!() };
+        let latent: Vec<f32> = (0..512).map(|i| ((i * 37 % 101) as f32) / 50.0 - 1.0).collect();
+        let out = g.forward_cpu(&latent, None).unwrap();
+        let norm = out.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-5, "norm was {norm}");
+        // out . u == cos_r exactly when t is orthogonal to u and both are unit.
+        let u = s.direction_cpu(&latent);
+        let dot: f32 = out.iter().zip(&u).map(|(a, b)| a * b).sum();
+        assert!((dot - s.cos_r).abs() < 1e-5, "out.u was {dot}, cos_r is {}", s.cos_r);
+    }
+
+    /// trunk 4->3, direction 2x3, tangent_in 5x4 (+b), gamma 5x3 (+b), beta 5x3 (+b), tangent_out 2x5 (+b)
+    fn tiny_spherical(latent: u32, shapes: &[(u32, u32)]) -> Vec<u8> {
+        container_bytes(2, latent, 2, &[0.6, 0.8, 1e-8], shapes)
+    }
+    const TINY_SPH: [(u32, u32); 11] =
+        [(3, 4), (3, 1), (2, 3), (5, 4), (5, 1), (5, 3), (5, 1), (5, 3), (5, 1), (2, 5), (2, 1)];
+
+    #[test]
+    fn spherical_accepts_a_consistent_tiny_blob() {
+        assert!(Generator::from_blob(&tiny_spherical(8, &TINY_SPH)).is_ok());
+    }
+
+    #[test]
+    fn spherical_rejects_a_latent_that_is_not_trunk_plus_skip() {
+        assert!(Generator::from_blob(&tiny_spherical(9, &TINY_SPH)).unwrap_err().to_string().contains("latent"));
+    }
+
+    #[test]
+    fn spherical_rejects_a_gamma_that_does_not_match_tangent_in() {
+        let mut shapes = TINY_SPH;
+        shapes[5] = (6, 3);
+        shapes[6] = (6, 1);
+        assert!(Generator::from_blob(&tiny_spherical(8, &shapes)).unwrap_err().to_string().contains("gamma"));
+    }
+
+    #[test]
+    fn spherical_rejects_an_even_tensor_count() {
+        assert!(Generator::from_blob(&tiny_spherical(8, &TINY_SPH[..10])).unwrap_err().to_string().contains("tensors"));
     }
 }
