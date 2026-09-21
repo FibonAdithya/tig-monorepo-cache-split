@@ -213,7 +213,7 @@ the same as "this challenge has no build phase".
 > arithmetic. Until then, do not set `build_fuel_alpha` in protocol config — with
 > the master unwired, every c004 batch would fail.
 
-Design and rationale: `docs/superpowers/specs/2026-08-31-c004-index-build-split-design.md`.
+Design and rationale: `docs/ai/specs/2026-08-31-c004-index-build-split-design.md`.
 Challenge semantics: [`vector_search/README.md`](../tig-challenges/src/vector_search/README.md).
 
 # License

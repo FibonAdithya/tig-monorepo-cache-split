@@ -62,7 +62,7 @@ def run_build_index(batch, so_path, ptx_path, results_dir):
     """Build the index once per batch, before any nonce is computed.
 
     Deliberately passes no nonce: the build process must not be able to derive
-    a query set. See docs/superpowers/specs/2026-08-31-c004-index-build-split-design.md.
+    a query set. See docs/ai/specs/2026-08-31-c004-index-build-split-design.md.
     """
     index_path = f"{results_dir}/{batch['id']}/index.blob"
     os.makedirs(os.path.dirname(index_path), exist_ok=True)

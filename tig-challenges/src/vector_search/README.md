@@ -163,17 +163,17 @@ with `--index`, and the blob crosses between them **only** through the
 **For reviewing the design** — read in this order, each supersedes parts of the
 one before:
 
-1. `docs/superpowers/specs/2026-08-13-gan-instance-generation-design.md` — the
+1. `docs/ai/specs/2026-08-13-gan-instance-generation-design.md` — the
    generator, determinism, and the `## Validation` section with measured
    evidence. Validated on a single GPU architecture only.
-2. `docs/superpowers/specs/2026-08-25-per-scenario-gan-tracks-design.md` —
+2. `docs/ai/specs/2026-08-25-per-scenario-gan-tracks-design.md` —
    supersedes the track model above.
-3. `docs/superpowers/specs/2026-08-31-c004-index-build-split-design.md` — the
+3. `docs/ai/specs/2026-08-31-c004-index-build-split-design.md` — the
    build/solve split. Carries a blocking warning; read it before touching
    config.
 4. `docs/measurements/2026-08-31-c004-post-split-nonce-time.md` — the
    measurements that set `alpha` and the memory cap.
-5. `docs/superpowers/2026-08-27-recall-gated-c004-monorepo-followups.md` — what
+5. `docs/ai/2026-08-27-recall-gated-c004-monorepo-followups.md` — what
    the implementation found that the specs got wrong. Short, and the highest
    signal of the five.
 
@@ -181,7 +181,7 @@ The recall-gating design doc itself is **not in this repo** — it lives at
 `docs/superpowers/specs/2026-08-27-recall-gated-c004-design.md` in the
 `tig-pentesting` repo.
 
-**Not review material:** everything under `docs/superpowers/plans/`. Those are
+**Not review material:** everything under `docs/ai/plans/`. Those are
 agent execution artifacts — task-by-task implementation plans, each opening with
 a `> **For agentic workers:**` banner and using `- [ ]` checkboxes. They record
 how the work was carried out, not what was decided or why. Nothing in them is

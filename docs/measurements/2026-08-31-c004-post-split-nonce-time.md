@@ -1,7 +1,7 @@
 # c004 post-split per-nonce time, `alpha`, and the memory cap
 
 **Date:** 2026-08-31 (revised the same day after review — see §11 for what changed)
-**Measures:** `docs/superpowers/specs/2026-08-31-c004-index-build-split-design.md`
+**Measures:** `docs/ai/specs/2026-08-31-c004-index-build-split-design.md`
 **Code under test:** branch `vector_search/gan_instance_gen` at `d0487f97`
 (byte-identical in code to `be650a7c`; `git diff --stat be650a7c d0487f97` shows
 exactly one file changed, 519 insertions and 17 deletions, and no source file at
