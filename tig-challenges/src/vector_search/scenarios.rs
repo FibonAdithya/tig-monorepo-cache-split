@@ -159,6 +159,15 @@ mod tests {
     }
 
     #[test]
+    fn nytimes_wire_string_is_literal() {
+        // The literal, for the same reason the SIFT and GloVe tests above pin
+        // one: this is what the protocol puts in settings.track_id.
+        assert_eq!(Scenario::NYTIMES_256.to_string(), "nytimes_256");
+        assert_eq!(Scenario::from_str("nytimes_256").unwrap(), Scenario::NYTIMES_256);
+        assert_eq!(Scenario::from_str("NYTIMES_256").unwrap(), Scenario::NYTIMES_256);
+    }
+
+    #[test]
     fn scenario_from_str_rejects_unknown() {
         // `deep_96`, not `glove_300`: glove_100 is a real scenario now, and a
         // rejection test whose input is one character away from a valid name

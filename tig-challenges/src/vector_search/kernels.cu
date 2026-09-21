@@ -224,6 +224,91 @@ extern "C" __global__ void gan_row_normalize(
     }
 }
 
+// out = leaky(a * (1 + gamma) + beta), element-wise over `count` values.
+//
+// Element-wise, not row-wise: `count` is rows * width, so one thread owns one
+// value rather than a whole row. The largest product this crate launches is
+// 131,072 rows (FORWARD_CHUNK is 65,536; the launch-geometry test goes to twice
+// that) at width 512, which is 67,108,864 -- well inside `int`, so the index,
+// the stride and `count` itself all stay 32-bit as in the kernels above.
+extern "C" __global__ void gan_film_leaky(
+    const float *a,
+    const float *gamma,
+    const float *beta,
+    float *out,
+    const int count
+)
+{
+    for (int i = threadIdx.x + blockIdx.x * blockDim.x; i < count;
+         i += blockDim.x * gridDim.x)
+    {
+        const float v = fmaf(a[i], 1.0f + gamma[i], beta[i]);
+        out[i] = (v >= 0.0f) ? v : (v * 0.2f);
+    }
+}
+
+// The spherical generator's last step, per row:
+//   u = unit(d);  t = unit(v - (v.u) u);  out = cos_r * u + sin_r * t
+// `d` and `v` are scratch and are overwritten with u and t.
+//
+// Every fmaf here has a matching mul_add in `Spherical::forward_cpu`, in the
+// same operand order, and the divide by `norm` happens before the multiply by
+// `sin_r` for the same reason: `normalize_cpu` stores t/norm back as f32 and
+// only then scales it. Keep them in step if either changes.
+extern "C" __global__ void gan_sphere_combine(
+    float *d,
+    float *v,
+    float *out,
+    const int n,
+    const int dim,
+    const float cos_r,
+    const float sin_r,
+    const float eps,
+    const int out_row_offset
+)
+{
+    for (int i = threadIdx.x + blockIdx.x * blockDim.x; i < n;
+         i += blockDim.x * gridDim.x)
+    {
+        float *u = d + (long long)i * dim;
+        float *t = v + (long long)i * dim;
+        float *o = out + (long long)(out_row_offset + i) * dim;
+
+        float ss = 0.0f;
+        for (int j = 0; j < dim; ++j) {
+            ss = fmaf(u[j], u[j], ss);
+        }
+        float norm = sqrtf(ss);
+        if (norm < eps) {
+            norm = eps;
+        }
+        for (int j = 0; j < dim; ++j) {
+            u[j] = u[j] / norm;
+        }
+
+        float dot = 0.0f;
+        for (int j = 0; j < dim; ++j) {
+            dot = fmaf(t[j], u[j], dot);
+        }
+        for (int j = 0; j < dim; ++j) {
+            t[j] = fmaf(-dot, u[j], t[j]);
+        }
+
+        ss = 0.0f;
+        for (int j = 0; j < dim; ++j) {
+            ss = fmaf(t[j], t[j], ss);
+        }
+        norm = sqrtf(ss);
+        if (norm < eps) {
+            norm = eps;
+        }
+
+        for (int j = 0; j < dim; ++j) {
+            o[j] = fmaf(cos_r, u[j], sin_r * (t[j] / norm));
+        }
+    }
+}
+
 #define AUDIT_BLOCK 256
 #define AUDIT_MAX_DIMS 256
 

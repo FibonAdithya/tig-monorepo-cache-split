@@ -561,6 +561,17 @@ mod track_tests {
     }
 
     #[test]
+    fn nytimes_track_uses_the_protocol_wire_form() {
+        let encoded = serde_json::to_string(&Track {
+            s: Scenario::NYTIMES_256,
+        })
+        .unwrap();
+        assert_eq!(encoded, r#""s=nytimes_256""#);
+        let track: Track = serde_json::from_str(r#""s=nytimes_256""#).unwrap();
+        assert_eq!(track.s, Scenario::NYTIMES_256);
+    }
+
+    #[test]
     fn track_rejects_unknown_scenario() {
         // `deep_96`, not `glove_300`: glove_100 is a real scenario now, and a
         // rejection test whose input is one character away from a valid name
@@ -1874,6 +1885,12 @@ extern "C" __global__ void reference_nn_search(
         assert_eq!(assert_gpu_matches_cpu(Scenario::GLOVE_100, |_, _, _| false), 1024);
     }
 
+    #[test]
+    fn nytimes_gpu_forward_matches_the_cpu_reference() {
+        // Skips nothing, so all 1024 rows must compare -- see the GloVe caller.
+        assert_eq!(assert_gpu_matches_cpu(Scenario::NYTIMES_256, |_, _, _| false), 1024);
+    }
+
     fn generated_rows(
         scenario: Scenario,
         seed: [u8; 32],
@@ -1939,6 +1956,16 @@ extern "C" __global__ void reference_nn_search(
         assert_invariant_to_launch_geometry(Scenario::GLOVE_100);
     }
 
+    #[test]
+    fn nytimes_output_is_invariant_to_launch_geometry() {
+        // Kept alongside the GPU-vs-CPU test rather than folded into it:
+        // `assert_gpu_matches_cpu` runs one 1,024-row chunk at global index 0
+        // and out_row_offset 0, so only this test and the unit-norm one below
+        // can see a spherical driver that mishandles a non-zero index or offset
+        // -- including the second latent stream taking a chunk-local index.
+        assert_invariant_to_launch_geometry(Scenario::NYTIMES_256);
+    }
+
     /// Every database row is unit-norm. Returns the rows for further checks.
     fn assert_database_rows_are_unit_norm(scenario: Scenario) -> (Vec<f32>, usize) {
         let (challenge, _module, stream, _prop) = gpu_instance_for(scenario, 11);
@@ -1959,6 +1986,15 @@ extern "C" __global__ void reference_nn_search(
     #[test]
     fn glove_database_rows_are_unit_norm() {
         assert_database_rows_are_unit_norm(Scenario::GLOVE_100);
+    }
+
+    #[test]
+    fn nytimes_database_rows_are_unit_norm() {
+        // Unit norm is structural for the spherical generator, not a separate
+        // normalise step: out = cos_r * u + sin_r * t with u and t orthonormal
+        // has norm sqrt(cos_r^2 + sin_r^2) = 1. So this fails if
+        // `gan_sphere_combine` skips either normalise or the projection.
+        assert_database_rows_are_unit_norm(Scenario::NYTIMES_256);
     }
 
     /// The same two probes `exact_1nn_measures_recall_1` and
@@ -1987,5 +2023,69 @@ extern "C" __global__ void reference_nn_search(
     #[test]
     fn recall_probes_hold_on_glove() {
         assert_recall_probes(Scenario::GLOVE_100);
+    }
+
+    #[test]
+    fn recall_probes_hold_on_nytimes() {
+        // 256 dims is exactly AUDIT_MAX_DIMS, so this is where an audit that
+        // stages one element past the end of its buffer shows up.
+        assert_recall_probes(Scenario::NYTIMES_256);
+    }
+
+    /// Pearson correlation of two equal-length samples, in f64.
+    fn correlation(x: &[f32], y: &[f32]) -> f64 {
+        let n = x.len() as f64;
+        let (mx, my) = (
+            x.iter().map(|v| *v as f64).sum::<f64>() / n,
+            y.iter().map(|v| *v as f64).sum::<f64>() / n,
+        );
+        let (mut sxy, mut sxx, mut syy) = (0.0, 0.0, 0.0);
+        for (a, b) in x.iter().zip(y) {
+            let (da, db) = (*a as f64 - mx, *b as f64 - my);
+            sxy += da * db;
+            sxx += da * da;
+            syy += db * db;
+        }
+        sxy / (sxx * syy).sqrt()
+    }
+
+    fn column(data: &[f32], width: usize, offset: usize) -> Vec<f32> {
+        data.chunks_exact(width).map(|row| row[offset]).collect()
+    }
+
+    /// The trunk and skip latents must be independent draws. If the 1 << 30
+    /// offset were dropped, both calls would seed curand identically and
+    /// column j of z_t would EQUAL column j of z_s: correlation 1.0.
+    /// For independent columns over 65,536 rows the correlation has standard
+    /// deviation 1/sqrt(65536) = 0.0039, so 0.05 is about 13 sigma.
+    ///
+    /// The column indexing is the contract on `read_inputs` for a spherical
+    /// generator: each row comes back as `[z_t (256) | z_s (256)]`, width 512,
+    /// which is the order `Spherical::forward_cpu` splits the latent in. The
+    /// `latent_dim` assertion below pins those literals against the blob.
+    #[test]
+    fn nytimes_trunk_and_skip_latents_are_independent() {
+        const ROWS: usize = 65_536;
+        let (module, stream) = gpu_context();
+        let generator =
+            Generator::from_blob(ScenarioConfig::from(Scenario::NYTIMES_256).weights).unwrap();
+        assert_eq!(generator.latent_dim(), 512, "the 512/256 offsets below assume this shape");
+        let d_seed = stream.memcpy_stod(&[7u8; 32]).unwrap();
+        let mut device = generator::DeviceGenerator::new(
+            &generator,
+            ROWS,
+            generator::ROW_BLOCK,
+            &module,
+            stream.clone(),
+        )
+        .unwrap();
+        device.sample_inputs(&d_seed, ROWS, 0).unwrap();
+        stream.synchronize().unwrap();
+        let (latents, _) = device.read_inputs(ROWS).unwrap();
+        assert_eq!(latents.len(), ROWS * 512);
+        for j in 0..256 {
+            let r = correlation(&column(&latents, 512, j), &column(&latents, 512, 256 + j));
+            assert!(r.abs() < 0.05, "z_t column {j} correlates with z_s column {j}: r = {r}");
+        }
     }
 }
