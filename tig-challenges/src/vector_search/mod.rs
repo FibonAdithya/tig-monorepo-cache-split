@@ -2436,4 +2436,302 @@ extern "C" __global__ void test_gate_noise_from_uniform(
         // the noise is -18.4207. Bounding at -18.0 leaves 0.42 of margin.
         assert!(out[3] < -18.0, "u at the bottom of the interval gave {}", out[3]);
     }
+
+    // ---- The Task 10 measurements ----
+    //
+    // Everything below is `#[ignore]`d and asserts nothing about any measured
+    // value: these tests print numbers, and one of them writes files. They do
+    // not run in the default suite, so the default count is unchanged -- but
+    // libtest still COMPILES them on every run, so a mistake here breaks the
+    // whole suite and they get the same care as the assertions above.
+    //
+    // `.unwrap()` throughout rather than a soft failure: a measurement that
+    // silently could not take its reading is worse than one that stops.
+
+    /// FNV-1a over raw bytes, 64-bit: offset basis 0xcbf29ce484222325, prime
+    /// 0x100000001b3, wrapping. Only `dump_rows_for_the_wgan_gates` uses it, to
+    /// RECORD what a dump's bytes were on the card that produced it.
+    fn fnv1a64(bytes: &[u8]) -> u64 {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in bytes {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h
+    }
+
+    /// Writes 50,000 generated rows per scenario as raw little-endian f32 into
+    /// `$TIG_DUMP_DIR`, for the WGAN repo's gate check, and prints each dump's
+    /// path, shape and FNV-1a digest. Asserts nothing about the values: the
+    /// acceptance decision is the WGAN repo's `check_gate`, run on the dumps
+    /// afterwards, not an assertion here.
+    ///
+    /// The digest is PRINTED, never compared against a literal. The generation
+    /// kernels are built with `--use_fast_math`, which makes division, sqrt and
+    /// the transcendentals approximate and lets their results differ between GPU
+    /// architectures, so a hard-coded digest would fail on a different card for a
+    /// reason that is not a defect. What it is for: a future run on another card
+    /// can print its own digests and compare. `DIGEST_1K` covers the first 1,000
+    /// rows only, so a mismatch in both lines means the output differs from the
+    /// very start while a mismatch in `DIGEST` alone localises it past row 1,000
+    /// without transferring either dump.
+    ///
+    /// 50,000 is below `FORWARD_CHUNK` (65,536), so each dump is generated in ONE
+    /// chunk and exercises no chunk boundary. That is deliberate -- the dump is a
+    /// sample of the distribution, and the chunk-boundary behaviour is what
+    /// `*_output_is_invariant_to_launch_geometry` covers over 200,000 rows.
+    ///
+    /// Run with:
+    /// `BOX_ENV="TIG_TEST_EXTRA=--ignored" scripts/box_submit.sh task10-dump gpu dump_rows_for_the_wgan_gates`
+    #[test]
+    #[ignore]
+    fn dump_rows_for_the_wgan_gates() {
+        const ROWS: usize = 50_000;
+        const CHUNK: usize = 65_536;
+        const BLOCK: u32 = 256;
+        // `expect` rather than a default: writing 97 MB into whatever the
+        // runner's working directory happens to be, on a tree it may clean
+        // between jobs, is not a reasonable fallback. scripts/box_test.sh
+        // exports this.
+        let dir = PathBuf::from(std::env::var("TIG_DUMP_DIR").expect("set TIG_DUMP_DIR"));
+        std::fs::create_dir_all(&dir).unwrap();
+        for scenario in Scenario::ALL {
+            let rows = generated_rows(scenario, [42u8; 32], ROWS, CHUNK, BLOCK);
+            // Derived from the returned length, not from ScenarioConfig: this is
+            // the width the bytes on disk actually have, which is what the
+            // reader reshapes by.
+            assert_eq!(rows.len() % ROWS, 0, "{}: {} values is not a whole number of rows", scenario, rows.len());
+            let dims = rows.len() / ROWS;
+            let bytes: Vec<u8> = rows.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let path = dir.join(format!("{}.f32", scenario));
+            std::fs::write(&path, &bytes).unwrap();
+            println!("wrote {} ({} rows x {} dims)", path.display(), ROWS, dims);
+            println!(
+                "DIGEST scenario={} rows={} dims={} seed=42x32 chunk={} block={} fnv1a64={:016x}",
+                scenario, ROWS, dims, CHUNK, BLOCK, fnv1a64(&bytes)
+            );
+            println!(
+                "DIGEST_1K scenario={} rows=1000 dims={} seed=42x32 chunk={} block={} fnv1a64={:016x}",
+                scenario, dims, CHUNK, BLOCK, fnv1a64(&bytes[..1_000 * dims * 4])
+            );
+        }
+    }
+
+    /// Prints `Database::generate`'s wall time per scenario, three runs each,
+    /// with the stream synchronised before the clock stops. Asserts nothing: no
+    /// wall-clock value is a correctness property, and a timing assertion would
+    /// fail on a busy or a different card.
+    ///
+    /// All three runs are printed rather than a minimum or a median. The first
+    /// run of a scenario pays for uploading that scenario's weights and for
+    /// loading the kernels it is the first to use, so it is not comparable with
+    /// the other two, and hiding it behind a summary would hide exactly that.
+    ///
+    /// Each seed differs per run (`run + 1`), so no run can be served from a
+    /// cache keyed on the seed, and none of them is `[0u8; 32]`.
+    ///
+    /// Run with:
+    /// `BOX_ENV="TIG_TEST_EXTRA=--ignored" scripts/box_submit.sh task10-times gpu print_generation_times`
+    #[test]
+    #[ignore]
+    fn print_generation_times() {
+        let (module, stream) = gpu_context();
+        let prop = get_device_prop(0).unwrap();
+        for scenario in Scenario::ALL {
+            for run in 0..3u8 {
+                let start = std::time::Instant::now();
+                let db = Database::generate(
+                    &[run + 1; 32],
+                    &Track { s: scenario },
+                    module.clone(),
+                    stream.clone(),
+                    &prop,
+                )
+                .unwrap();
+                stream.synchronize().unwrap();
+                println!(
+                    "GENERATION_MS scenario={} run={} ms={}",
+                    scenario,
+                    run,
+                    start.elapsed().as_millis()
+                );
+                // Dropped before the next iteration allocates: a NYTimes
+                // database is 700,000 x 256 x 4 = 717 MB of device memory, so
+                // three live at once would be 2.2 GB on top of the weights and
+                // the driver's scratch buffers.
+                drop(db);
+            }
+        }
+    }
+
+    /// Counts SIFT gate margins close to zero, on the CPU reference over 4,096
+    /// rows of GPU-drawn inputs. Asserts nothing about the counts -- they are the
+    /// measurement. The only assertions are the two read-back lengths, which say
+    /// that the row slicing below is indexing what it thinks it is.
+    ///
+    /// Why it matters. A margin is `logit_j + smoothed_noise_j`, and its SIGN
+    /// decides whether coordinate j is a magnitude or an exact zero. The GPU's
+    /// tanh and the host's differ in the last bits, so a margin near zero can
+    /// fall either way between the two -- and a flipped gate changes the whole
+    /// row, because the row is renormalised afterwards. The spec estimated 1-10
+    /// such coordinates per 128-dim instance row without measuring it; this is
+    /// the measurement, and `sift_gpu_forward_matches_the_cpu_reference` skips
+    /// rows inside the 1e-4 band on the strength of it.
+    ///
+    /// Three thresholds rather than the spec's one: the extra two cost nothing
+    /// (the margins are already computed) and they show whether the density near
+    /// zero is flat, which is what makes an extrapolation from a 524,288-gate
+    /// sample to a whole instance defensible or not.
+    ///
+    /// Run with:
+    /// `BOX_ENV="TIG_TEST_EXTRA=--ignored" scripts/box_submit.sh task10-gates gpu count_sift_gates_near_the_threshold`
+    #[test]
+    #[ignore]
+    fn count_sift_gates_near_the_threshold() {
+        const ROWS: usize = 4096;
+        let (module, stream) = gpu_context();
+        let generator =
+            Generator::from_blob(ScenarioConfig::from(Scenario::SIFT_128).weights).unwrap();
+        let Generator::StructuredGate(s) = &generator else {
+            panic!("SIFT_128 should be structured_gate")
+        };
+        // Read off the blob, not written as 128: `gate_margin_cpu` takes one
+        // noise value per OUTPUT coordinate and a latent of the trunk's width,
+        // and those are different numbers in general even though both are 128
+        // here.
+        let (latent_dim, out_dim) = (generator.latent_dim(), generator.output_dim());
+        let d_seed = stream.memcpy_stod(&[7u8; 32]).unwrap();
+        let mut device = generator::DeviceGenerator::new(
+            &generator,
+            ROWS,
+            generator::ROW_BLOCK,
+            &module,
+            stream.clone(),
+        )
+        .unwrap();
+        device.sample_inputs(&d_seed, ROWS, 0).unwrap();
+        stream.synchronize().unwrap();
+        let (latents, noise) = device.read_inputs(ROWS).unwrap();
+        let noise = noise.expect("structured_gate has gate noise");
+        assert_eq!(latents.len(), ROWS * latent_dim);
+        assert_eq!(noise.len(), ROWS * out_dim);
+
+        let (mut within_5, mut within_4, mut within_3) = (0usize, 0usize, 0usize);
+        for row in 0..ROWS {
+            let margins = s.gate_margin_cpu(
+                &latents[row * latent_dim..(row + 1) * latent_dim],
+                &noise[row * out_dim..(row + 1) * out_dim],
+            );
+            for m in &margins {
+                // Nested, not chained with `else`: each band contains the
+                // narrower ones, so the three counts are cumulative and
+                // `within_1e-5 <= within_1e-4 <= within_1e-3` by construction.
+                let a = m.abs();
+                if a < 1.0e-3 {
+                    within_3 += 1;
+                    if a < 1.0e-4 {
+                        within_4 += 1;
+                        if a < 1.0e-5 {
+                            within_5 += 1;
+                        }
+                    }
+                }
+            }
+        }
+        println!(
+            "NEAR_THRESHOLD rows={} gates={} within_1e-5={} within_1e-4={} within_1e-3={}",
+            ROWS,
+            ROWS * out_dim,
+            within_5,
+            within_4,
+            within_3
+        );
+    }
+
+    /// Prints the distribution of the NYTimes spherical generator's PROJECTED
+    /// TANGENT norm over GPU-drawn latents. Asserts nothing about the numbers --
+    /// they are the measurement. The only assertion is the read-back length,
+    /// which says that the row slicing below is indexing what it thinks it is.
+    ///
+    /// Why it matters. `gan_sphere_combine` computes `v <- v - (v.u) u` and then
+    /// `t = v / max(||v||, eps)` with eps = 1e-8. When `v` is nearly parallel to
+    /// `u` the projection leaves almost nothing behind and the division amplifies
+    /// a last-bit difference in `v` by up to `1 / ||v||`. Under `--use_fast_math`
+    /// sqrt and division are approximate, so such a row is where this generator
+    /// could differ materially between GPU architectures. The spec named that
+    /// class of risk for SIFT's gate and not for NYTimes; this says how small the
+    /// norm actually gets.
+    ///
+    /// Computed on the CPU from the latents the GPU drew, not on the GPU: the
+    /// kernel never writes the pre-normalisation norm anywhere a test could read
+    /// it, and the CPU reference is within a few ulp of it (which
+    /// `nytimes_gpu_forward_matches_the_cpu_reference` already pins) -- far
+    /// closer than the orders of magnitude this measurement is about.
+    ///
+    /// Cost: 8,192 rows times one 256 -> 512 -> 1024 -> 1024 trunk plus the
+    /// direction, tangent_in, gamma, beta and tangent_out maps, which is
+    /// 3,276,800 multiply-adds per row (computed from the blob's tensor shapes)
+    /// and 2.7e10 in total. MEASURED on a development workstation in a debug
+    /// build, 2026-09-21: 55 ms per row. ESTIMATE from that, for the box: about
+    /// 450 s for the loop, on top of the crate build and the nvcc PTX build the
+    /// job pays anyway, so it fits inside `box_submit.sh`'s default 5,400 s
+    /// timeout even on a CPU several times slower. If a slower box makes it
+    /// tight, reduce ROWS: the `rows=` field is printed from the constant, so the
+    /// reader never has to assume it.
+    ///
+    /// Run with:
+    /// `BOX_ENV="TIG_TEST_EXTRA=--ignored" scripts/box_submit.sh task10-tangent gpu measure_nytimes_projected_tangent_norms`
+    #[test]
+    #[ignore]
+    fn measure_nytimes_projected_tangent_norms() {
+        const ROWS: usize = 8_192;
+        let (module, stream) = gpu_context();
+        let generator =
+            Generator::from_blob(ScenarioConfig::from(Scenario::NYTIMES_256).weights).unwrap();
+        let Generator::Spherical(s) = &generator else {
+            panic!("NYTIMES_256 should be spherical")
+        };
+        let latent_dim = generator.latent_dim();
+        let d_seed = stream.memcpy_stod(&[7u8; 32]).unwrap();
+        let mut device = generator::DeviceGenerator::new(
+            &generator,
+            ROWS,
+            generator::ROW_BLOCK,
+            &module,
+            stream.clone(),
+        )
+        .unwrap();
+        device.sample_inputs(&d_seed, ROWS, 0).unwrap();
+        stream.synchronize().unwrap();
+        // `read_inputs` hands a spherical row back as `[z_t | z_s]`, width
+        // latent_dim, which is the order `Spherical` splits a latent in, so a
+        // row slices straight into the CPU reference.
+        let (latents, _) = device.read_inputs(ROWS).unwrap();
+        assert_eq!(latents.len(), ROWS * latent_dim);
+
+        let mut norms: Vec<f32> = (0..ROWS)
+            .map(|row| {
+                s.projected_tangent_norm_cpu(&latents[row * latent_dim..(row + 1) * latent_dim])
+            })
+            .collect();
+        let below_3 = norms.iter().filter(|n| **n < 1.0e-3).count();
+        let below_5 = norms.iter().filter(|n| **n < 1.0e-5).count();
+        // `total_cmp` rather than `partial_cmp().unwrap()`: it is a total order,
+        // so a NaN cannot panic the sort or leave the vector misordered. A NaN
+        // would not be hidden either -- `total_cmp` puts a positive NaN above
+        // +inf and a negative one below -inf, so it lands at an end of the
+        // printed percentiles while neither `below_` count includes it (every
+        // comparison against a NaN is false), and that disagreement is visible.
+        norms.sort_by(f32::total_cmp);
+        println!(
+            "TANGENT_NORM rows={} min={} p0.1={} p1={} p50={} below_1e-3={} below_1e-5={}",
+            ROWS,
+            norms[0],
+            norms[ROWS / 1000],
+            norms[ROWS / 100],
+            norms[ROWS / 2],
+            below_3,
+            below_5
+        );
+    }
 }
