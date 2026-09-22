@@ -2623,6 +2623,94 @@ extern "C" __global__ void test_gate_noise_from_uniform(
         }
     }
 
+    /// Reproducibility probe over the FULL instance (700,000 database rows and
+    /// 7,000 queries) for every scenario, with fixed seeds. Three checks:
+    ///
+    /// 1. In-process: the same seeds generated twice, on two separate CUDA
+    ///    contexts, must agree bit for bit over every float of both buffers.
+    /// 2. Control: a different seed pair must change both buffers, so that
+    ///    check 1 cannot be satisfied by a generator that ignores its seed.
+    /// 3. Cross-process: each buffer is written as raw little-endian f32 into
+    ///    `$TIG_DUMP_DIR` and its FNV-1a digest is PRINTED, so two separate
+    ///    jobs (or two cards, or two days) can be compared with `sha256sum`
+    ///    without either job knowing about the other. The digest is not
+    ///    compared against a literal here, for the reason
+    ///    `dump_rows_for_the_wgan_gates` gives: `--use_fast_math` lets results
+    ///    differ between GPU architectures, and that is not a defect.
+    ///
+    /// Run with:
+    /// `BOX_ENV="TIG_TEST_EXTRA=--ignored TIG_DUMP_DIR=/workspace/tig-dumps/<run>" scripts/box_submit.sh <run> gpu dump_full_instances_for_reproducibility`
+    #[test]
+    #[ignore]
+    fn dump_full_instances_for_reproducibility() {
+        let dir = PathBuf::from(std::env::var("TIG_DUMP_DIR").expect("set TIG_DUMP_DIR"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prop = get_device_prop(0).unwrap();
+        let seeds = Seeds {
+            nonce: [1u8; 32],
+            db: [7u8; 32],
+        };
+        let control_seeds = Seeds {
+            nonce: [2u8; 32],
+            db: [8u8; 32],
+        };
+        // A fresh context per call: nothing on the device (an allocator
+        // state, a cached module) survives from the first generation into the
+        // second, which is what makes this a two-process check in miniature.
+        let generate = |scenario: Scenario, seeds: &Seeds| -> (Vec<f32>, Vec<f32>) {
+            let (module, stream) = gpu_context();
+            let challenge =
+                Challenge::generate_instance(seeds, &Track { s: scenario }, module, stream.clone(), &prop)
+                    .unwrap();
+            stream.synchronize().unwrap();
+            let db = stream.memcpy_dtov(&challenge.d_database_vectors).unwrap();
+            let q = stream.memcpy_dtov(&challenge.d_query_vectors).unwrap();
+            assert_eq!(db.len(), 700_000 * challenge.vector_dims as usize);
+            assert_eq!(q.len(), 7_000 * challenge.vector_dims as usize);
+            (db, q)
+        };
+        let differing = |a: &[f32], b: &[f32]| -> usize {
+            assert_eq!(a.len(), b.len());
+            a.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits()).count()
+        };
+        let to_bytes = |v: &[f32]| -> Vec<u8> {
+            let mut out = Vec::with_capacity(v.len() * 4);
+            for x in v {
+                out.extend_from_slice(&x.to_le_bytes());
+            }
+            out
+        };
+        for scenario in Scenario::ALL {
+            let (db_a, q_a) = generate(scenario, &seeds);
+            let (db_b, q_b) = generate(scenario, &seeds);
+            let (db_diff, q_diff) = (differing(&db_a, &db_b), differing(&q_a, &q_b));
+            println!(
+                "REPRO_IN_PROCESS scenario={} db_differing={} q_differing={}",
+                scenario, db_diff, q_diff
+            );
+            assert_eq!((db_diff, q_diff), (0, 0), "{}: same seeds, different output", scenario);
+            drop((db_b, q_b));
+
+            let (db_c, q_c) = generate(scenario, &control_seeds);
+            let (db_cd, q_cd) = (differing(&db_a, &db_c), differing(&q_a, &q_c));
+            println!(
+                "REPRO_CONTROL scenario={} db_differing={} q_differing={}",
+                scenario, db_cd, q_cd
+            );
+            assert!(db_cd > 0 && q_cd > 0, "{}: a different seed must change both buffers", scenario);
+            drop((db_c, q_c));
+
+            let dims = db_a.len() / 700_000;
+            let (db_bytes, q_bytes) = (to_bytes(&db_a), to_bytes(&q_a));
+            std::fs::write(dir.join(format!("{}.db.f32", scenario)), &db_bytes).unwrap();
+            std::fs::write(dir.join(format!("{}.q.f32", scenario)), &q_bytes).unwrap();
+            println!(
+                "FULL_DIGEST scenario={} dims={} db_seed=7x32 nonce=1x32 db_rows=700000 db_fnv1a64={:016x} q_rows=7000 q_fnv1a64={:016x}",
+                scenario, dims, fnv1a64(&db_bytes), fnv1a64(&q_bytes)
+            );
+        }
+    }
+
     /// Prints `Database::generate`'s wall time per scenario, three runs each,
     /// with the stream synchronised before the clock stops. Asserts nothing: no
     /// wall-clock value is a correctness property, and a timing assertion would
