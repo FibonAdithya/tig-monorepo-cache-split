@@ -1,4 +1,5 @@
 use crate::QUALITY_PRECISION;
+use crate::Seeds;
 use anyhow::Result;
 use cudarc::{
     cublas::CudaBlas,
@@ -123,12 +124,15 @@ pub struct Challenge {
 
 impl Challenge {
     pub fn generate_instance(
-        seed: &[u8; 32],
+        seeds: &Seeds,
         track: &Track,
         module: Arc<CudaModule>,
         stream: Arc<CudaStream>,
         _prop: &cudaDeviceProp,
     ) -> Result<Self> {
+        // c005/c006 are not split across a precommit; `seeds.db` is not theirs
+        // to read.
+        let seed = &seeds.nonce;
         const K_RFF: usize = 128;
         const RFF_AMPLITUDE_PER_FUNC: f32 = 1.0;
         const RFF_LENGTHSCALE_PER_INPUT_DIM: f32 = 0.3;
@@ -232,6 +236,10 @@ impl Challenge {
         fn evaluate_solution(
             &self,
             solution: &Solution,
+            // Unused: c005/c006 quality is not audited on a subsample. The
+            // parameter exists so all three GPU challenges share one
+            // signature, which is what dispatch_challenge!'s gpu arm calls.
+            _audit_salt: &[u8; 32],
             module: Arc<CudaModule>,
             stream: Arc<CudaStream>,
             _prop: &cudaDeviceProp,

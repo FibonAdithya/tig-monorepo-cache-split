@@ -53,3 +53,42 @@ pub fn entry_point(
 pub extern "C" fn help() {
     {ALGORITHM}::help();
 }
+
+// Optional index-building ABI (c004 / vector_search). Only algorithms that
+// actually define `build_index` and `load_index` can compile these shims, so
+// they are gated behind the `index_build` cargo feature, which defaults off.
+// `build_so` adds it only when INDEX_BUILD is set in the environment.
+#[cfg(all(feature = "cuda", feature = "index_build"))]
+#[unsafe(no_mangle)]
+pub fn build_index(
+    database: &Database,
+    hyperparameters: Option<String>,
+    module: Arc<CudaModule>,
+    stream: Arc<CudaStream>,
+    prop: &cudaDeviceProp,
+) -> Result<Vec<u8>>
+{
+    catch_unwind(AssertUnwindSafe(|| {
+        let hyperparameters = hyperparameters.map(|x| serde_json::from_str::<Map<String, Value>>(&x).unwrap());
+        {ALGORITHM}::build_index(database, &hyperparameters, module, stream, prop)
+    })).unwrap_or_else(|_| {
+        Err(anyhow!("Panic occurred calling build_index"))
+    })
+}
+
+#[cfg(all(feature = "cuda", feature = "index_build"))]
+#[unsafe(no_mangle)]
+pub fn load_index(
+    database: &Database,
+    blob: &[u8],
+    module: Arc<CudaModule>,
+    stream: Arc<CudaStream>,
+    prop: &cudaDeviceProp,
+) -> Result<()>
+{
+    catch_unwind(AssertUnwindSafe(|| {
+        {ALGORITHM}::load_index(database, blob, module, stream, prop)
+    })).unwrap_or_else(|_| {
+        Err(anyhow!("Panic occurred calling load_index"))
+    })
+}

@@ -1,5 +1,20 @@
 #!/usr/bin/env python3
-"""Fit the vector_search quality constants so GAN instances land in today's band.
+"""HISTORICAL REFERENCE ONLY -- fits the RETIRED mean-distance quality map.
+
+c004's quality is no longer a function of average distance. It is the audited
+recall@1 measured on a salt-selected subsample of queries, scaled to
+QUALITY_PRECISION (see `tig-challenges/src/vector_search/mod.rs`); there is no
+QUALITY_OFFSET and no QUALITY_SCALE for this script to fit any more, and the
+`optimal`/`zero`/`random` average distances it consumes no longer determine
+anything a solver is scored on.
+
+Kept, deliberately, and NOT to be deleted: it is the record of how the old
+constants were arrived at, and of the mainnet-spread reasoning below that
+motivated them. Read it as documentation of a decision, not as a tool to run.
+
+The original docstring follows.
+
+Fit the vector_search quality constants so GAN instances land in today's band.
 
     quality = (QUALITY_OFFSET - avg_dist) / QUALITY_SCALE
 

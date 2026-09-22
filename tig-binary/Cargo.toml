@@ -2,7 +2,7 @@
 name = "tig-binary"
 version = "0.1.0"
 readme = "README.md"
-license = "https://github.com/tig-foundation/tig-monorepo/tree/main/docs/agreements/end_user_license_agreement.pdf"
+license = "https://github.com/tig-foundation/tig-monorepo/tree/main/docs/licenses/TIG_Game_Source_Code_End_User_License_Agreement_v1.0.pdf"
 authors.workspace = true
 repository.workspace = true
 edition.workspace = true
@@ -24,6 +24,10 @@ tig-algorithms = { path = "../tig-algorithms" }
 [features]
 entry_point = []
 cuda = ["cudarc"]
+# Compiles the optional build_index/load_index forwarding shims in
+# entry_point_template.rs. Off by default: an algorithm that does not define
+# both functions will not compile with this on.
+index_build = []
 c001 = ["tig-algorithms/c001", "tig-challenges/c001"]
 satisfiability = ["c001"]
 c002 = ["tig-algorithms/c002", "tig-challenges/c002"]

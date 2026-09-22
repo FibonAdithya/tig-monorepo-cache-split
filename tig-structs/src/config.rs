@@ -4,6 +4,19 @@ use std::collections::HashMap;
 pub use tig_utils::Frontier;
 use tig_utils::PreciseNumber;
 
+/// The factor the runtime multiplies a fuel budget by before patching it into
+/// the PTX, so GPU fuel units line up loosely with CPU fuel units.
+///
+/// It lives here, in `tig-structs`, because two crates that cannot see each
+/// other both need the same number: `tig-runtime` patches the PTX with it (the
+/// shared GPU solve loop and `build_index`), and `tig-protocol` rejects a
+/// `max_build_fuel_budget` that would overflow `u64` once scaled by it
+/// (`contracts/benchmarks.rs`). `tig-protocol` has no dependency on
+/// `tig-runtime` and must not gain one, and both already depend on
+/// `tig-structs`. Changing the value here changes every site at once; a
+/// second literal `20` anywhere in either crate is a bug.
+pub const GPU_FUEL_SCALE: u64 = 20;
+
 serializable_struct_with_getters! {
     ProtocolConfig {
         advances: AdvancesConfig,
@@ -92,6 +105,13 @@ serializable_struct_with_getters! {
         max_qualifiers_per_track: u64,
         legacy_multiplier_span: f32,
         min_num_bundles: u64,
+        // Gated: only set once the slave is wired to `tig-runtime batch` AND
+        // live algorithms implement `build_index`/`load_index`. Otherwise every
+        // c004 batch carries `build_fuel_budget`, `run_build_index` runs for
+        // every algorithm, and each batch fails ("does not export build_index").
+        // See docs/ai/specs/2026-08-31-c004-index-build-split-design.md.
+        build_fuel_alpha: Option<f64>,
+        max_build_fuel_budget: Option<u64>,
     }
 }
 serializable_struct_with_getters! {

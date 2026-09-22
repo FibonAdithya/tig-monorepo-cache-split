@@ -5,6 +5,32 @@ use rand::{prelude::IteratorRandom, rngs::StdRng, seq::SliceRandom, Rng, Seedabl
 use std::collections::{HashMap, HashSet};
 use tig_structs::{config::*, core::*};
 
+/// The build phase's fuel budget: a fixed fraction of the total scored fuel the
+/// precommit will spend, so a heavy index is something a benchmarker must
+/// commit to a large precommit to earn.
+///
+/// The product is computed in `u128`. In `u64` it wraps at the protocol
+/// maximum, and a wrapped budget becomes a tiny patched PTX fuel limit rather
+/// than an error.
+///
+/// No caller yet: wiring `build_fuel_budget` into a precommit's per-batch payload
+/// needs a `tig-benchmarker/master` DB migration plus a second, Python-side
+/// reimplementation of this arithmetic, which was out of scope when this landed.
+/// This is deliberately dead code, not an oversight -- do not delete it as unused.
+#[allow(dead_code)]
+pub fn calc_build_fuel_budget(
+    alpha: f64,
+    num_nonces: u64,
+    fuel_budget: u64,
+    max_build_fuel_budget: u64,
+) -> u64 {
+    let scaled = (num_nonces as u128)
+        .saturating_mul(fuel_budget as u128)
+        .saturating_mul((alpha * 1_000_000.0) as u128)
+        / 1_000_000u128;
+    scaled.min(max_build_fuel_budget as u128) as u64
+}
+
 #[time]
 pub async fn submit_precommit<T: Context>(
     ctx: &T,
@@ -92,6 +118,19 @@ pub async fn submit_precommit<T: Context>(
             fuel_budget,
             challenge_config.max_fuel_budget
         ));
+    }
+
+    // `Some(0)` is a legitimate value -- "this challenge grants no build fuel" --
+    // and is not the same as `None`, "this challenge has no build phase". Match
+    // on the Option; never `if let Some(x) = .. if x > 0`, and never a falsy
+    // check on the u64.
+    if let Some(max_build_fuel_budget) = challenge_config.max_build_fuel_budget {
+        if max_build_fuel_budget.checked_mul(GPU_FUEL_SCALE).is_none() {
+            return Err(anyhow!(
+                "max_build_fuel_budget {} overflows when scaled by the GPU fuel scale",
+                max_build_fuel_budget
+            ));
+        }
     }
 
     // verify player has sufficient balance
@@ -382,4 +421,36 @@ pub async fn submit_proof<T: Context>(
     ctx.add_proof_to_mempool(benchmark_id.clone(), merkle_proofs, allegation)
         .await?;
     Ok(verification_result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_fuel_budget_scales_with_the_nonces_it_is_amortised_over() {
+        // 0.25 * 1000 nonces * 2e9 fuel = 5e11
+        assert_eq!(calc_build_fuel_budget(0.25, 1_000, 2_000_000_000, u64::MAX), 500_000_000_000);
+    }
+
+    #[test]
+    fn build_fuel_budget_is_capped() {
+        assert_eq!(calc_build_fuel_budget(0.25, 1_000, 2_000_000_000, 1_000), 1_000);
+    }
+
+    #[test]
+    fn build_fuel_budget_does_not_overflow_at_the_protocol_maximum() {
+        // The runtime later multiplies this by `GPU_FUEL_SCALE`. The
+        // mutation this catches is doing the product in u64: 0.25 * 1e6 nonces
+        // * 5e12 fuel is 1.25e18, and 1.25e18 * 20 exceeds u64, which would
+        // wrap to a tiny patched fuel limit and make every build trap
+        // immediately for reasons no message explains.
+        let cap = 100_000_000_000_000u64;
+        let got = calc_build_fuel_budget(0.25, 1_000_000, 5_000_000_000_000, cap);
+        assert_eq!(got, cap);
+        assert!(
+            got.checked_mul(GPU_FUEL_SCALE).is_some(),
+            "scaled build fuel must fit in u64"
+        );
+    }
 }

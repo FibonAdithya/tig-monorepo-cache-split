@@ -171,6 +171,15 @@ impl BenchmarkSettings {
     pub fn calc_seed(&self, rand_hash: &String, nonce: u64) -> [u8; 32] {
         u8s_from_str(&format!("{}_{}_{}", jsonify(&self), rand_hash, nonce))
     }
+
+    /// The seed for the part of an instance that is constant across a
+    /// precommit. Takes no nonce, deliberately: `tig-runtime build-index`
+    /// derives its instance from this and is never given a nonce, so a build
+    /// process cannot compute any query set. That is the property the whole
+    /// index-build design rests on.
+    pub fn calc_db_seed(&self, rand_hash: &String) -> [u8; 32] {
+        u8s_from_str(&format!("{}_{}_db", jsonify(&self), rand_hash))
+    }
 }
 serializable_struct_with_getters! {
     BenchmarkDetails {

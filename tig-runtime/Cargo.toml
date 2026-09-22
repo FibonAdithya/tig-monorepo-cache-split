@@ -2,7 +2,7 @@
 name = "tig-runtime"
 version = "0.1.0"
 readme = "README.md"
-license = "https://github.com/tig-foundation/tig-monorepo/tree/main/docs/agreements/end_user_license_agreement.pdf"
+license = "https://github.com/tig-foundation/tig-monorepo/tree/main/docs/licenses/TIG_Game_Source_Code_End_User_License_Agreement_v1.0.pdf"
 authors.workspace = true
 repository.workspace = true
 edition.workspace = true
@@ -13,6 +13,7 @@ clap = { version = "4.5.4" }
 cudarc = { git = "https://github.com/tig-foundation/cudarc.git", branch = "runtime-fuel/cudnn-cublas", features = [
     "cuda-version-from-build-system",
 ], optional = true }
+libc = "0.2"
 libloading = "0.8.6"
 serde = { version = "1.0.196", features = ["derive"] }
 serde_json = { version = "1.0.113" }

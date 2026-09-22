@@ -58,5 +58,31 @@ class TestData(unittest.TestCase):
         ]))
         self.assertEqual(merkle_hash, expected)
 
+    def test_calc_db_seed(self):
+        settings = BenchmarkSettings(
+            player_id="some_player",
+            block_id="some_block",
+            challenge_id="some_challenge",
+            algorithm_id="some_algorithm",
+            track_id="a=1,b=2"
+        )
+
+        rand_hash = "random_hash"
+
+        # Assert same as Rust version: tig-structs/tests/core.rs
+        expected = bytes([
+            209, 209, 150, 41, 179, 131, 168, 223, 27, 59, 221, 124, 237, 86, 161, 52, 118, 79,
+            8, 0, 171, 205, 118, 2, 64, 244, 59, 240, 176, 44, 51, 185
+        ])
+        self.assertEqual(settings.calc_db_seed(rand_hash), expected)
+
+    def test_build_is_skipped_without_a_build_fuel_budget(self):
+        from common.batch import needs_index_build
+        self.assertFalse(needs_index_build({"challenge": "c001"}))
+        self.assertTrue(needs_index_build({"challenge": "c004", "build_fuel_budget": 1}))
+        # A budget of 0 is a real value, not an absent one: it means "no build
+        # fuel", which is different from "this challenge has no build phase".
+        self.assertTrue(needs_index_build({"challenge": "c004", "build_fuel_budget": 0}))
+
 if __name__ == '__main__':
     unittest.main()
