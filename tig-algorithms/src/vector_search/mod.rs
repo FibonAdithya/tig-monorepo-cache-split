@@ -1995,3 +1995,6 @@
 // c004_a998
 
 // c004_a999
+
+// Fuel-metering probe on the index-build ABI; not a network submission.
+pub mod ivf_kmeans;
