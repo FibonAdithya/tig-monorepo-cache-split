@@ -1998,3 +1998,5 @@
 
 // Fuel-metering probe on the index-build ABI; not a network submission.
 pub mod ivf_kmeans;
+pub mod graph_nndescent;
+pub mod graph_nsw;

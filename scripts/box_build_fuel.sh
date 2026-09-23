@@ -14,9 +14,10 @@
 # nightly-2025-02-10 toolchain with rust-src.
 #
 # Env knobs: ALGO (ivf_kmeans), SEED (buildfuel1), TRACKS, CONFIGS (space
-# separated "n_lists,n_iters,train_fraction,n_probe"), BUILD_FUEL (1e14, i.e.
-# unbounded for this purpose -- the point is to read the meter, not to trip it),
-# SOLVE_FUEL (mainnet 5e12).
+# separated JSON hyperparameter objects with no spaces inside, one build per
+# object; defaults to the IVF sweep when ALGO is ivf_kmeans), BUILD_FUEL (1e14,
+# i.e. unbounded for this purpose -- the point is to read the meter, not to
+# trip it), SOLVE_FUEL (mainnet 5e12).
 set -uo pipefail
 name=$1
 export PATH="/opt/llvm/bin:/usr/local/cuda/bin:$HOME/.cargo/bin:$PATH"
@@ -29,7 +30,12 @@ export CHALLENGE=vector_search
 ALGO=${ALGO:-ivf_kmeans}
 SEED=${SEED:-buildfuel1}
 TRACKS=${TRACKS:-"sift_128 glove_100 nytimes_256"}
-CONFIGS=${CONFIGS:-"256,0,0.5,8 256,20,0.5,8 1024,0,0.5,32 1024,10,0.5,32 1024,20,0.5,32 1024,20,1.0,32 2048,20,0.5,64 4096,0,0.5,128 4096,20,0.5,128"}
+IVF_CONFIGS=""
+for c in 256,0,0.5,8 256,20,0.5,8 1024,0,0.5,32 1024,10,0.5,32 1024,20,0.5,32 1024,20,1.0,32 2048,20,0.5,64 4096,0,0.5,128 4096,20,0.5,128; do
+  IFS=, read -r l i t p <<< "$c"
+  IVF_CONFIGS="$IVF_CONFIGS {\"n_lists\":$l,\"n_iters\":$i,\"train_fraction\":$t,\"n_probe\":$p}"
+done
+if [ "$ALGO" = ivf_kmeans ]; then CONFIGS=${CONFIGS:-$IVF_CONFIGS}; else CONFIGS=${CONFIGS:?set CONFIGS to the JSON hyperparameter objects to sweep}; fi
 BUILD_FUEL=${BUILD_FUEL:-100000000000000}
 SOLVE_FUEL=${SOLVE_FUEL:-5000000000000}
 
@@ -60,16 +66,14 @@ sha256sum "$SO" "$PTX"
 set +e
 
 TSV="$OUT/fuel.tsv"
-printf 'track\tn_lists\tn_iters\ttrain_fraction\tn_probe\tbuild_rc\tbuild_ms\tblob_bytes\tcpu_fuel\tgpu_fuel\tsolve_rc\tsolve_ms\tsolve_fuel\tverify_rc\tquality\n' > "$TSV"
+printf 'track\thyperparameters\tbuild_rc\tbuild_ms\tblob_bytes\tcpu_fuel\tgpu_fuel\tsolve_rc\tsolve_ms\tsolve_fuel\tverify_rc\tquality\n' > "$TSV"
 
 now_ms() { date +%s%3N; }
 
 for track in $TRACKS; do
   SETTINGS="{\"algorithm_id\":\"\",\"challenge_id\":\"c004\",\"track_id\":\"s=$track\",\"block_id\":\"\",\"player_id\":\"\"}"
-  for cfg in $CONFIGS; do
-    IFS=, read -r n_lists n_iters train_fraction n_probe <<< "$cfg"
-    HP="{\"n_lists\":$n_lists,\"n_iters\":$n_iters,\"train_fraction\":$train_fraction,\"n_probe\":$n_probe}"
-    tag="${track}_L${n_lists}_I${n_iters}_T${train_fraction}_P${n_probe}"
+  for HP in $CONFIGS; do
+    tag="${track}_$(printf '%s' "$HP" | tr -c 'A-Za-z0-9.' '_' | tr -s '_' | sed 's/^_//; s/_$//')"
     dir="$OUT/$tag"; mkdir -p "$dir"
     echo "== $tag"
 
@@ -105,8 +109,8 @@ for track in $TRACKS; do
       echo "   solve rc=$solve_rc ${solve_ms}ms fuel=${solve_fuel:-?} verify rc=${verify_rc:-?} quality=${quality:-?}"
       rm -f "$dir/index.blob"   # regenerable; the ids alone are 4 MB per row set
     fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$track" "$n_lists" "$n_iters" "$train_fraction" "$n_probe" \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$track" "$HP" \
       "$build_rc" "$build_ms" "$blob_bytes" "${cpu_fuel:-}" "${gpu_fuel:-}" \
       "${solve_rc:-}" "${solve_ms:-}" "${solve_fuel:-}" "${verify_rc:-}" "${quality:-}" >> "$TSV"
   done
