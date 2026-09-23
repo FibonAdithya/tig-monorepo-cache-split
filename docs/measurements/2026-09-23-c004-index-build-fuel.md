@@ -83,12 +83,14 @@ a factor of 1.8 against sift_128 and 2.3 against glove_100.
   nytimes_256 at 1.47x.
 - On nytimes_256 at 3e11, the largest of the measured configurations that fit
   are 1024 lists with 10 iterations (0.80x) and 4096 lists with no k-means
-  (0.53x). Twenty iterations fit only with n_lists <= 512 or a training
-  fraction of about 0.3.
+  (0.53x). From the linear fit, ESTIMATE (not measured): twenty iterations
+  fit only with n_lists <= 512, or with 1024 lists and a training fraction of
+  about 0.3.
 - Training on the full database (train 1.0) or 2048+ lists with 20 iterations
   exceed every proposed limit.
 - For the same recipe to be admitted on all three tracks, limits proportional
-  to `n_db * dims` would be sift 9e11 : glove 8.4e11 : nytimes 5.4e11.
+  to `n_db * dims` would be sift 9e11 : glove 8.4e11 : nytimes 5.4e11
+  (arithmetic on the measured fit, not a separate measurement).
 
 ## Caveats
 
