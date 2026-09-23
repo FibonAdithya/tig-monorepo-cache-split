@@ -220,6 +220,15 @@ the resulting index blob is then loaded by each solve.
 Two protocol-config keys govern the budget, both `Option`:
 `build_fuel_alpha` and `max_build_fuel_budget`.
 
+**The index-build fuel limit is 1.1e12 (`max_build_fuel_budget`), the same for
+every track** (decided 2026-09-23; the key is per challenge, so it cannot vary
+by track). It was set from 45 builds metered through `tig-runtime build-index`
+in `docs/measurements/2026-09-23-c004-index-build-fuel.md`: a cuVS-default
+IVF-Flat build (1,024 lists, 20 k-means iterations, half the rows for training)
+costs 0.40x to 0.68x of it depending on the track, and every graph build
+measured (NN-descent, batched NSW) costs at most 0.46x. `scripts/test_algorithm`
+hands this value to the build phase by default.
+
 > **Neither may be set in protocol config yet.** The reference slave still runs
 > one process per nonce, and `needs_index_build` is membership-based
 > (`"build_fuel_budget" in batch`), so no batch the master produces today

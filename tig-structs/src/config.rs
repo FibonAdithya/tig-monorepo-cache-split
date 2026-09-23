@@ -110,6 +110,12 @@ serializable_struct_with_getters! {
         // c004 batch carries `build_fuel_budget`, `run_build_index` runs for
         // every algorithm, and each batch fails ("does not export build_index").
         // See docs/ai/specs/2026-08-31-c004-index-build-split-design.md.
+        //
+        // Decided value for c004, 2026-09-23: `max_build_fuel_budget` =
+        // 1_100_000_000_000 (1.1e12), the same for every track -- the config
+        // is per challenge, so a per-track value is not expressible here.
+        // Basis: docs/measurements/2026-09-23-c004-index-build-fuel.md.
+        // `build_fuel_alpha` is still unset; see the gate above.
         build_fuel_alpha: Option<f64>,
         max_build_fuel_budget: Option<u64>,
     }

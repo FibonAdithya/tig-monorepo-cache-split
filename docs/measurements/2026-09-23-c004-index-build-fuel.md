@@ -170,6 +170,29 @@ Results: `2026-09-23-c004-index-build-fuel-nsw.tsv`,
   inside the runtime's 600 s watchdog, and the beam search's serial thread-0
   merging is what makes NSW slow, not its fuel.
 
+## Decision (2026-09-23): the limit is 1.1e12 for every track
+
+`max_build_fuel_budget` is set to **1.1e12** for c004. The key is per challenge,
+so one value covers all three tracks; the proposed 9e11 / 11e11 / 3e11 split is
+withdrawn. Against 1.1e12, from the tables above (all MEASURED):
+
+| build | sift_128 | glove_100 | nytimes_256 |
+|---|---|---|---|
+| IVF 1024 lists, 20 iters, train 0.5 (cuVS default) | 0.68x | 0.64x | 0.40x |
+| IVF 1024 lists, 20 iters, train 1.0 | 1.29x, fails | 1.22x, fails | 0.77x |
+| IVF 2048 lists, 20 iters, train 0.5 | 1.34x, fails | 1.27x, fails | 0.80x |
+| IVF 4096 lists, 0 iters | 0.24x | 0.23x | 0.14x |
+| IVF 4096 lists, 20 iters | 2.68x, fails | 2.53x, fails | 1.59x, fails |
+| NSW m=32, ef_construction=200 (largest measured) | 0.19x | 0.25x | 0.07x |
+| NN-descent degree 64, 10 rounds (largest measured) | 0.42x | 0.46x | 0.16x |
+
+Where the value is recorded: `tig-structs/src/config.rs` (comment on the key),
+`tig-challenges/src/vector_search/README.md`, `scripts/test_algorithm`
+(`BUILD_FUEL_LIMIT`, the default `--build-fuel`), and the superseded-value notes
+in the 2026-08-31 design doc and measurement note. The live protocol config is
+not in this repo; setting the key there is a separate step, and
+`build_fuel_alpha` remains unset (see the design doc's gate).
+
 ## Caveats (IVF section)
 
 - The IVF rows measure one family; the graph section above adds two more.

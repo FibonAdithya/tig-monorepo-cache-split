@@ -202,6 +202,18 @@ asserted at config load.
 The 10-minute wall-clock survives as a **watchdog ceiling**: a flat safety net
 that kills a runaway build, not the budget itself.
 
+> **`max_build_fuel_budget` set to 1.1e12 on 2026-09-23**, superseding the
+> 7.0e12 of `docs/measurements/2026-08-31-c004-post-split-nonce-time.md` §5.5,
+> which was derived from the watchdog (600 s of fuel) rather than from any
+> index. The new value comes from metering real builds on every track
+> (`docs/measurements/2026-09-23-c004-index-build-fuel.md`): a cuVS-default
+> IVF-Flat build costs 0.40x-0.68x of it and the graph builds measured at most
+> 0.46x. It is the same for every track because the key is per challenge. The
+> `alpha` term of the formula above is unchanged and still unset; at 1.1e12 the
+> cap binds from `alpha * N * fuel_budget` >= 1.1e12, i.e. N >= 74 nonces at
+> `alpha` = 0.003 and `fuel_budget` = 5e12, so under that `alpha` the cap is
+> what nearly every precommit gets.
+
 ## Architecture
 
 ```
@@ -464,7 +476,9 @@ for free. At the recommended constants that back door is **~40x more generous
 than the build budget it routes around**: nonce 0's `max_fuel` is
 `fuel_budget` (up to 5e12), while `alpha * N * fuel_budget` capped at
 `max_build_fuel_budget` = 7.0e12 is what a legitimate build gets for the whole
-precommit.
+precommit. (The cap was reset to **1.1e12** on 2026-09-23, see the note at the
+end of "Why not a flat 10 minutes"; a smaller cap widens the gap between the
+back door and the budget, which strengthens rather than changes this paragraph.)
 
 This is **inside** the stated model, not a hole in it: D2 makes fuel a spend
 limit rather than a score term, and "these caps are not security controls"

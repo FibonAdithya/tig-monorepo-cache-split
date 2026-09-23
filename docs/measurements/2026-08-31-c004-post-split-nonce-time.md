@@ -1004,7 +1004,7 @@ built, §5.3 says what happens to `alpha`.
 | constant | value | derivation |
 |---|---|---|
 | `build_fuel_alpha` | **0.003** — **do not set in config yet** | `delta * R_low / (2 * max_fuel_budget) / 1.25` = `2.8607 * 1.5360e10 / 1e13 / 1.25` = 3.52e-3, rounded down. **Assumes `batch_size` = 8 in one runtime process; the slave uses one process per nonce, where the same chain gives 4.58e-4 -> 0.0004.** See the box at the top. |
-| `max_build_fuel_budget` | **7.0e12** | `600 s * R_low / 1.25` = 7.37e12, rounded down so the fuel cap binds before the watchdog |
+| `max_build_fuel_budget` | ~~7.0e12~~ **superseded 2026-09-23 by 1.1e12** | Was `600 s * R_low / 1.25` = 7.37e12, i.e. derived from the watchdog, not from any index. Reset from measured builds on every track: `docs/measurements/2026-09-23-c004-index-build-fuel.md`. |
 | memory cap | **2 GiB** (revised from 8 GiB, 2026-08-31) | 2x the 1,010 MiB measured build peak (6.2). 8 GiB was never derived from anything and made the build refuse itself: `balloon_size` errors when `free < cap + 64 MiB`, the slave never passes `--memory-cap`, and the build runs alongside `num_workers` solve threads holding device memory. Still not confirmed for a real index — `nullstub` allocates nothing. |
 | build watchdog | **600 s** unchanged | safety net; never the binding limit at these constants |
 
