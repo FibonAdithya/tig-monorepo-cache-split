@@ -146,14 +146,14 @@ Results: `2026-09-23-c004-index-build-fuel-nsw.tsv`,
 
 - **Every graph build fits every proposed limit**, with the largest at 0.59x
   (NN-descent, degree 64, nytimes_256) and NSW never above 0.27x. Against the
-  cuVS-default IVF build on the same track, NSW at m=16/ef=100 costs 9x less on
-  sift_128 and glove_100 and 15x less on nytimes_256: there is no
+  cuVS-default IVF build on the same track, NSW at m=16/ef=100 costs 8.8x less on
+  sift_128, 6.6x less on glove_100 and 15x less on nytimes_256: there is no
   `n_db * n_lists * dims` assignment pass, and each inserted node touches only
   the rows its search visits.
 - **NSW cost scales with ef_construction** (100 -> 200 roughly doubles it) and
-  much less with m (16 -> 32 at ef 200 adds 19-22%). Per row it is 660-1200
-  fuel per dim on the three tracks at m=16/ef=100, against 5,800 for the
-  default IVF.
+  much less with m (16 -> 32 at ef 200 adds 19-29%). Per row it is 380-880
+  fuel per dim on the three tracks at m=16/ef=100, against about 5,800 for
+  the default IVF.
 - **NN-descent cost is dominated by the first round** (a full `n * degree^2`
   join); the new/old rule makes rounds 6-10 cost about half of rounds 1-5 in
   total. Degree 64 costs 3.5x degree 32, close to the 4x of the join size.
