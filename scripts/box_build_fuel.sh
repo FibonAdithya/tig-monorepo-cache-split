@@ -20,6 +20,11 @@
 set -uo pipefail
 name=$1
 export PATH="/opt/llvm/bin:/usr/local/cuda/bin:$HOME/.cargo/bin:$PATH"
+# The instrumented .so links libstd dynamically (build_so symlinks libstd.so
+# into the toolchain's target libdir); Dockerfile.dev puts that dir on
+# LD_LIBRARY_PATH and so must we, or tig-runtime's dlopen fails with
+# "libstd-<hash>.so: cannot open shared object file" (exit 84).
+export LD_LIBRARY_PATH="$(rustc +nightly-2025-02-10 --print target-libdir --target=x86_64-unknown-linux-gnu)${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export CHALLENGE=vector_search
 ALGO=${ALGO:-ivf_kmeans}
 SEED=${SEED:-buildfuel1}
@@ -28,7 +33,9 @@ CONFIGS=${CONFIGS:-"256,0,0.5,8 256,20,0.5,8 1024,0,0.5,32 1024,10,0.5,32 1024,2
 BUILD_FUEL=${BUILD_FUEL:-100000000000000}
 SOLVE_FUEL=${SOLVE_FUEL:-5000000000000}
 
-OUT="runs/box/$name"
+# Absolute and outside the checkout: the gpuq runner cleans its work tree when
+# the job ends, so anything left under it is gone before it can be fetched.
+OUT="${BOX_RUNS_DIR:-/workspace/tig-runs}/$name"
 mkdir -p "$OUT"
 exec > >(tee "$OUT/driver.log") 2>&1
 
