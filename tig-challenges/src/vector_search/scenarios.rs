@@ -130,7 +130,7 @@ impl From<Scenario> for ScenarioConfig {
             // under `#[cfg(test)]`, where the v1 parser's own tests live.
             Scenario::SIFT_128 => ScenarioConfig {
                 n_queries: 7_000,
-                database_size: 700_000,
+                database_size: 1_000_000,
                 vector_dims: 128,
                 weights: SIFT_128_BLOB,
                 min_recall: 0.9,
@@ -144,7 +144,7 @@ impl From<Scenario> for ScenarioConfig {
             // Follow-ups.
             Scenario::GLOVE_100 => ScenarioConfig {
                 n_queries: 7_000,
-                database_size: 700_000,
+                database_size: 1_200_000,
                 vector_dims: 100,
                 weights: GLOVE_100_BLOB,
                 min_recall: 0.9,
@@ -162,7 +162,7 @@ impl From<Scenario> for ScenarioConfig {
             // the spec's Follow-ups.
             Scenario::NYTIMES_256 => ScenarioConfig {
                 n_queries: 7_000,
-                database_size: 700_000,
+                database_size: 300_000,
                 vector_dims: 256,
                 weights: NYTIMES_256_BLOB,
                 min_recall: 0.9,
@@ -258,16 +258,12 @@ mod tests {
                 config.vector_dims,
                 super::super::AUDIT_MAX_DIMS
             );
-            // The instance shape and the recall bar are shared across
-            // scenarios by design; a variant that quietly diverged would move
-            // the audit's launch geometry or the qualifying bar without any
-            // other test noticing.
-            assert_eq!(
-                (config.n_queries, config.database_size),
-                (7_000, 700_000),
-                "scenario {}",
-                scenario
-            );
+            // The query count and the recall bar are shared across scenarios
+            // by design; a variant that quietly diverged would move the
+            // audit's launch geometry or the qualifying bar without any other
+            // test noticing. The database size is per scenario and is pinned
+            // by `database_sizes_are_per_scenario` below.
+            assert_eq!(config.n_queries, 7_000, "scenario {}", scenario);
             assert_eq!(
                 (config.min_recall, config.recall_tolerance, config.audit_samples),
                 (0.9, 1e-6, 1_000),
@@ -287,9 +283,30 @@ mod tests {
         // launch geometry and the recall bar are reasoned about against.
         let c = ScenarioConfig::from(Scenario::SIFT_128);
         assert_eq!(c.n_queries, 7_000);
-        assert_eq!(c.database_size, 700_000);
+        assert_eq!(c.database_size, 1_000_000);
         assert_eq!(c.vector_dims, 128);
         assert!(!c.weights.is_empty());
+    }
+
+    #[test]
+    fn database_sizes_are_per_scenario() {
+        // The database size is the one instance parameter that differs by
+        // corpus: the sizes below stand in for the real corpora (SIFT1M is
+        // 1,000,000 rows, GloVe-100 about 1.2 million, NYTimes-256 about
+        // 290,000). Asserted per scenario so a copy-paste that gave two
+        // scenarios the same size is caught.
+        let sizes: Vec<(Scenario, u32)> = Scenario::ALL
+            .iter()
+            .map(|&s| (s, ScenarioConfig::from(s).database_size))
+            .collect();
+        assert_eq!(
+            sizes,
+            vec![
+                (Scenario::SIFT_128, 1_000_000),
+                (Scenario::GLOVE_100, 1_200_000),
+                (Scenario::NYTIMES_256, 300_000),
+            ]
+        );
     }
 
     #[test]

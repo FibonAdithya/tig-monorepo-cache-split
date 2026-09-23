@@ -83,6 +83,12 @@ summary that carries the `v3_best` label.~~
    challenge samples 700,000 rows, more than NYTimes' ~290k real rows. SIFT
    already works this way, but no gate statistic has been measured at 700,000.
 
+   **Superseded 2026-09-23:** `database_size` is now per scenario, sized to the
+   real corpus each one stands in for: SIFT 1,000,000, GloVe 1,200,000, NYTimes
+   300,000 (`scenarios.rs`). Database VRAM at the new sizes, `N × dims × 4`:
+   SIFT 512 MB, GloVe 480 MB, NYTimes 307.2 MB. The 20-nonces-per-bundle
+   argument and the gate statistics have not been re-derived at these sizes.
+
    **Correction 2026-09-21 (final review):** the VRAM figures above count the
    database only, and the generation scratch is not negligible. NYTimes is the
    largest: `SphericalDevice` holds 5,120 floats per row, computed from the

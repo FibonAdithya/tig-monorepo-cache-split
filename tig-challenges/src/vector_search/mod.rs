@@ -1105,9 +1105,9 @@ extern "C" __global__ void test_gate_noise_from_uniform(
             .unwrap();
         assert_eq!(before, 1.0);
 
-        // A different index in 128 dims over 700k vectors is not within 1e-6 of
-        // the true minimum except by astronomical coincidence; if this ever
-        // flakes, that tie is the reason.
+        // A different index in 128 dims over a million vectors is not within
+        // 1e-6 of the true minimum except by astronomical coincidence; if this
+        // ever flakes, that tie is the reason.
         sol.indexes[victim] = (sol.indexes[victim] + 1) % challenge.database_size as usize;
         let after = challenge
             .measure_recall(&sol, &salt, module, stream, &prop)
@@ -1273,7 +1273,7 @@ extern "C" __global__ void test_gate_noise_from_uniform(
 
         let mut sol = brute_force_1nn(&challenge, module.clone(), stream.clone());
         // Same corruption Task 4's tests use: a different index in 128 dims over
-        // 700k vectors is not within 1e-6 of the true minimum except by
+        // a million vectors is not within 1e-6 of the true minimum except by
         // astronomical coincidence.
         sol.indexes[victim] = (sol.indexes[victim] + 1) % challenge.database_size as usize;
 
@@ -1334,7 +1334,7 @@ extern "C" __global__ void test_gate_noise_from_uniform(
         // it catches skipped fractions of roughly 1% and up. Structural bugs
         // clear that comfortably: a half-scan is 50%, and truncating
         // `rows_in_tile` by one row of a 16-row staging pass is 6.25%. A
-        // single-row off-by-one over 700,000 rows is 0.39% and would NOT be
+        // single-row off-by-one per 256-row tile is 0.39% and would NOT be
         // caught here. This test is a guard against the tiling being wrong in
         // shape, not a proof that it is right in every index.
         let (challenge, module, stream, prop) = gpu_instance(1);
@@ -2105,8 +2105,8 @@ extern "C" __global__ void test_gate_noise_from_uniform(
 
     /// Bit-exact equality across the four geometries the 2026-08-25 spec used,
     /// and a different seed as the control that the comparison can fail.
-    /// Over 200,000 rows, not the full 700,000: enough for four chunks at the
-    /// smallest chunk size, and a third of the generation time.
+    /// Over 200,000 rows, not a full database: enough for four chunks at the
+    /// smallest chunk size, and a fraction of the generation time.
     fn assert_invariant_to_launch_geometry(scenario: Scenario) {
         const COUNT: usize = 200_000;
         let reference = generated_rows(scenario, [3u8; 32], COUNT, 65_536, 256);
@@ -2449,7 +2449,7 @@ extern "C" __global__ void test_gate_noise_from_uniform(
     /// assertion and two of the bit-equalities fail. (Both effects MEASURED on
     /// the host, running the same expression in f32.)
     ///
-    /// This is the only test that reaches those clamps. The 700,000-row
+    /// This is the only test that reaches those clamps. The full-database
     /// unit-norm test cannot, because the damage is silent: an infinity in the
     /// raw noise is expected to become a NaN across the WHOLE smoothed row, since
     /// the smoothing layer sums every tap and, under IEEE 754 rules, a zero
@@ -2661,10 +2661,11 @@ extern "C" __global__ void test_gate_noise_from_uniform(
                     run,
                     start.elapsed().as_millis()
                 );
-                // Dropped before the next iteration allocates: a NYTimes
-                // database is 700,000 x 256 x 4 = 717 MB of device memory, so
-                // three live at once would be 2.2 GB on top of the weights and
-                // the driver's scratch buffers.
+                // Dropped before the next iteration allocates: a SIFT
+                // database is 1,000,000 x 128 x 4 = 512 MB of device memory
+                // and a GloVe one 1,200,000 x 100 x 4 = 480 MB, so three live
+                // at once would be about 1.5 GB on top of the weights and the
+                // driver's scratch buffers.
                 drop(db);
             }
         }

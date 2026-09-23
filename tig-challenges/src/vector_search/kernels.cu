@@ -329,7 +329,7 @@ extern "C" __global__ void gan_sphere_combine(
 // 128-wide smoothed row into NaN, not just the taps near it. `logit + NaN > 0` is
 // false for every coordinate, so `any_open` stays 0 and gan_gate_apply's
 // all-closed fallback replaces the row with a one-hot vector: still finite, still
-// unit-norm, which is why the 700,000-row unit-norm test cannot see it.
+// unit-norm, which is why the full-database unit-norm test cannot see it.
 //
 // That is what is expected, not something to reason from: this PTX is built with
 // --use_fast_math, and what a zero times an infinity does under it is not

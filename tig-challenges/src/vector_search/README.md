@@ -86,14 +86,16 @@ enum Scenario { SIFT_128, GLOVE_100, NYTIMES_256 }        // scenarios.rs
 ```
 
 A scenario fixes every instance parameter, so there is exactly one shape of
-instance per track:
+instance per track. The database size follows the real corpus each scenario
+stands in for (SIFT1M has 1,000,000 rows, GloVe-100 about 1.2 million,
+NYTimes-256 about 290,000); the query count and the audit are shared:
 
 | Field | `sift_128` | `glove_100` | `nytimes_256` |
 |---|---|---|---|
 | generator architecture | `structured_gate` (SIFT v4) | `mlp` (GloVe v1) | `spherical` (NYTimes v3) |
 | `vector_dims` | 128 | 100 | 256 |
 | `n_queries` | 7,000 | 7,000 | 7,000 |
-| `database_size` | 700,000 | 700,000 | 700,000 |
+| `database_size` | 1,000,000 | 1,200,000 | 300,000 |
 | `min_recall` | 0.9 | 0.9 | 0.9 |
 | `recall_tolerance` | 1e-6 | 1e-6 | 1e-6 |
 | `audit_samples` | 1,000 | 1,000 | 1,000 |
